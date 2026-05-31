@@ -1,0 +1,296 @@
+%%%-------------------------------------------------------------------
+%%% @doc Hue BLE Light Driver.
+%%% A gen_server per bulb that manages the BLE connection and
+%%% provides light control operations via the Hue BLE GATT protocol.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(myhome_hue_ble).
+-behaviour(gen_server).
+
+%% Public API
+-export([start_link/4]).
+-export([set_power/2, set_brightness/2, set_color_temp/2]).
+-export([set_color_xy/3, set_state/2, get_state/1]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+%%--------------------------------------------------------------------
+%% Hue BLE GATT UUIDs (16 bytes, big-endian)
+%%--------------------------------------------------------------------
+
+%% Light control service: 932c32bd-0000-47a2-835a-a8d455b859dd
+-define(SVC_LIGHT, <<16#93,16#2c,16#32,16#bd, 16#00,16#00, 16#47,16#a2,
+                     16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% Characteristic: 932c32bd-0002-... (power on/off)
+-define(CHR_POWER, <<16#93,16#2c,16#32,16#bd, 16#00,16#02, 16#47,16#a2,
+                     16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% Characteristic: 932c32bd-0003-... (brightness)
+-define(CHR_BRIGHTNESS, <<16#93,16#2c,16#32,16#bd, 16#00,16#03, 16#47,16#a2,
+                          16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% Characteristic: 932c32bd-0004-... (color temperature)
+-define(CHR_COLOR_TEMP, <<16#93,16#2c,16#32,16#bd, 16#00,16#04, 16#47,16#a2,
+                          16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% Characteristic: 932c32bd-0005-... (color XY)
+-define(CHR_COLOR_XY, <<16#93,16#2c,16#32,16#bd, 16#00,16#05, 16#47,16#a2,
+                        16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% Characteristic: 932c32bd-0007-... (combined control)
+-define(CHR_COMBINED, <<16#93,16#2c,16#32,16#bd, 16#00,16#07, 16#47,16#a2,
+                        16#83,16#5a, 16#a8,16#d4,16#55,16#b8,16#59,16#dd>>).
+
+%% TLV type codes for combined control
+-define(TLV_POWER,      16#01).
+-define(TLV_BRIGHTNESS, 16#02).
+-define(TLV_COLOR_TEMP, 16#03).
+-define(TLV_COLOR_XY,   16#04).
+
+%%--------------------------------------------------------------------
+%% State
+%%--------------------------------------------------------------------
+
+-record(state, {
+    name      :: atom(),
+    port      :: port(),
+    addr      :: binary(),        %% 6-byte BLE address
+    addr_type :: integer(),
+    conn_idx  :: integer() | undefined,
+    connected :: boolean(),
+    %% Cached light state
+    power     :: boolean() | undefined,
+    brightness :: integer() | undefined,
+    color_temp :: integer() | undefined,
+    %% Reconnect
+    reconnect_timer :: reference() | undefined
+}).
+
+-define(RECONNECT_DELAY, 5000).
+
+%%====================================================================
+%% Public API
+%%====================================================================
+
+%% @doc Start the light controller.
+%% Port: the opened BLE port.
+%% Addr: 6-byte BLE MAC address of the bulb.
+%% Name: registered name for this gen_server.
+-spec start_link(port(), binary(), integer(), atom()) -> {ok, pid()} | {error, term()}.
+start_link(Port, Addr, AddrType, Name) ->
+    gen_server:start_link({local, Name}, ?MODULE, {Port, Addr, AddrType, Name}, []).
+
+-define(CALL_TIMEOUT, 15000).
+
+-spec set_power(atom(), boolean()) -> ok | {error, term()}.
+set_power(Name, On) ->
+    gen_server:call(Name, {set_power, On}, ?CALL_TIMEOUT).
+
+-spec set_brightness(atom(), 1..254) -> ok | {error, term()}.
+set_brightness(Name, Bri) when Bri >= 1, Bri =< 254 ->
+    gen_server:call(Name, {set_brightness, Bri}, ?CALL_TIMEOUT).
+
+-spec set_color_temp(atom(), 0..255) -> ok | {error, term()}.
+set_color_temp(Name, Temp) when Temp >= 0, Temp =< 255 ->
+    gen_server:call(Name, {set_color_temp, Temp}, ?CALL_TIMEOUT).
+
+-spec set_color_xy(atom(), 0..65535, 0..65535) -> ok | {error, term()}.
+set_color_xy(Name, X, Y) when X >= 0, X =< 65535, Y >= 0, Y =< 65535 ->
+    gen_server:call(Name, {set_color_xy, X, Y}, ?CALL_TIMEOUT).
+
+%% @doc Set multiple properties at once using the combined control characteristic.
+%% State is a map with optional keys: power, brightness, color_temp, color_xy.
+-spec set_state(atom(), map()) -> ok | {error, term()}.
+set_state(Name, State) when is_map(State) ->
+    gen_server:call(Name, {set_state, State}, ?CALL_TIMEOUT).
+
+-spec get_state(atom()) -> {ok, map()} | {error, term()}.
+get_state(Name) ->
+    gen_server:call(Name, get_state, ?CALL_TIMEOUT).
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
+init({Port, Addr, AddrType, Name}) ->
+    State = #state{
+        name = Name,
+        port = Port,
+        addr = Addr,
+        addr_type = AddrType,
+        conn_idx = undefined,
+        connected = false
+    },
+    %% Stagger connection attempts to avoid NimBLE EALREADY errors
+    Delay = case Name of
+        bulb_1 -> 100;
+        bulb_2 -> 3000;
+        bulb_3 -> 6000;
+        _      -> 9000
+    end,
+    erlang:send_after(Delay, self(), connect),
+    {ok, State}.
+
+handle_call({set_power, On}, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({set_power, On}, _From, #state{port = Port, conn_idx = Idx} = State) ->
+    Value = case On of true -> <<16#01>>; false -> <<16#00>> end,
+    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_POWER, Value),
+    NewState = case Result of
+        ok -> State#state{power = On};
+        _  -> State
+    end,
+    {reply, Result, NewState};
+
+handle_call({set_brightness, Bri}, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({set_brightness, Bri}, _From, #state{port = Port, conn_idx = Idx} = State) ->
+    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<Bri:8>>),
+    NewState = case Result of
+        ok -> State#state{brightness = Bri};
+        _  -> State
+    end,
+    {reply, Result, NewState};
+
+handle_call({set_color_temp, Temp}, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({set_color_temp, Temp}, _From, #state{port = Port, conn_idx = Idx} = State) ->
+    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<Temp:8>>),
+    NewState = case Result of
+        ok -> State#state{color_temp = Temp};
+        _  -> State
+    end,
+    {reply, Result, NewState};
+
+handle_call({set_color_xy, X, Y}, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({set_color_xy, X, Y}, _From, #state{port = Port, conn_idx = Idx} = State) ->
+    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>),
+    {reply, Result, State};
+
+handle_call({set_state, Props}, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({set_state, Props}, _From, #state{port = Port, conn_idx = Idx} = State) ->
+    %% Write each property to its individual characteristic
+    Results = lists:map(fun
+        ({power, On}) ->
+            Val = case On of true -> <<16#01>>; false -> <<16#00>> end,
+            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_POWER, Val);
+        ({brightness, B}) ->
+            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<B:8>>);
+        ({color_temp, T}) ->
+            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<T:8>>);
+        ({color_xy, {X, Y}}) ->
+            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>);
+        (_) -> ok
+    end, maps:to_list(Props)),
+    Result = case lists:all(fun(R) -> R =:= ok end, Results) of
+        true -> ok;
+        false -> {error, partial_failure}
+    end,
+    NewState = case Result of
+        ok -> update_cached_state(State, Props);
+        _  -> State
+    end,
+    {reply, Result, NewState};
+
+handle_call(get_state, _From, #state{connected = false} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call(get_state, _From, State) ->
+    %% Read individual characteristics and return current state
+    Reply = read_current_state(State),
+    {reply, Reply, State};
+
+handle_call(_Req, _From, State) ->
+    {reply, {error, unknown_request}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(connect, State) ->
+    case do_connect(State) of
+        {ok, NewState} ->
+            io:format("[~p] connected to bulb~n", [State#state.name]),
+            {noreply, NewState};
+        {error, _Reason} ->
+            io:format("[~p] connect failed, retrying in ~pms~n",
+                      [State#state.name, ?RECONNECT_DELAY]),
+            Ref = erlang:send_after(?RECONNECT_DELAY, self(), connect),
+            {noreply, State#state{reconnect_timer = Ref}}
+    end;
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{conn_idx = undefined}) ->
+    ok;
+terminate(_Reason, #state{port = Port, conn_idx = Idx}) ->
+    ble:disconnect(Port, Idx),
+    ok.
+
+%%====================================================================
+%% Internal functions
+%%====================================================================
+
+do_connect(#state{port = Port, addr = Addr, addr_type = AddrType} = State) ->
+    case ble:connect(Port, Addr, AddrType) of
+        {ok, Idx} ->
+            %% Wait a moment for encryption/bonding to complete
+            timer:sleep(1000),
+            {ok, State#state{conn_idx = Idx, connected = true,
+                             reconnect_timer = undefined}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Write to the combined control characteristic (0x0007) using write-no-response
+write_combined(#state{port = Port, conn_idx = Idx}, Cmd) ->
+    ble:gatt_write_nr(Port, Idx, ?SVC_LIGHT, ?CHR_COMBINED, Cmd).
+
+%% Build a combined TLV command from a map of properties
+build_combined_cmd(Props) ->
+    Cmds = lists:filtermap(fun
+        ({power, true})  -> {true, <<?TLV_POWER, 16#01, 16#01>>};
+        ({power, false}) -> {true, <<?TLV_POWER, 16#01, 16#00>>};
+        ({brightness, B}) when B >= 1, B =< 254 ->
+            {true, <<?TLV_BRIGHTNESS, 16#01, B:8>>};
+        ({color_temp, T}) when T >= 0, T =< 255 ->
+            {true, <<?TLV_COLOR_TEMP, 16#02, T:8, 16#01>>};
+        ({color_xy, {X, Y}}) when X >= 0, X =< 65535, Y >= 0, Y =< 65535 ->
+            {true, <<?TLV_COLOR_XY, 16#04, X:16/big, Y:16/big>>};
+        (_) -> false
+    end, maps:to_list(Props)),
+    iolist_to_binary(Cmds).
+
+%% Read current light state from individual characteristics
+read_current_state(#state{port = Port, conn_idx = Idx}) ->
+    Power = case ble:gatt_read(Port, Idx, ?SVC_LIGHT, ?CHR_POWER) of
+        {ok, <<16#01>>} -> true;
+        {ok, <<16#00>>} -> false;
+        _ -> undefined
+    end,
+    Bri = case ble:gatt_read(Port, Idx, ?SVC_LIGHT, ?CHR_BRIGHTNESS) of
+        {ok, <<B:8>>} -> B;
+        _ -> undefined
+    end,
+    Temp = case ble:gatt_read(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP) of
+        {ok, <<T:8, _/binary>>} -> T;
+        _ -> undefined
+    end,
+    {ok, #{power => Power, brightness => Bri, color_temp => Temp}}.
+
+update_cached_state(State, Props) ->
+    S1 = case maps:find(power, Props) of
+        {ok, P} -> State#state{power = P};
+        error   -> State
+    end,
+    S2 = case maps:find(brightness, Props) of
+        {ok, B} -> S1#state{brightness = B};
+        error   -> S1
+    end,
+    case maps:find(color_temp, Props) of
+        {ok, T} -> S2#state{color_temp = T};
+        error   -> S2
+    end.
