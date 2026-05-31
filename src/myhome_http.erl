@@ -1,0 +1,70 @@
+%%%-------------------------------------------------------------------
+%%% @doc HTTP server manager.
+%%% Connects to WiFi and starts the HTTP API server.
+%%% Managed by the supervisor for automatic restart on failure.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(myhome_http).
+-behaviour(gen_server).
+
+-export([start_link/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-record(state, {}).
+
+%%====================================================================
+%% Public API
+%%====================================================================
+
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
+init([]) ->
+    SSID = myhome_config:wifi_ssid(),
+    PSK = myhome_config:wifi_psk(),
+    myhome_log:log(info, "Connecting to WiFi (~s)...", [SSID]),
+    Creds = [{ssid, SSID}, {psk, PSK}],
+    case network:wait_for_sta(Creds, 30000) of
+        {ok, {Address, _Netmask, _Gateway}} ->
+            io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
+            Port = myhome_config:http_port(),
+            case tiny_httpd:start_link(Port, myhome_http_handler) of
+                {ok, _} ->
+                    io:format("HTTP API listening on port ~p~n", [Port]),
+                    myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
+                    myhome_log:log(info, "Try: curl http://~s:~p/api/status",
+                              [format_ip(Address), Port]),
+                    {ok, #state{}};
+                {error, Reason} ->
+                    io:format("HTTP server FAILED: ~p~n", [Reason]),
+                    myhome_log:log(error, "HTTP server failed: ~p", [Reason]),
+                    {stop, {http_start_failed, Reason}}
+            end;
+        {error, Reason} ->
+            myhome_log:log(error, "WiFi failed: ~p", [Reason]),
+            {stop, {wifi_failed, Reason}}
+    end.
+
+handle_call(_Req, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+%%====================================================================
+%% Internal
+%%====================================================================
+
+format_ip({A, B, C, D}) ->
+    io_lib:format("~p.~p.~p.~p", [A, B, C, D]).

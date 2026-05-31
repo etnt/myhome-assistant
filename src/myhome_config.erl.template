@@ -1,0 +1,9 @@
+-module(myhome_config).
+
+-export([wifi_ssid/0, wifi_psk/0, http_port/0]).
+
+%% Copy this file to myhome_config.erl and fill in your values.
+
+wifi_ssid() -> <<"YOUR_SSID">>.
+wifi_psk()  -> <<"YOUR_PASSWORD">>.
+http_port() -> 8080.

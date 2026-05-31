@@ -224,21 +224,27 @@ Bond information is managed by NimBLE's own NVS storage automatically.
 ```
 myhome-assistant/
 ├── rebar.config
+├── sdkconfig.defaults        # NimBLE Kconfig settings
 ├── src/                      # Erlang source
 │   ├── myhome_app.erl
 │   ├── myhome_hue_ble.erl
 │   └── myhome_discovery.erl
 ├── nifs/
-│   └── ble/                  # BLE NIF component
+│   └── ble/                  # BLE port driver component
 │       ├── CMakeLists.txt
-│       ├── Kconfig
-│       └── nif_ble.c
+│       ├── include/
+│       │   └── ble_port.h
+│       └── ble_port.c
 └── plans/
 ```
 
 ### Build Steps
 
-1. Build a custom AtomVM firmware that includes the BLE NIF component
+The build approach is modelled on
+[hello_atomvm_ble_switchbot](https://github.com/piyopiyoex/hello_atomvm_ble_switchbot),
+which demonstrates an AtomVM port driver using NimBLE on ESP32-S3.
+
+1. Build a custom AtomVM firmware that includes the BLE port driver component
 2. Flash the custom AtomVM image to the ESP32-S3
 3. `rebar3 compile` — compile Erlang sources
 4. `rebar3 atomvm packbeam` — create AVM file
@@ -246,17 +252,43 @@ myhome-assistant/
 
 ### Custom AtomVM Build
 
-Since we need a NIF, we must build AtomVM from source with our component:
+Since we need a native port driver, we build AtomVM from source with our
+component linked in (same approach as the SwitchBot project):
 
 ```bash
 git clone https://github.com/atomvm/AtomVM.git
 cd AtomVM/src/platforms/esp32
-# Add our BLE component to the build
-# Link or copy nifs/ble/ into components/
+
+# Symlink our BLE component into the build
+ln -s ../../../../nifs/ble components/ble_port
+
+# Copy our sdkconfig.defaults for NimBLE
+cp ../../../../sdkconfig.defaults sdkconfig.defaults.ble
+cat sdkconfig.defaults.ble >> sdkconfig.defaults
+
 idf.py set-target esp32s3
 idf.py build
 idf.py flash
 ```
+
+### Port Driver Protocol (Erlang ↔ C)
+
+The BLE port uses a binary opcode protocol (same pattern as the SwitchBot project):
+
+| Opcode | Direction | Meaning |
+|--------|-----------|---------|
+| `0x01` | → C | Initialize NimBLE stack |
+| `0x10` | → C | Start BLE scan (optional duration byte) |
+| `0x11` | → C | Stop scan |
+| `0x12` | → C | Get scan results |
+| `0x20` | → C | Connect (6-byte addr + addr_type) |
+| `0x21` | → C | Disconnect (conn_idx) |
+| `0x22` | → C | Get connection state |
+| `0x30` | → C | GATT read (conn_idx + svc_uuid + chr_uuid) |
+| `0x31` | → C | GATT write with response |
+| `0x32` | → C | GATT write no-response (fast, for light control) |
+
+Response format: `<<Status:8, Payload/binary>>` where Status `0x00` = OK.
 
 ## Risks & Considerations
 
@@ -270,6 +302,7 @@ idf.py flash
 
 ## References
 
+- [hello_atomvm_ble_switchbot](https://github.com/piyopiyoex/hello_atomvm_ble_switchbot) — AtomVM + NimBLE port driver on ESP32-S3 (our architecture reference)
 - [Hue BLE GATT Services & Characteristics](https://gist.github.com/shinyquagsire23/f7907fdf6b470200702e75a30135caf3) — reverse-engineered protocol
 - [HueBLE (Python)](https://github.com/flip-dots/HueBLE) — active Python library using Bleak
 - [philble (Python)](https://github.com/npaun/philble) — earlier Python BLE client

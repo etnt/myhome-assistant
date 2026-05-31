@@ -1,0 +1,8 @@
+{application, myhome_assistant, [
+    {description, "Philips Hue BLE light control for ESP32-S3/AtomVM"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {modules, []},
+    {mod, {myhome_app, []}}
+]}.
