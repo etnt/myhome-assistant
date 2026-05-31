@@ -1,0 +1,3 @@
+# My Home Assistant - ESP32-S3 + AtomVM + Erlang
+
+This is my own home assistant...bla...bla...
