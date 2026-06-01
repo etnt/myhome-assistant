@@ -1,28 +1,35 @@
 %%%-------------------------------------------------------------------
-%%% @doc MyHome supervisor.
-%%% Supervises one myhome_hue_ble gen_server per configured bulb.
+%%% @doc Secondary supervisor.
+%%% Starts HTTP and discovery as static children.
+%%% Bulb gen_servers are added dynamically by myhome_discovery.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_sup).
 -behaviour(supervisor).
 
--export([start_link/2]).
+-export([start_link/1]).
 -export([init/1]).
 
--spec start_link(port(), [{atom(), binary(), integer()}]) -> {ok, pid()} | {error, term()}.
-start_link(Port, Config) ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, {Port, Config}).
+-spec start_link(port()) -> {ok, pid()} | {error, term()}.
+start_link(Port) ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, Port).
 
-init({Port, Config}) ->
-    ChildSpecs = lists:map(fun({Name, Addr, AddrType}) ->
-        #{
-            id => Name,
-            start => {myhome_hue_ble, start_link, [Port, Addr, AddrType, Name]},
-            restart => permanent,
-            shutdown => 5000,
-            type => worker
-        }
-    end, Config),
+init(Port) ->
+    HttpSpec = #{
+        id => myhome_http,
+        start => {myhome_http, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
+    DiscoverySpec = #{
+        id => myhome_discovery,
+        start => {myhome_discovery, start_link, [Port]},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
 
     SupFlags = #{
         strategy => one_for_one,
@@ -30,4 +37,4 @@ init({Port, Config}) ->
         period => 60
     },
 
-    {ok, {SupFlags, ChildSpecs}}.
+    {ok, {SupFlags, [HttpSpec, DiscoverySpec]}}.

@@ -3,6 +3,8 @@
 %%%
 %%% Endpoints:
 %%%   GET  /api/status          — list bulbs and connection state
+%%%   GET  /api/scan            — get last BLE scan results
+%%%   POST /api/scan            — trigger new BLE scan (optional: {"duration":10})
 %%%   POST /api/bulb/1/power    — body: {"on": true}
 %%%   POST /api/bulb/1/brightness — body: {"value": 200}
 %%%   POST /api/bulb/1/color_temp — body: {"value": 153}
@@ -20,6 +22,35 @@
 handle_api_request(get, [<<"status">>], _HttpRequest, _Args) ->
     Bulbs = get_bulb_status(),
     {ok, #{status => ok, bulbs => Bulbs}};
+
+handle_api_request(get, [<<"scan">>], _HttpRequest, _Args) ->
+    case myhome_scanner:get_results() of
+        {ok, Results} ->
+            {ok, #{status => ok, scan => Results}};
+        {error, Reason} ->
+            {ok, #{status => error, reason => to_bin(Reason)}}
+    end;
+
+handle_api_request(post, [<<"scan">>], HttpRequest, _Args) ->
+    #{body := Body} = HttpRequest,
+    Duration = case parse_json_int(Body, <<"duration">>) of
+        {ok, D} when D >= 1, D =< 30 -> D;
+        _ -> 10
+    end,
+    case myhome_scanner:scan(Duration) of
+        {ok, Count} ->
+            {ok, #{status => ok, devices_found => Count}};
+        {error, Reason} ->
+            {ok, #{status => error, reason => to_bin(Reason)}}
+    end;
+
+handle_api_request(post, [<<"discover">>], _HttpRequest, _Args) ->
+    case myhome_discovery:run_discovery() of
+        {ok, Count} ->
+            {ok, #{status => ok, bulbs_paired => Count}};
+        {error, Reason} ->
+            {ok, #{status => error, reason => to_bin(Reason)}}
+    end;
 
 handle_api_request(post, [<<"bulb">>, BulbNum, <<"power">>], HttpRequest, _Args) ->
     Name = bulb_name(BulbNum),

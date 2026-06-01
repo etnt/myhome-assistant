@@ -12,9 +12,14 @@ AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 
 ```
 ESP32-S3 (AtomVM/Erlang)
-  ├── ble_port (C, NimBLE) ──BLE──► Hue Bulb 1
-  ├── myhome_hue_ble (gen_server)
-  └── myhome_hue_ble (gen_server) ──BLE──► Hue Bulb 2
+  ├── myhome_top_sup (rest_for_one)
+  │     ├── myhome_scanner ──BLE scan──► all nearby devices
+  │     └── myhome_sup (one_for_one)
+  │           ├── myhome_http (WiFi + HTTP API)
+  │           ├── myhome_discovery (pairing + bulb startup)
+  │           ├── bulb_1 (gen_server) ──BLE──► Hue Bulb 1
+  │           └── bulb_2 (gen_server) ──BLE──► Hue Bulb 2
+  └── ble_port (C, NimBLE)
 ```
 
 ## Prerequisites
@@ -58,7 +63,7 @@ Run `make help` to see all targets.
 On first boot (no bulbs in NVS), the application runs discovery automatically:
 
 1. Power-cycle your Hue bulbs (they enter pairing mode for ~30 seconds)
-2. The ESP32 scans for BLE devices with "Hue" in their name
+2. The ESP32 scans for all nearby BLE devices, then pairs with those that have "Hue" in their name
 3. It connects and bonds with each discovered bulb
 4. Addresses are stored in NVS for automatic reconnection on future boots
 
@@ -104,17 +109,92 @@ curl -X POST http://<esp-ip>:8080/api/bulb/1/color_temp -d '{"value":153}'
 
 # Set multiple properties at once
 curl -X POST http://<esp-ip>:8080/api/bulb/1/state -d '{"power":true,"brightness":200,"color_temp":100}'
+
+# Scan for nearby BLE devices (blocks until scan completes)
+curl -X POST http://<esp-ip>:8080/api/scan -d '{"duration":10}'
+
+# Get last scan results
+curl http://<esp-ip>:8080/api/scan
+
+# Trigger discovery and pairing of new Hue bulbs
+curl -X POST http://<esp-ip>:8080/api/discover
 ```
 
 
 ## Re-pairing
 
-If a bulb is factory-reset or paired to another device, clear NVS and reboot:
+You can trigger re-discovery via the HTTP API without rebooting:
+
+```bash
+# Power-cycle bulbs first, then:
+curl -X POST http://<esp-ip>:8080/api/discover
+```
+
+Or clear NVS and reboot to start fresh:
 
 ```erlang
 esp:nvs_erase_all(myhome).
 esp:restart().
 ```
+
+## Troubleshooting
+
+### `ATT_ERR_INSUFFICIENT_AUTHENTICATION` (error code 5)
+
+GATT writes are rejected because the connection is not encrypted/bonded.
+
+**Symptoms:**
+- `{"reason": "{ble_error,<<5>>}", "status": "error"}` from HTTP API
+- Serial log shows `encryption change: handle=N status=1285`
+- Discovery reports "connected (bond pending)" instead of "bonded!"
+
+**Causes:**
+1. The bulb is already bonded to another device (phone/tablet). Hue BLE
+   bulbs only support one bond at a time.
+2. The bulb was not in pairing mode during discovery.
+
+**Fix:**
+1. Remove the bulbs from the Hue Bluetooth app on your phone (if paired).
+2. Factory-reset the bulbs: rapidly power-cycle 5 times (on ~1s, off ~1s).
+   The bulb flashes to confirm the reset.
+3. Rebuild and flash firmware + app: `make flash`
+4. The bulbs enter pairing mode for ~30s after reset — the ESP32 will
+   discover and bond them automatically.
+
+### Timeout errors on first GATT write
+
+The first write to a bulb after connection takes longer (~5-10s) because
+NimBLE performs GATT service discovery to resolve characteristic handles.
+
+**Symptoms:**
+- `{timeout, {gen_server, call, ...}}` on first command
+- Subsequent commands work fine
+
+**Fix:** This is expected on the first write after connection. The API uses
+a 15-second timeout to accommodate this. If you still see timeouts, check
+that the bulb is within BLE range.
+
+### Serial port busy during flash
+
+```
+Could not open /dev/cu.usbmodemXXX, the port is busy
+```
+
+Close minicom (or any serial monitor) before flashing:
+```bash
+pkill minicom
+make flash-app
+```
+
+### WiFi beacon timeouts
+
+```
+WIFI_EVENT_STA_BEACON_TIMEOUT received
+```
+
+The ESP32 is losing WiFi signal. This can happen when BLE and WiFi are
+active simultaneously (they share the radio). Move the ESP32 closer to
+the WiFi access point, or reduce BLE activity.
 
 ## Project Structure
 
@@ -124,9 +204,13 @@ esp:restart().
 ├── sdkconfig.defaults        NimBLE Kconfig settings
 ├── src/
 │   ├── myhome_app.erl        Application entry point (start/0)
-│   ├── myhome_sup.erl        Supervisor (one_for_one)
+│   ├── myhome_top_sup.erl    Top-level supervisor (rest_for_one)
+│   ├── myhome_sup.erl        Secondary supervisor (one_for_one)
+│   ├── myhome_http.erl       WiFi connection + HTTP server
+│   ├── myhome_scanner.erl    On-demand BLE device scanner
+│   ├── myhome_discovery.erl  BLE pairing + dynamic bulb startup
 │   ├── myhome_hue_ble.erl    Per-bulb gen_server, Hue BLE protocol
-│   ├── myhome_discovery.erl  BLE scanning & pairing flow
+│   ├── myhome_http_handler.erl  HTTP API request handler
 │   └── ble.erl               Erlang wrapper for BLE port driver
 ├── nifs/ble/
 │   ├── CMakeLists.txt         ESP-IDF component build
@@ -135,6 +219,10 @@ esp:restart().
 └── plans/
     └── philips_hue_control.md Detailed implementation plan
 ```
+
+## References
+[BLE](https://learn.adafruit.com/introduction-to-bluetooth-low-energy/introduction)
+[hello_atomvm_ble_switchbot](https://github.com/piyopiyoex/hello_atomvm_ble_switchbot)
 
 ## License
 

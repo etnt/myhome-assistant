@@ -1,44 +1,113 @@
 %%%-------------------------------------------------------------------
-%%% @doc BLE discovery and pairing for Hue bulbs.
+%%% @doc BLE discovery and pairing gen_server.
 %%%
-%%% One-time setup flow:
-%%% 1. Scan for BLE devices (look for "Hue" in name or Hue service UUID)
-%%% 2. Display discovered bulbs on serial console
-%%% 3. Connect and pair with each discovered Hue bulb
-%%% 4. Store bonded addresses in NVS for auto-reconnect
+%%% On init, loads bulb config from NVS and dynamically starts bulb
+%%% gen_servers under myhome_sup. If no config exists, runs the
+%%% discovery/pairing flow automatically.
 %%%
-%%% Usage from console:
-%%%   {ok, Port} = ble:start().
-%%%   myhome_discovery:run(Port).
+%%% Can be triggered to re-run discovery via the HTTP API.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_discovery).
+-behaviour(gen_server).
 
--export([run/1, scan/1, scan/2, pair/3]).
-
-%% Hue bulbs advertise with service UUID 0000fe0f-0000-1000-8000-00805f9b34fb
-%% and typically have "Hue" in their local name.
+-export([start_link/1, run_discovery/0, get_config/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SCAN_DURATION, 15).  %% seconds
+
+-record(state, {
+    port :: port(),
+    config = [] :: [{atom(), binary(), integer()}]
+}).
 
 %%====================================================================
 %% Public API
 %%====================================================================
 
-%% @doc Run the full discovery and pairing flow interactively.
-%% Scans for Hue bulbs, displays them, then attempts to pair with each.
-%% The user should power-cycle each bulb before running this to enter pairing mode.
--spec run(port()) -> {ok, [{atom(), binary()}]} | {error, term()}.
-run(Port) ->
+-spec start_link(port()) -> {ok, pid()} | {error, term()}.
+start_link(Port) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, Port, []).
+
+%% @doc Trigger a new discovery and pairing flow.
+%% Scans for Hue bulbs, pairs with them, saves to NVS, and starts
+%% new bulb gen_servers under the supervisor.
+-spec run_discovery() -> {ok, non_neg_integer()} | {error, term()}.
+run_discovery() ->
+    gen_server:call(?MODULE, run_discovery, 60000).
+
+%% @doc Get current bulb configuration.
+-spec get_config() -> {ok, [{atom(), binary(), integer()}]}.
+get_config() ->
+    gen_server:call(?MODULE, get_config).
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
+init(Port) ->
+    %% Send ourselves a message to do initial setup after init returns
+    self() ! init_bulbs,
+    {ok, #state{port = Port}}.
+
+handle_call(run_discovery, _From, State) ->
+    case do_discovery(State#state.port) of
+        {ok, [_|_] = Paired} ->
+            NewConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
+            start_bulb_children(State#state.port, NewConfig),
+            AllConfig = State#state.config ++ NewConfig,
+            {reply, {ok, length(NewConfig)}, State#state{config = AllConfig}};
+        {ok, []} ->
+            {reply, {ok, 0}, State};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+handle_call(get_config, _From, State) ->
+    {reply, {ok, State#state.config}, State};
+handle_call(_Req, _From, State) ->
+    {reply, {error, unknown_request}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(init_bulbs, #state{port = Port} = State) ->
+    Config = load_config(),
+    case Config of
+        [] ->
+            io:format("No bulbs configured, starting discovery...~n"),
+            case do_discovery(Port) of
+                {ok, [_|_] = Paired} ->
+                    BulbConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
+                    start_bulb_children(Port, BulbConfig),
+                    {noreply, State#state{config = BulbConfig}};
+                _ ->
+                    io:format("No bulbs paired. Use POST /api/discover to retry.~n"),
+                    {noreply, State}
+            end;
+        _ ->
+            io:format("Starting ~p bulb(s) from NVS config~n", [length(Config)]),
+            start_bulb_children(Port, Config),
+            {noreply, State#state{config = Config}}
+    end;
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+%%====================================================================
+%% Discovery logic
+%%====================================================================
+
+do_discovery(Port) ->
     io:format("~n=== Hue Bulb Discovery ===~n"),
     io:format("Make sure your Hue bulbs are in pairing mode~n"),
     io:format("(power-cycle the bulb -- it stays in pairing mode for 30s)~n~n"),
     io:format("Scanning for ~p seconds...~n", [?SCAN_DURATION]),
 
-    case scan(Port, ?SCAN_DURATION) of
+    case scan_for_hue() of
         {ok, []} ->
             io:format("No Hue bulbs found.~n"),
-            io:format("Tips: ensure bulbs are powered on and in pairing mode.~n"),
             {ok, []};
         {ok, Bulbs} ->
             io:format("~nFound ~p Hue bulb(s):~n", [length(Bulbs)]),
@@ -54,46 +123,57 @@ run(Port) ->
             {error, Reason}
     end.
 
-%% @doc Scan for Hue bulbs. Returns a list of discovered devices.
--spec scan(port()) -> {ok, [map()]} | {error, term()}.
-scan(Port) ->
-    scan(Port, ?SCAN_DURATION).
-
--spec scan(port(), pos_integer()) -> {ok, [map()]} | {error, term()}.
-scan(Port, Duration) ->
-    case ble:scan_start(Port, Duration) of
-        ok ->
-            %% Wait for scan to complete
-            timer:sleep((Duration + 1) * 1000),
-            case ble:scan_results(Port) of
+scan_for_hue() ->
+    case myhome_scanner:scan(?SCAN_DURATION) of
+        {ok, _Count} ->
+            case myhome_scanner:get_raw_results() of
                 {ok, Results} ->
-                    HueBulbs = filter_hue_bulbs(Results),
-                    {ok, HueBulbs};
-                Error ->
-                    Error
+                    {ok, filter_hue_bulbs(Results)};
+                {error, Reason} ->
+                    {error, Reason}
             end;
-        Error ->
-            Error
+        {error, Reason} ->
+            {error, Reason}
     end.
 
-%% @doc Pair with a specific bulb by address.
-%% The bulb must be in pairing mode (power-cycled within last 30s).
-%% Returns ok if connection + bonding succeeds.
--spec pair(port(), binary(), integer()) -> ok | {error, term()}.
+%%====================================================================
+%% Bulb child management
+%%====================================================================
+
+start_bulb_children(Port, Config) ->
+    lists:foreach(fun({Name, Addr, AddrType}) ->
+        ChildSpec = #{
+            id => Name,
+            start => {myhome_hue_ble, start_link, [Port, Addr, AddrType, Name]},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker
+        },
+        case supervisor:start_child(myhome_sup, ChildSpec) of
+            {ok, _Pid} ->
+                io:format("Started ~p~n", [Name]);
+            {error, {already_started, _}} ->
+                io:format("~p already running~n", [Name]);
+            {error, Reason} ->
+                io:format("Failed to start ~p: ~p~n", [Name, Reason])
+        end
+    end, Config).
+
+%%====================================================================
+%% Pairing
+%%====================================================================
+
 pair(Port, Addr, AddrType) ->
     io:format("  Connecting to ~s...", [format_addr(Addr)]),
     case ble:connect(Port, Addr, AddrType) of
         {ok, Idx} ->
-            %% Wait for bonding to complete (initiated automatically in ble_port.c)
             timer:sleep(2000),
             case ble:conn_state(Port, Idx) of
                 {ok, bonded} ->
                     io:format(" bonded!~n"),
-                    %% Disconnect — we'll reconnect from the app
                     ble:disconnect(Port, Idx),
                     ok;
                 {ok, connected} ->
-                    %% Connected but not yet bonded — might still work
                     io:format(" connected (bond pending)~n"),
                     ble:disconnect(Port, Idx),
                     ok;
@@ -107,34 +187,8 @@ pair(Port, Addr, AddrType) ->
             {error, Reason}
     end.
 
-%%====================================================================
-%% Internal
-%%====================================================================
-
-%% Filter scan results to only Hue bulbs.
-%% Hue bulbs typically advertise with "Hue" in their name.
-filter_hue_bulbs(Results) ->
-    lists:filter(fun(#{name := Name}) ->
-        is_hue_name(Name);
-    (_) ->
-        false
-    end, Results).
-
-is_hue_name(<<>>) -> false;
-is_hue_name(Name) when is_binary(Name) ->
-    %% Check if name contains "Hue" (case-insensitive)
-    Lower = to_lower(Name),
-    binary:match(Lower, <<"hue">>) =/= nomatch;
-is_hue_name(_) -> false.
-
-to_lower(Bin) ->
-    << <<(lower_char(C))>> || <<C>> <= Bin >>.
-
-lower_char(C) when C >= $A, C =< $Z -> C + 32;
-lower_char(C) -> C.
-
 pair_all(Port, Bulbs) ->
-    pair_all(Port, Bulbs, 1, []).
+    pair_all(Port, Bulbs, next_bulb_number(), []).
 
 pair_all(_Port, [], _N, Acc) ->
     lists:reverse(Acc);
@@ -145,16 +199,47 @@ pair_all(Port, [#{addr := Addr, addr_type := AddrType, name := Name} | Rest], N,
             Entry = {BulbName, Addr, AddrType, Name},
             pair_all(Port, Rest, N + 1, [Entry | Acc]);
         {error, _} ->
-            %% Skip failed bulbs
             pair_all(Port, Rest, N + 1, Acc)
     end.
 
-%% Store paired bulb config in NVS
+%% Find the next available bulb number
+next_bulb_number() ->
+    next_bulb_number(1).
+
+next_bulb_number(N) when N > 8 -> N;
+next_bulb_number(N) ->
+    Name = list_to_atom("bulb_" ++ integer_to_list(N)),
+    case whereis(Name) of
+        undefined -> N;
+        _ -> next_bulb_number(N + 1)
+    end.
+
+%%====================================================================
+%% NVS config
+%%====================================================================
+
+load_config() ->
+    try load_bulbs(1, [])
+    catch _:_ -> []
+    end.
+
+load_bulbs(N, Acc) when N > 4 ->
+    lists:reverse(Acc);
+load_bulbs(N, Acc) ->
+    Name = list_to_atom("bulb_" ++ integer_to_list(N)),
+    Key = list_to_binary("bulb_" ++ integer_to_list(N) ++ "_addr"),
+    case esp:nvs_get_binary(myhome, Key) of
+        {ok, Addr} when byte_size(Addr) =:= 6 ->
+            io:format("Loaded ~p from NVS: ~s~n", [Name, format_addr(Addr)]),
+            load_bulbs(N + 1, [{Name, Addr, 1} | Acc]);
+        _ ->
+            lists:reverse(Acc)
+    end.
+
 save_config(Paired) ->
     lists:foreach(fun({Name, Addr, _AddrType, DisplayName}) ->
         Key = atom_to_list(Name) ++ "_addr",
         NameKey = atom_to_list(Name) ++ "_name",
-        %% AtomVM NVS API — best effort
         try
             esp:nvs_set_binary(myhome, list_to_binary(Key), Addr),
             esp:nvs_set_binary(myhome, list_to_binary(NameKey), DisplayName),
@@ -164,7 +249,29 @@ save_config(Paired) ->
         end
     end, Paired).
 
-%% Pretty-print discovered bulbs
+%%====================================================================
+%% Helpers
+%%====================================================================
+
+filter_hue_bulbs(Results) ->
+    lists:filter(fun(#{name := Name}) ->
+        is_hue_name(Name);
+    (_) ->
+        false
+    end, Results).
+
+is_hue_name(<<>>) -> false;
+is_hue_name(Name) when is_binary(Name) ->
+    Lower = to_lower(Name),
+    binary:match(Lower, <<"hue">>) =/= nomatch;
+is_hue_name(_) -> false.
+
+to_lower(Bin) ->
+    << <<(lower_char(C))>> || <<C>> <= Bin >>.
+
+lower_char(C) when C >= $A, C =< $Z -> C + 32;
+lower_char(C) -> C.
+
 print_bulbs(Bulbs) ->
     lists:foldl(fun(#{addr := Addr, rssi := RSSI, name := Name}, N) ->
         io:format("  ~p. ~s (~s) RSSI: ~p dBm~n",
