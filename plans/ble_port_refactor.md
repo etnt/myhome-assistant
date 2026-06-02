@@ -178,17 +178,53 @@ may auto-reconnect, but initial pairing is always user-triggered.
 
 ### Phase 4: Async GATT Operations
 
-**Goal:** Non-blocking reads/writes with Erlang-managed timeouts.
+**Goal:** Non-blocking reads/writes with Erlang-managed timeouts. Remove the
+last blocking semaphore pattern from C.
 
-1. Add `disc_chars` opcode — discovers all characteristics, sends results as
-   message: `{ble_chars, ConnHandle, [{UUID, ValHandle, Properties}]}`
-2. Cache characteristic handles in Erlang (per-connection map)
-3. `gatt_write` takes `ValHandle` directly (no per-write discovery!)
-4. Write result sent as `{ble_write_result, ConnHandle, ValHandle, Status}`
-5. Read result sent as `{ble_read_result, ConnHandle, UUID, Status, Data}`
-6. Erlang handles retries and timeouts via `receive...after`
-7. Remove `discover_char_handle()`, `disc_chr_cb`, `gatt_write_cb`,
-   `gatt_read_by_uuid_cb`, and all semaphore code from C
+**Current state (after Phase 3):** GATT read/write in C still uses
+`xSemaphoreTake(g_gatt_sem, GATT_TIMEOUT_MS)` — the `ble` gen_server blocks
+on `port:call` while waiting for the NimBLE callback. This blocks the `ble`
+process (and thus all other callers) for up to 10 seconds per GATT op.
+
+**C changes:**
+1. `gatt_read` (0x30) sends the command, returns `ok` immediately.
+   Callback sends: `{ble_gatt_read, ConnHandle, Status, Data}`
+2. `gatt_write` (0x31) sends the command, returns `ok` immediately.
+   Callback sends: `{ble_gatt_write, ConnHandle, Status}`
+3. `gatt_write_nr` (0x32) remains fire-and-forget (no callback, returns `ok`).
+4. Add `disc_svcs` opcode (0x33) — discover services+characteristics for a
+   connection. Result sent as: `{ble_disc_complete, ConnHandle, [{SvcUUID, ChrUUID, ValHandle, Properties}]}`
+5. Remove `g_gatt_sem`, `g_gatt_rc`, `g_gatt_data`, `g_gatt_data_len`,
+   `GATT_TIMEOUT_MS`, and all semaphore take/give code.
+
+**Erlang changes (`ble.erl`):**
+1. `gatt_read/3` and `gatt_write/4` become two-step:
+   - Send command via `port:call` (returns `ok` immediately)
+   - Wait for async result in the gen_server's `handle_info`
+   - Use a correlation mechanism (ConnHandle + pending op map) to match
+     results to waiting callers
+   - `receive...after 15000 ->` timeout handled per-caller via `gen_server:reply`
+2. Add pending operations map to state: `#{ConnHandle => {From, Op, TRef}}`
+3. `gatt_write_nr/4` stays synchronous (it's already fast, no callback).
+4. New `discover_services/1` API — caches {SvcUUID, ChrUUID} → ValHandle mapping.
+5. GATT read/write can use cached ValHandle for efficiency (skip per-op discovery).
+
+**Event bus integration:**
+- GATT results are NOT published to the event bus (they're request/response,
+  not broadcast events). Only `ble.erl` handles them internally.
+- Connection/disconnect events continue flowing through the bus as today.
+
+**Serialization concern:**
+- With async GATT, the `ble` gen_server can potentially have multiple in-flight
+  GATT ops. Since NimBLE serializes ops per-connection anyway, we allow at most
+  one pending GATT op per ConnHandle. Additional requests queue in the gen_server
+  mailbox (natural backpressure via `gen_server:call` timeout).
+
+**Benefits:**
+- `ble` gen_server no longer blocks for 10s on GATT ops
+- Other callers (scan, connect) aren't starved while a GATT op is pending
+- Timeout logic moves to Erlang (single place to tune)
+- ~40 lines of semaphore code removed from C
 
 ### Architecture After Refactor
 
@@ -196,26 +232,41 @@ may auto-reconnect, but initial pairing is always user-triggered.
 ┌─────────────────────────────────────────────────────┐
 │ Erlang                                              │
 │                                                     │
+│  ble (gen_server)                                   │
+│    - owns the port (sole accessor)                  │
+│    - serializes all BLE commands                    │
+│    - receives async events from port                │
+│    - publishes events to myhome_event_bus           │
+│    - manages pending GATT ops (Phase 4)             │
+│    - timeout management (per-caller timers)         │
+│                                                     │
+│  myhome_event_bus (gen_server)                      │
+│    - pub/sub with filtered subscriptions            │
+│    - auto-cleanup via process monitors              │
+│                                                     │
 │  myhome_ble_conn (gen_server)                       │
-│    - owns the port                                  │
+│    - subscribes to connection events via bus         │
 │    - connection state machine per handle            │
-│    - characteristic handle cache                    │
-│    - timeout management (receive...after)           │
-│    - auto-rebond on enc_change failure              │
+│    - sync connect (waiter pattern)                  │
+│                                                     │
+│  myhome_scanner (gen_server)                        │
+│    - subscribes to scan events via bus              │
 │    - scan result dedup (map by address)             │
 │                                                     │
 │  myhome_hue_ble (gen_server, per bulb)              │
-│    - calls myhome_ble_conn for GATT ops             │
+│    - calls ble:gatt_* for GATT ops                  │
+│    - uses myhome_ble_conn for connect/disconnect    │
 │    - Hue protocol encoding (UUIDs, TLV)             │
 │    - light state caching                            │
 │                                                     │
 ├─────────────────────────────────────────────────────┤
-│ C (ble_port.c, ~275 lines)                          │
+│ C (ble_port.c, ~250 lines after Phase 4)            │
 │    - NimBLE init + config                           │
 │    - Thin wrappers: scan, connect, disconnect,      │
-│      security, gatt_read, gatt_write, disc_chars    │
+│      security, gatt_read, gatt_write, disc_svcs     │
 │    - Callbacks → send Erlang messages               │
 │    - No state management, no timeouts, no parsing   │
+│    - No semaphores                                  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -230,9 +281,17 @@ may auto-reconnect, but initial pairing is always user-triggered.
 | First write slow (char discovery) | Discovery on every write | Cache handles after first discovery |
 | Radio contention drops | Timeout + disconnect | Retry with backoff in Erlang |
 
+## Progress
+
+- [x] Phase 1: Cross-thread messaging verified (port_send_message_from_task works)
+- [x] Phase 2: Async scan events (myhome_scanner subscribes via event bus)
+- [x] Phase 3: Async connect + security events (myhome_ble_conn, HTTP API)
+- [ ] Phase 4: Async GATT operations (remove last semaphore from C)
+
 ## Next Steps
 
-1. Verify AtomVM supports `globalcontext_send_message()` from arbitrary FreeRTOS tasks
-2. Prototype async scan events first (lowest risk)
-3. If cross-thread messaging works, convert connect/GATT ops to async
-4. Move parsing and state management to a new `myhome_ble_conn.erl` gen_server
+1. Implement Phase 4: make `gatt_read`/`gatt_write` non-blocking in C
+2. Add pending-op map to `ble.erl` for correlating async GATT results
+3. Add `disc_svcs` opcode for characteristic handle caching
+4. Remove all semaphore code from `ble_port.c`
+5. Rebuild firmware (`make flash`) and verify end-to-end

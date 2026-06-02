@@ -58,7 +58,7 @@ enum {
     // Connection
     OP_CONNECT      = 0x20,
     OP_DISCONNECT   = 0x21,
-    OP_CONN_STATE   = 0x22,
+    OP_SECURITY     = 0x22,
 
     // GATT operations
     OP_GATT_READ    = 0x30,
@@ -80,30 +80,6 @@ enum {
 #define RSP_ERR_NOMEM   0x06
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Connection state
-// ─────────────────────────────────────────────────────────────────────────────
-
-#define MAX_CONNECTIONS 2
-#define OP_TIMEOUT_MS   20000  // 20s timeout for BLE operations (first write needs full service discovery)
-
-typedef enum {
-    CONN_STATE_IDLE = 0,
-    CONN_STATE_CONNECTING,
-    CONN_STATE_CONNECTED,
-    CONN_STATE_BONDED,
-} conn_state_t;
-
-typedef struct {
-    bool in_use;
-    uint8_t addr[6];
-    uint8_t addr_type;
-    uint16_t conn_handle;
-    conn_state_t state;
-} connection_t;
-
-static connection_t g_conns[MAX_CONNECTIONS];
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Scan state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -120,6 +96,7 @@ static int g_op_rc;                     // result code from async op
 
 // GATT read result buffer
 #define MAX_GATT_READ 128
+#define GATT_TIMEOUT_MS 10000
 static uint8_t g_read_buf[MAX_GATT_READ];
 static uint16_t g_read_len;
 
@@ -136,6 +113,9 @@ static int32_t g_scan_subscriber_pid = -1;  // PID subscribed to scan events (-1
 
 static const char *const ble_scan_event_atom = ATOM_STR("\xE", "ble_scan_event");
 static const char *const ble_scan_complete_atom = ATOM_STR("\x11", "ble_scan_complete");
+static const char *const ble_connected_atom = ATOM_STR("\xD", "ble_connected");
+static const char *const ble_disconnected_atom = ATOM_STR("\x10", "ble_disconnected");
+static const char *const ble_enc_change_atom = ATOM_STR("\xE", "ble_enc_change");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility: build response binaries
@@ -167,51 +147,6 @@ static term make_ok_payload(Context *ctx, const uint8_t *p, size_t len)
 static term make_error(Context *ctx, uint8_t code)
 {
     return make_response(ctx, RSP_ERR, &code, 1);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Connection management
-// ─────────────────────────────────────────────────────────────────────────────
-
-static int conn_find_by_addr(const uint8_t addr[6])
-{
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_conns[i].in_use && memcmp(g_conns[i].addr, addr, 6) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static int conn_find_by_handle(uint16_t handle)
-{
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_conns[i].in_use && g_conns[i].conn_handle == handle) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static int conn_alloc(const uint8_t addr[6], uint8_t addr_type)
-{
-    // Check if already exists
-    int idx = conn_find_by_addr(addr);
-    if (idx >= 0) {
-        return idx;
-    }
-    // Allocate new slot
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (!g_conns[i].in_use) {
-            memset(&g_conns[i], 0, sizeof(connection_t));
-            g_conns[i].in_use = true;
-            memcpy(g_conns[i].addr, addr, 6);
-            g_conns[i].addr_type = addr_type;
-            g_conns[i].state = CONN_STATE_IDLE;
-            return i;
-        }
-    }
-    return -1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,33 +238,41 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         int status = event->connect.status;
         ESP_LOGI(TAG, "connect event: handle=%u status=%d", handle, status);
 
-        if (status == 0) {
-            // Find the connecting entry and update its handle
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (g_conns[i].in_use && g_conns[i].state == CONN_STATE_CONNECTING) {
-                    g_conns[i].conn_handle = handle;
-                    g_conns[i].state = CONN_STATE_CONNECTED;
-                    break;
-                }
+        // Send {ble_connected, ConnHandle, Status} to subscriber
+        if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            {
+                term atom = globalcontext_make_atom(g_global, ble_connected_atom);
+                term t_handle = term_from_int(handle);
+                term t_status = term_from_int(status);
+                term msg = port_heap_create_tuple_n(&heap, 3,
+                    (term[]){atom, t_handle, t_status});
+                port_send_message_from_task(g_global,
+                    term_from_local_process_id(g_scan_subscriber_pid), msg);
             }
-            // Initiate security (pairing/bonding) — Hue bulbs require it
-            ble_gap_security_initiate(handle);
+            END_WITH_STACK_HEAP(heap, g_global);
         }
-
-        g_op_rc = status;
-        xSemaphoreGive(g_op_sem);
         return 0;
     }
 
     case BLE_GAP_EVENT_DISCONNECT: {
         uint16_t handle = event->disconnect.conn.conn_handle;
-        ESP_LOGI(TAG, "disconnect: handle=%u reason=%d",
-                 handle, event->disconnect.reason);
+        int reason = event->disconnect.reason;
+        ESP_LOGI(TAG, "disconnect: handle=%u reason=%d", handle, reason);
 
-        int idx = conn_find_by_handle(handle);
-        if (idx >= 0) {
-            g_conns[idx].state = CONN_STATE_IDLE;
-            g_conns[idx].conn_handle = 0;
+        // Send {ble_disconnected, ConnHandle, Reason} to subscriber
+        if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            {
+                term atom = globalcontext_make_atom(g_global, ble_disconnected_atom);
+                term t_handle = term_from_int(handle);
+                term t_reason = term_from_int(reason);
+                term msg = port_heap_create_tuple_n(&heap, 3,
+                    (term[]){atom, t_handle, t_reason});
+                port_send_message_from_task(g_global,
+                    term_from_local_process_id(g_scan_subscriber_pid), msg);
+            }
+            END_WITH_STACK_HEAP(heap, g_global);
         }
         return 0;
     }
@@ -339,20 +282,19 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         int status = event->enc_change.status;
         ESP_LOGI(TAG, "encryption change: handle=%u status=%d", handle, status);
 
-        if (status == 0) {
-            int idx = conn_find_by_handle(handle);
-            if (idx >= 0) {
-                g_conns[idx].state = CONN_STATE_BONDED;
+        // Send {ble_enc_change, ConnHandle, Status} to subscriber
+        if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            {
+                term atom = globalcontext_make_atom(g_global, ble_enc_change_atom);
+                term t_handle = term_from_int(handle);
+                term t_status = term_from_int(status);
+                term msg = port_heap_create_tuple_n(&heap, 3,
+                    (term[]){atom, t_handle, t_status});
+                port_send_message_from_task(g_global,
+                    term_from_local_process_id(g_scan_subscriber_pid), msg);
             }
-        } else {
-            // Bonding failed — disconnect to free the radio (prevents WiFi starvation)
-            ESP_LOGW(TAG, "bonding failed (status=%d), disconnecting handle=%u", status, handle);
-            ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
-            int idx = conn_find_by_handle(handle);
-            if (idx >= 0) {
-                g_conns[idx].state = CONN_STATE_IDLE;
-                g_conns[idx].conn_handle = 0;
-            }
+            END_WITH_STACK_HEAP(heap, g_global);
         }
         return 0;
     }
@@ -489,8 +431,6 @@ static term handle_init(Context *ctx)
     ble_hs_cfg.store_write_cb = ble_store_config_write;
     ble_hs_cfg.store_delete_cb = ble_store_config_delete;
 
-    memset(g_conns, 0, sizeof(g_conns));
-
     g_ble_initialized = true;
     nimble_port_freertos_init(host_task);
 
@@ -579,99 +519,69 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
         g_scanning = false;
     }
 
-    int idx = conn_alloc(addr, addr_type);
-    if (idx < 0) {
-        ESP_LOGE(TAG, "no free connection slots");
-        return make_error(ctx, RSP_ERR_NOMEM);
-    }
-
-    // If already connected, return ok
-    if (g_conns[idx].state >= CONN_STATE_CONNECTED) {
-        uint8_t payload[1] = { (uint8_t) idx };
-        return make_ok_payload(ctx, payload, 1);
-    }
-
-    g_conns[idx].state = CONN_STATE_CONNECTING;
-
     ble_addr_t peer_addr;
     peer_addr.type = addr_type;
     memcpy(peer_addr.val, addr, 6);
 
-    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, OP_TIMEOUT_MS,
+    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 30000,
                              NULL, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
-        g_conns[idx].state = CONN_STATE_IDLE;
         return make_error(ctx, RSP_ERR_BLE);
     }
 
-    // Wait for connect event
-    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(OP_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "connect timeout");
-        ble_gap_conn_cancel();
-        g_conns[idx].state = CONN_STATE_IDLE;
-        return make_error(ctx, RSP_ERR_TIMEOUT);
-    }
-
-    if (g_op_rc != 0) {
-        ESP_LOGE(TAG, "connect failed: rc=%d", g_op_rc);
-        g_conns[idx].state = CONN_STATE_IDLE;
-        return make_error(ctx, RSP_ERR_BLE);
-    }
-
-    // Connection established. Return conn index.
-    uint8_t payload[1] = { (uint8_t) idx };
-    ESP_LOGI(TAG, "connected: slot=%d handle=%u", idx, g_conns[idx].conn_handle);
-    return make_ok_payload(ctx, payload, 1);
-}
-
-/**
- * Disconnect.
- * Request: <<OP_DISCONNECT, ConnIdx:8>>
- */
-static term handle_disconnect(Context *ctx, const uint8_t *data, size_t len)
-{
-    if (len < 2) {
-        return make_error(ctx, RSP_ERR_ARGS);
-    }
-
-    uint8_t idx = data[1];
-    if (idx >= MAX_CONNECTIONS || !g_conns[idx].in_use) {
-        return make_error(ctx, RSP_ERR_ARGS);
-    }
-
-    if (g_conns[idx].state >= CONN_STATE_CONNECTED) {
-        ble_gap_terminate(g_conns[idx].conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-    }
-
-    g_conns[idx].state = CONN_STATE_IDLE;
-    g_conns[idx].in_use = false;
+    ESP_LOGI(TAG, "connect initiated");
     return make_ok(ctx);
 }
 
 /**
- * Get connection state.
- * Request: <<OP_CONN_STATE, ConnIdx:8>>
- * Response: <<RSP_OK, State:8>>
+ * Disconnect by connection handle.
+ * Request: <<OP_DISCONNECT, Handle:16/little>>
  */
-static term handle_conn_state(Context *ctx, const uint8_t *data, size_t len)
+static term handle_disconnect(Context *ctx, const uint8_t *data, size_t len)
 {
-    if (len < 2) {
+    if (!g_ble_initialized) {
+        return make_error(ctx, RSP_ERR_STATE);
+    }
+    if (len < 3) { // opcode + handle(2)
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
-    uint8_t idx = data[1];
-    if (idx >= MAX_CONNECTIONS || !g_conns[idx].in_use) {
+    uint16_t handle = data[1] | ((uint16_t)data[2] << 8);
+    int rc = ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_terminate failed: %d", rc);
+        return make_error(ctx, RSP_ERR_BLE);
+    }
+    return make_ok(ctx);
+}
+
+/**
+ * Initiate security (pairing/bonding) on an active connection.
+ * Request: <<OP_SECURITY, Handle:16/little>>
+ */
+static term handle_security(Context *ctx, const uint8_t *data, size_t len)
+{
+    if (!g_ble_initialized) {
+        return make_error(ctx, RSP_ERR_STATE);
+    }
+    if (len < 3) { // opcode + handle(2)
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
-    uint8_t state = (uint8_t) g_conns[idx].state;
-    return make_ok_payload(ctx, &state, 1);
+    uint16_t handle = data[1] | ((uint16_t)data[2] << 8);
+    int rc = ble_gap_security_initiate(handle);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_security_initiate failed: %d", rc);
+        return make_error(ctx, RSP_ERR_BLE);
+    }
+    ESP_LOGI(TAG, "security initiated: handle=%u", handle);
+    return make_ok(ctx);
 }
 
 /**
  * GATT Read by UUID.
- * Request: <<OP_GATT_READ, ConnIdx:8, ServiceUUID:16/bytes, CharUUID:16/bytes>>
+ * Request: <<OP_GATT_READ, ConnHandle:16/little, ServiceUUID:16/bytes, CharUUID:16/bytes>>
  * Response: <<RSP_OK, Data/bytes>>
  *
  * Uses ble_gattc_read_long with service discovery. For simplicity,
@@ -712,19 +622,15 @@ static int gatt_read_by_uuid_cb(uint16_t conn_handle,
 
 static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
 {
-    // opcode(1) + conn_idx(1) + service_uuid(16) + char_uuid(16) = 34
-    if (len < 34) {
+    // opcode(1) + conn_handle(2) + service_uuid(16) + char_uuid(16) = 35
+    if (len < 35) {
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
-    uint8_t idx = data[1];
-    if (idx >= MAX_CONNECTIONS || !g_conns[idx].in_use ||
-        g_conns[idx].state < CONN_STATE_CONNECTED) {
-        return make_error(ctx, RSP_ERR_STATE);
-    }
+    uint16_t conn_handle = data[1] | ((uint16_t)data[2] << 8);
 
     ble_uuid128_t char_uuid;
-    uuid128_from_be(&data[18], &char_uuid);  // char UUID at offset 18
+    uuid128_from_be(&data[19], &char_uuid);  // char UUID at offset 3+16=19
 
     g_read_len = 0;
     g_op_rc = -1;
@@ -732,7 +638,7 @@ static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
     // Drain any stale semaphore from a previous timed-out operation
     xSemaphoreTake(g_op_sem, 0);
 
-    int rc = ble_gattc_read_by_uuid(g_conns[idx].conn_handle,
+    int rc = ble_gattc_read_by_uuid(conn_handle,
                                     1, 0xFFFF,  // search all handles
                                     &char_uuid.u,
                                     gatt_read_by_uuid_cb, NULL);
@@ -741,7 +647,7 @@ static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
         return make_error(ctx, RSP_ERR_BLE);
     }
 
-    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(OP_TIMEOUT_MS)) != pdTRUE) {
+    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
         return make_error(ctx, RSP_ERR_TIMEOUT);
     }
 
@@ -755,7 +661,7 @@ static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
 
 /**
  * GATT Write (with response).
- * Request: <<OP_GATT_WRITE, ConnIdx:8, ServiceUUID:16/bytes, CharUUID:16/bytes, Value/bytes>>
+ * Request: <<OP_GATT_WRITE, ConnHandle:16/little, ServiceUUID:16/bytes, CharUUID:16/bytes, Value/bytes>>
  *
  * We discover the characteristic handle first via disc_all_chrs, then write.
  * For simplicity, we use a two-step approach: discover handle, then write.
@@ -811,7 +717,7 @@ static int discover_char_handle(uint16_t conn_handle, const uint8_t *svc_uuid_be
         return rc;
     }
 
-    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(OP_TIMEOUT_MS)) != pdTRUE) {
+    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
         return BLE_HS_ETIMEOUT;
     }
 
@@ -825,25 +731,21 @@ static int discover_char_handle(uint16_t conn_handle, const uint8_t *svc_uuid_be
 
 static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, bool with_response)
 {
-    // opcode(1) + conn_idx(1) + service_uuid(16) + char_uuid(16) + value(1+)
-    if (len < 35) {
+    // opcode(1) + conn_handle(2) + service_uuid(16) + char_uuid(16) + value(1+)
+    if (len < 36) {
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
-    uint8_t idx = data[1];
-    if (idx >= MAX_CONNECTIONS || !g_conns[idx].in_use ||
-        g_conns[idx].state < CONN_STATE_CONNECTED) {
-        return make_error(ctx, RSP_ERR_STATE);
-    }
+    uint16_t conn_handle = data[1] | ((uint16_t)data[2] << 8);
 
-    const uint8_t *svc_uuid = &data[2];
-    const uint8_t *chr_uuid = &data[18];
-    const uint8_t *value = &data[34];
-    size_t value_len = len - 34;
+    const uint8_t *svc_uuid = &data[3];
+    const uint8_t *chr_uuid = &data[19];
+    const uint8_t *value = &data[35];
+    size_t value_len = len - 35;
 
     // Discover the characteristic handle
     uint16_t val_handle;
-    int rc = discover_char_handle(g_conns[idx].conn_handle, svc_uuid, chr_uuid, &val_handle);
+    int rc = discover_char_handle(conn_handle, svc_uuid, chr_uuid, &val_handle);
     if (rc != 0) {
         ESP_LOGE(TAG, "characteristic discovery failed: %d", rc);
         return make_error(ctx, RSP_ERR_BLE);
@@ -855,14 +757,14 @@ static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, boo
         // Drain any stale semaphore from a previous timed-out operation
         xSemaphoreTake(g_op_sem, 0);
 
-        rc = ble_gattc_write_flat(g_conns[idx].conn_handle, val_handle,
+        rc = ble_gattc_write_flat(conn_handle, val_handle,
                                   value, value_len, gatt_write_cb, NULL);
         if (rc != 0) {
             ESP_LOGE(TAG, "ble_gattc_write_flat failed: %d", rc);
             return make_error(ctx, RSP_ERR_BLE);
         }
 
-        if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(OP_TIMEOUT_MS)) != pdTRUE) {
+        if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
             return make_error(ctx, RSP_ERR_TIMEOUT);
         }
 
@@ -871,7 +773,7 @@ static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, boo
         }
     } else {
         // Write without response (faster, used for light control)
-        rc = ble_gattc_write_no_rsp_flat(g_conns[idx].conn_handle, val_handle,
+        rc = ble_gattc_write_no_rsp_flat(conn_handle, val_handle,
                                          value, value_len);
         if (rc != 0) {
             ESP_LOGE(TAG, "ble_gattc_write_no_rsp_flat failed: %d", rc);
@@ -920,8 +822,8 @@ static term handle_call(Context *ctx, term req, term caller_pid)
     case OP_DISCONNECT:
         return handle_disconnect(ctx, data, len);
 
-    case OP_CONN_STATE:
-        return handle_conn_state(ctx, data, len);
+    case OP_SECURITY:
+        return handle_security(ctx, data, len);
 
     case OP_GATT_READ:
         return handle_gatt_read(ctx, data, len);

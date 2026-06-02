@@ -7,14 +7,30 @@
 -module(myhome_sup).
 -behaviour(supervisor).
 
--export([start_link/1]).
+-export([start_link/0]).
 -export([init/1]).
 
--spec start_link(port()) -> {ok, pid()} | {error, term()}.
-start_link(Port) ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, Port).
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-init(Port) ->
+init([]) ->
+    ScannerSpec = #{
+        id => myhome_scanner,
+        start => {myhome_scanner, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
+    BleConnSpec = #{
+        id => myhome_ble_conn,
+        start => {myhome_ble_conn, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     HttpSpec = #{
         id => myhome_http,
         start => {myhome_http, start_link, []},
@@ -25,7 +41,7 @@ init(Port) ->
 
     DiscoverySpec = #{
         id => myhome_discovery,
-        start => {myhome_discovery, start_link, [Port]},
+        start => {myhome_discovery, start_link, []},
         restart => permanent,
         shutdown => 5000,
         type => worker
@@ -37,4 +53,4 @@ init(Port) ->
         period => 60
     },
 
-    {ok, {SupFlags, [HttpSpec, DiscoverySpec]}}.
+    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec]}}.

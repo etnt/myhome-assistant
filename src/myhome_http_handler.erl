@@ -3,8 +3,15 @@
 %%%
 %%% Endpoints:
 %%%   GET  /api/status          — list bulbs and connection state
+%%%   GET  /api/logs            — get system logs (params: level, limit)
 %%%   GET  /api/scan            — get last BLE scan results
+%%%   GET  /api/connections     — list active BLE connections
 %%%   POST /api/scan            — trigger new BLE scan (optional: {"duration":10})
+%%%   POST /api/connect         — body: {"addr":"AA:BB:CC:DD:EE:FF","addr_type":1}
+%%%   POST /api/disconnect      — body: {"handle":1}
+%%%   POST /api/security        — body: {"handle":1}
+%%%   POST /api/discover        — run bulb discovery and pairing
+%%%   POST /api/reset           — factory reset (clears config and reboots)
 %%%   POST /api/bulb/1/power    — body: {"on": true}
 %%%   POST /api/bulb/1/brightness — body: {"value": 200}
 %%%   POST /api/bulb/1/color_temp — body: {"value": 153}
@@ -12,6 +19,7 @@
 %%%
 %%% Example:
 %%%   curl http://<ip>:8080/api/bulb/1/power -d '{"on":true}'
+%%%   curl http://<ip>:8080/api/logs?level=info&limit=50
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_http_handler).
@@ -130,6 +138,70 @@ handle_api_request(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest, _Args)
             bad_request
     end;
 
+handle_api_request(get, [<<"connections">>], _HttpRequest, _Args) ->
+    case myhome_ble_conn:get_connections() of
+        {ok, Conns} ->
+            JsonConns = [#{addr => addr_to_hex(maps:get(addr, C)),
+                           handle => maps:get(handle, C),
+                           state => maps:get(state, C),
+                           since => maps:get(since, C)}
+                         || C <- Conns],
+            {ok, #{status => ok, connections => JsonConns}};
+        {error, Reason} ->
+            {ok, #{status => error, reason => to_bin(Reason)}}
+    end;
+
+handle_api_request(post, [<<"connect">>], HttpRequest, _Args) ->
+    #{body := Body} = HttpRequest,
+    case parse_json_string(Body, <<"addr">>) of
+        {ok, AddrHex} ->
+            case hex_to_addr(AddrHex) of
+                {ok, Addr} ->
+                    AddrType = case parse_json_int(Body, <<"addr_type">>) of
+                        {ok, T} when T >= 0, T =< 3 -> T;
+                        _ -> 1  %% default: random static
+                    end,
+                    case myhome_ble_conn:connect(Addr, AddrType) of
+                        ok ->
+                            {ok, #{status => ok, message => <<"connecting">>}};
+                        {error, Reason} ->
+                            {ok, #{status => error, reason => to_bin(Reason)}}
+                    end;
+                error ->
+                    bad_request
+            end;
+        error ->
+            bad_request
+    end;
+
+handle_api_request(post, [<<"disconnect">>], HttpRequest, _Args) ->
+    #{body := Body} = HttpRequest,
+    case parse_json_int(Body, <<"handle">>) of
+        {ok, Handle} ->
+            case myhome_ble_conn:disconnect(Handle) of
+                ok ->
+                    {ok, #{status => ok}};
+                {error, Reason} ->
+                    {ok, #{status => error, reason => to_bin(Reason)}}
+            end;
+        _ ->
+            bad_request
+    end;
+
+handle_api_request(post, [<<"security">>], HttpRequest, _Args) ->
+    #{body := Body} = HttpRequest,
+    case parse_json_int(Body, <<"handle">>) of
+        {ok, Handle} ->
+            case myhome_ble_conn:security(Handle) of
+                ok ->
+                    {ok, #{status => ok, message => <<"security initiated">>}};
+                {error, Reason} ->
+                    {ok, #{status => error, reason => to_bin(Reason)}}
+            end;
+        _ ->
+            bad_request
+    end;
+
 handle_api_request(_Method, _Path, _HttpRequest, _Args) ->
     not_found.
 
@@ -232,6 +304,50 @@ take_digits(_, Acc) -> Acc.
 
 to_bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8);
 to_bin(Other) -> list_to_binary(io_lib:format("~p", [Other])).
+
+%% Parse a JSON string value: {"key": "value"}
+parse_json_string(Body, Key) ->
+    Pattern = <<"\"", Key/binary, "\"">>,
+    case binary:match(Body, Pattern) of
+        {Start, Len} ->
+            Rest = binary:part(Body, Start + Len, byte_size(Body) - Start - Len),
+            Val = skip_colon_ws(Rest),
+            case Val of
+                <<$", Str/binary>> ->
+                    case binary:match(Str, <<$">>) of
+                        {End, 1} -> {ok, binary:part(Str, 0, End)};
+                        _ -> error
+                    end;
+                _ -> error
+            end;
+        nomatch ->
+            error
+    end.
+
+%% Convert "AA:BB:CC:DD:EE:FF" or "AABBCCDDEEFF" to 6-byte binary
+hex_to_addr(Hex) when byte_size(Hex) =:= 17 ->
+    %% AA:BB:CC:DD:EE:FF format
+    try
+        Bytes = [binary_to_integer(binary:part(Hex, I, 2), 16)
+                 || I <- [0, 3, 6, 9, 12, 15]],
+        {ok, list_to_binary(Bytes)}
+    catch _:_ -> error
+    end;
+hex_to_addr(Hex) when byte_size(Hex) =:= 12 ->
+    %% AABBCCDDEEFF format
+    try
+        Bytes = [binary_to_integer(binary:part(Hex, I, 2), 16)
+                 || I <- [0, 2, 4, 6, 8, 10]],
+        {ok, list_to_binary(Bytes)}
+    catch _:_ -> error
+    end;
+hex_to_addr(_) -> error.
+
+%% Convert 6-byte binary to "AA:BB:CC:DD:EE:FF"
+addr_to_hex(<<A, B, C, D, E, F>>) ->
+    list_to_binary(io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
+                                 [A, B, C, D, E, F]));
+addr_to_hex(_) -> <<"unknown">>.
 
 parse_log_opts(HttpRequest) ->
     Params = maps:get(params, HttpRequest, #{}),

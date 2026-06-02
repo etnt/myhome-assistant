@@ -14,14 +14,19 @@ AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 ESP32-S3 (AtomVM/Erlang)
   ├── myhome_top_sup (rest_for_one)
   │     ├── myhome_log (in-memory log ring buffer)
-  │     ├── myhome_scanner ──BLE scan──► all nearby devices
+  │     ├── ble (gen_server, owns port, serializes all BLE commands)
+  │     ├── myhome_event_bus (pub/sub for BLE events)
   │     └── myhome_sup (one_for_one)
+  │           ├── myhome_scanner (subscribes to scan events)
+  │           ├── myhome_ble_conn (connection state machine)
   │           ├── myhome_http (WiFi + HTTP API)
   │           ├── myhome_discovery (pairing + bulb startup)
   │           ├── bulb_1 (gen_server) ──BLE──► Hue Bulb 1
   │           └── bulb_2 (gen_server) ──BLE──► Hue Bulb 2
   └── ble_port (C, NimBLE)
 ```
+
+Event flow: C port → `ble` process → `myhome_event_bus` → filtered subscribers.
 
 ## Prerequisites
 
@@ -223,13 +228,15 @@ the WiFi access point, or reduce BLE activity.
 │   ├── myhome_app.erl        Application entry point (start/0)
 │   ├── myhome_top_sup.erl    Top-level supervisor (rest_for_one)
 │   ├── myhome_log.erl        In-memory log server (ring buffer via queue)
+│   ├── ble.erl               BLE port server (owns port, serializes commands)
+│   ├── myhome_event_bus.erl  Pub/sub event bus for BLE events
 │   ├── myhome_sup.erl        Secondary supervisor (one_for_one)
-│   ├── myhome_http.erl       WiFi connection + HTTP server
 │   ├── myhome_scanner.erl    On-demand BLE device scanner
-│   ├── myhome_discovery.erl  BLE pairing + dynamic bulb startup
-│   ├── myhome_hue_ble.erl    Per-bulb gen_server, Hue BLE protocol
+│   ├── myhome_ble_conn.erl   Connection state machine + sync connect
+│   ├── myhome_http.erl       WiFi connection + HTTP server
 │   ├── myhome_http_handler.erl  HTTP API request handler
-│   └── ble.erl               Erlang wrapper for BLE port driver
+│   ├── myhome_discovery.erl  BLE pairing + dynamic bulb startup
+│   └── myhome_hue_ble.erl    Per-bulb gen_server, Hue BLE protocol
 ├── nifs/ble/
 │   ├── CMakeLists.txt         ESP-IDF component build
 │   ├── include/ble_port.h     Port driver header

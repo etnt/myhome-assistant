@@ -2,22 +2,19 @@
 %%% @doc BLE discovery and pairing gen_server.
 %%%
 %%% On init, loads bulb config from NVS and dynamically starts bulb
-%%% gen_servers under myhome_sup. If no config exists, runs the
-%%% discovery/pairing flow automatically.
-%%%
-%%% Can be triggered to re-run discovery via the HTTP API.
+%%% gen_servers under myhome_sup. Discovery must be triggered
+%%% explicitly via the HTTP API (POST /api/discover).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_discovery).
 -behaviour(gen_server).
 
--export([start_link/1, run_discovery/0, get_config/0]).
+-export([start_link/0, run_discovery/0, get_config/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SCAN_DURATION, 15).  %% seconds
 
 -record(state, {
-    port :: port(),
     config = [] :: [{atom(), binary(), integer()}]
 }).
 
@@ -25,9 +22,9 @@
 %% Public API
 %%====================================================================
 
--spec start_link(port()) -> {ok, pid()} | {error, term()}.
-start_link(Port) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, Port, []).
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 %% @doc Trigger a new discovery and pairing flow.
 %% Scans for Hue bulbs, pairs with them, saves to NVS, and starts
@@ -45,16 +42,16 @@ get_config() ->
 %% gen_server callbacks
 %%====================================================================
 
-init(Port) ->
+init([]) ->
     %% Send ourselves a message to do initial setup after init returns
     self() ! init_bulbs,
-    {ok, #state{port = Port}}.
+    {ok, #state{}}.
 
 handle_call(run_discovery, _From, State) ->
-    case do_discovery(State#state.port) of
+    case do_discovery() of
         {ok, [_|_] = Paired} ->
             NewConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
-            start_bulb_children(State#state.port, NewConfig),
+            start_bulb_children(NewConfig),
             AllConfig = State#state.config ++ NewConfig,
             {reply, {ok, length(NewConfig)}, State#state{config = AllConfig}};
         {ok, []} ->
@@ -70,23 +67,15 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(init_bulbs, #state{port = Port} = State) ->
+handle_info(init_bulbs, State) ->
     Config = load_config(),
     case Config of
         [] ->
-            myhome_log:log(info, "No bulbs configured, starting discovery..."),
-            case do_discovery(Port) of
-                {ok, [_|_] = Paired} ->
-                    BulbConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
-                    start_bulb_children(Port, BulbConfig),
-                    {noreply, State#state{config = BulbConfig}};
-                _ ->
-                    myhome_log:log(warning, "No bulbs paired. Use POST /api/discover to retry."),
-                    {noreply, State}
-            end;
+            myhome_log:log(info, "No bulbs configured. Use POST /api/discover to pair."),
+            {noreply, State};
         _ ->
             myhome_log:log(info, "Starting ~p bulb(s) from NVS config", [length(Config)]),
-            start_bulb_children(Port, Config),
+            start_bulb_children(Config),
             {noreply, State#state{config = Config}}
     end;
 handle_info(_Msg, State) ->
@@ -99,7 +88,7 @@ terminate(_Reason, _State) ->
 %% Discovery logic
 %%====================================================================
 
-do_discovery(Port) ->
+do_discovery() ->
     myhome_log:log(info, "=== Hue Bulb Discovery ==="),
     myhome_log:log(info, "Make sure your Hue bulbs are in pairing mode"),
     myhome_log:log(info, "(power-cycle the bulb -- it stays in pairing mode for 30s)"),
@@ -113,7 +102,7 @@ do_discovery(Port) ->
             myhome_log:log(info, "Found ~p Hue bulb(s):", [length(Bulbs)]),
             print_bulbs(Bulbs),
             myhome_log:log(info, "Attempting to pair with each bulb..."),
-            Paired = pair_all(Port, Bulbs),
+            Paired = pair_all(Bulbs),
             myhome_log:log(info, "=== Pairing complete ==="),
             print_paired(Paired),
             save_config(Paired),
@@ -140,11 +129,11 @@ scan_for_hue() ->
 %% Bulb child management
 %%====================================================================
 
-start_bulb_children(Port, Config) ->
+start_bulb_children(Config) ->
     lists:foreach(fun({Name, Addr, AddrType}) ->
         ChildSpec = #{
             id => Name,
-            start => {myhome_hue_ble, start_link, [Port, Addr, AddrType, Name]},
+            start => {myhome_hue_ble, start_link, [Addr, AddrType, Name]},
             restart => permanent,
             shutdown => 5000,
             type => worker
@@ -163,43 +152,36 @@ start_bulb_children(Port, Config) ->
 %% Pairing
 %%====================================================================
 
-pair(Port, Addr, AddrType) ->
+pair(Addr, AddrType) ->
     myhome_log:log(info, "Connecting to ~s...", [format_addr(Addr)]),
-    case ble:connect(Port, Addr, AddrType) of
-        {ok, Idx} ->
-            timer:sleep(2000),
-            case ble:conn_state(Port, Idx) of
-                {ok, bonded} ->
-                    myhome_log:log(info, "~s bonded!", [format_addr(Addr)]),
-                    ble:disconnect(Port, Idx),
-                    ok;
-                {ok, connected} ->
-                    myhome_log:log(info, "~s connected (bond pending)", [format_addr(Addr)]),
-                    ble:disconnect(Port, Idx),
-                    ok;
-                {ok, Other} ->
-                    myhome_log:log(warning, "~s unexpected state: ~p", [format_addr(Addr), Other]),
-                    ble:disconnect(Port, Idx),
-                    {error, {unexpected_state, Other}}
-            end;
+    case myhome_ble_conn:connect_sync(Addr, AddrType) of
+        {ok, ConnHandle} ->
+            myhome_log:log(info, "~s connected (handle=~p), initiating security...",
+                           [format_addr(Addr), ConnHandle]),
+            ble:security(ConnHandle),
+            %% Wait for encryption change event
+            timer:sleep(5000),
+            myhome_log:log(info, "~s security initiated, disconnecting", [format_addr(Addr)]),
+            ble:disconnect(ConnHandle),
+            ok;
         {error, Reason} ->
             myhome_log:log(error, "~s connect failed: ~p", [format_addr(Addr), Reason]),
             {error, Reason}
     end.
 
-pair_all(Port, Bulbs) ->
-    pair_all(Port, Bulbs, next_bulb_number(), []).
+pair_all(Bulbs) ->
+    pair_all(Bulbs, next_bulb_number(), []).
 
-pair_all(_Port, [], _N, Acc) ->
+pair_all([], _N, Acc) ->
     lists:reverse(Acc);
-pair_all(Port, [#{addr := Addr, addr_type := AddrType, name := Name} | Rest], N, Acc) ->
+pair_all([#{addr := Addr, addr_type := AddrType, name := Name} | Rest], N, Acc) ->
     BulbName = list_to_atom("bulb_" ++ integer_to_list(N)),
-    case pair(Port, Addr, AddrType) of
+    case pair(Addr, AddrType) of
         ok ->
             Entry = {BulbName, Addr, AddrType, Name},
-            pair_all(Port, Rest, N + 1, [Entry | Acc]);
+            pair_all(Rest, N + 1, [Entry | Acc]);
         {error, _} ->
-            pair_all(Port, Rest, N + 1, Acc)
+            pair_all(Rest, N + 1, Acc)
     end.
 
 %% Find the next available bulb number

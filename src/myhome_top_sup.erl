@@ -1,21 +1,20 @@
 %%%-------------------------------------------------------------------
 %%% @doc Top-level supervisor.
-%%% Starts the BLE scanner first, then the secondary supervisor.
-%%% Uses rest_for_one so that if the scanner crashes, the secondary
-%%% supervisor is also restarted (correct dependency order).
+%%% Starts: log → ble (port owner) → event_bus → scanner → ble_conn → sub_sup.
+%%% Uses rest_for_one so crashing an early child restarts all later ones.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_top_sup).
 -behaviour(supervisor).
 
--export([start_link/1]).
+-export([start_link/0]).
 -export([init/1]).
 
--spec start_link(port()) -> {ok, pid()} | {error, term()}.
-start_link(Port) ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, Port).
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-init(Port) ->
+init([]) ->
     LogSpec = #{
         id => myhome_log,
         start => {myhome_log, start_link, []},
@@ -24,9 +23,17 @@ init(Port) ->
         type => worker
     },
 
-    ScannerSpec = #{
-        id => myhome_scanner,
-        start => {myhome_scanner, start_link, [Port]},
+    BleSpec = #{
+        id => ble,
+        start => {ble, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
+    EventBusSpec = #{
+        id => myhome_event_bus,
+        start => {myhome_event_bus, start_link, []},
         restart => permanent,
         shutdown => 5000,
         type => worker
@@ -34,7 +41,7 @@ init(Port) ->
 
     SubSupSpec = #{
         id => myhome_sup,
-        start => {myhome_sup, start_link, [Port]},
+        start => {myhome_sup, start_link, []},
         restart => permanent,
         shutdown => infinity,
         type => supervisor
@@ -46,4 +53,4 @@ init(Port) ->
         period => 60
     },
 
-    {ok, {SupFlags, [LogSpec, ScannerSpec, SubSupSpec]}}.
+    {ok, {SupFlags, [LogSpec, BleSpec, EventBusSpec, SubSupSpec]}}.

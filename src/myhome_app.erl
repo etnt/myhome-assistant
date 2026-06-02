@@ -10,21 +10,12 @@
 start() ->
     io:format("MyHome Assistant starting...~n"),
 
-    %% Initialize the BLE port (shared across all processes)
-    case ble:open() of
-        {ok, Port} ->
-            io:format("BLE initialized~n"),
-            %% Start supervision tree (scanner → HTTP → discovery → bulbs)
-            case myhome_top_sup:start_link(Port) of
-                {ok, _} ->
-                    myhome_log:log(info, "MyHome Assistant running"),
-                    loop();
-                {error, Reason} ->
-                    io:format("Failed to start supervisor: ~p~n", [Reason]),
-                    {error, Reason}
-            end;
+    case myhome_top_sup:start_link() of
+        {ok, _} ->
+            myhome_log:log(info, "MyHome Assistant running"),
+            loop();
         {error, Reason} ->
-            io:format("BLE init failed: ~p~n", [Reason]),
+            io:format("Failed to start supervisor: ~p~n", [Reason]),
             {error, Reason}
     end.
 
