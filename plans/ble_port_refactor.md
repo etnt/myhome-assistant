@@ -147,19 +147,34 @@ that the Erlang side polls via `port:call` on a timer (less elegant but function
 
 ### Phase 3: Async Connect + Security Events
 
-**Goal:** Non-blocking connection and bond management.
+**Goal:** Non-blocking, user-initiated connection and bond management.
 
+**Design principle:** Connections are never automatic. All connect/bond/disconnect
+actions are initiated via the HTTP API. Previously-bonded bulbs loaded from NVS
+may auto-reconnect, but initial pairing is always user-triggered.
+
+**HTTP API:**
+- `POST /api/connect` `{"addr":"E2:40:...", "addr_type":1}` — connect + bond
+- `POST /api/disconnect` `{"addr":"E2:40:..."}` — explicit teardown
+- `GET /api/connections` — list active connection states
+
+**C changes:**
 1. C `connect` initiates `ble_gap_connect()`, returns immediately
-2. Events sent to owner:
+2. Events sent to subscriber:
    - `{ble_connected, ConnHandle, Addr, Status}`
    - `{ble_disconnected, ConnHandle, Reason}`
    - `{ble_enc_change, ConnHandle, Status}`
 3. New `security` opcode calls `ble_gap_security_initiate()`
-4. Erlang gen_server manages connection state machine:
+4. Remove `g_conns[]` slot management, `conn_alloc`, `conn_find_*` from C
+5. Remove semaphore waiting from connect path
+
+**Erlang changes:**
+1. New gen_server (or extend myhome_scanner) manages connection state machine:
    - `connecting → connected → encrypting → bonded`
-   - On `enc_change` with status=1285: delete bond, disconnect, retry
-5. Remove `g_conns[]` slot management, `conn_alloc`, `conn_find_*` from C
-6. Remove semaphore waiting from connect path
+   - On `enc_change` with status=1285: delete bond, disconnect, report failure
+2. Remove auto-discovery-on-boot from `myhome_discovery.erl`
+3. `POST /api/discover` remains as a manual "scan + pair all Hue bulbs" convenience
+4. `myhome_hue_ble` gen_servers only started after explicit pairing succeeds
 
 ### Phase 4: Async GATT Operations
 

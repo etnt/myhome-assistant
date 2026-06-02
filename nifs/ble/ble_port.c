@@ -53,7 +53,6 @@ enum {
     // Scanning
     OP_SCAN_START   = 0x10,
     OP_SCAN_STOP    = 0x11,
-    OP_SCAN_RESULTS = 0x12,
     OP_SUBSCRIBE_SCAN = 0x13,  // Subscribe to async scan events
 
     // Connection
@@ -105,23 +104,10 @@ typedef struct {
 static connection_t g_conns[MAX_CONNECTIONS];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scan results cache
+// Scan state
 // ─────────────────────────────────────────────────────────────────────────────
 
-#define MAX_SCAN_RESULTS 16
 #define MAX_NAME_LEN     32
-
-typedef struct {
-    bool in_use;
-    uint8_t addr[6];
-    uint8_t addr_type;
-    int8_t rssi;
-    char name[MAX_NAME_LEN];
-    uint8_t name_len;
-} scan_result_t;
-
-static scan_result_t g_scan_results[MAX_SCAN_RESULTS];
-static int g_scan_count = 0;
 static bool g_scanning = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +135,7 @@ static GlobalContext *g_global = NULL;
 static int32_t g_scan_subscriber_pid = -1;  // PID subscribed to scan events (-1 = none)
 
 static const char *const ble_scan_event_atom = ATOM_STR("\xE", "ble_scan_event");
+static const char *const ble_scan_complete_atom = ATOM_STR("\x11", "ble_scan_complete");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility: build response binaries
@@ -255,43 +242,6 @@ static void parse_adv_name(const uint8_t *data, uint8_t data_len,
     }
 }
 
-static void scan_add_result(const struct ble_gap_disc_desc *desc)
-{
-    char name[MAX_NAME_LEN] = {0};
-    uint8_t name_len = 0;
-    parse_adv_name(desc->data, desc->length_data, name, &name_len);
-
-    xSemaphoreTake(g_data_lock, portMAX_DELAY);
-
-    // Update existing or add new
-    for (int i = 0; i < g_scan_count; i++) {
-        if (memcmp(g_scan_results[i].addr, desc->addr.val, 6) == 0) {
-            g_scan_results[i].rssi = desc->rssi;
-            if (name_len > 0) {
-                memcpy(g_scan_results[i].name, name, name_len + 1);
-                g_scan_results[i].name_len = name_len;
-            }
-            xSemaphoreGive(g_data_lock);
-            return;
-        }
-    }
-
-    if (g_scan_count < MAX_SCAN_RESULTS) {
-        scan_result_t *r = &g_scan_results[g_scan_count];
-        memcpy(r->addr, desc->addr.val, 6);
-        r->addr_type = desc->addr.type;
-        r->rssi = desc->rssi;
-        r->in_use = true;
-        if (name_len > 0) {
-            memcpy(r->name, name, name_len + 1);
-            r->name_len = name_len;
-        }
-        g_scan_count++;
-    }
-
-    xSemaphoreGive(g_data_lock);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // NimBLE: GAP event handler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,10 +253,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
 
     case BLE_GAP_EVENT_DISC:
-        scan_add_result(&event->disc);
-
-        // Phase 1: send async scan event to subscriber (if any)
-        // Only send for devices with a name to avoid flooding with every advertisement
+        // Phase 2: send all advertisements to subscriber for Erlang-side dedup
         if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
             const struct ble_gap_disc_desc *desc = &event->disc;
             // Parse name from advertisement
@@ -314,33 +261,41 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             uint8_t name_len = 0;
             parse_adv_name(desc->data, desc->length_data, name, &name_len);
 
-            if (name_len > 0) {
-                ESP_LOGI(TAG, "async send: name=%s pid=%d", name, (int)g_scan_subscriber_pid);
-                // Message: {ble_scan_event, <<Addr:6/binary>>, AddrType, RSSI, <<Name/binary>>}
-                #define SCAN_EVENT_HEAP_SIZE (TUPLE_SIZE(5) + TERM_BINARY_HEAP_SIZE(6) + TERM_BINARY_HEAP_SIZE(MAX_NAME_LEN))
-                BEGIN_WITH_STACK_HEAP(SCAN_EVENT_HEAP_SIZE, heap);
-                {
-                    term atom = globalcontext_make_atom(g_global, ble_scan_event_atom);
-                    term addr_bin = term_from_literal_binary(desc->addr.val, 6, &heap, g_global);
-                    term addr_type = term_from_int(desc->addr.type);
-                    term rssi = term_from_int(desc->rssi);
-                    term name_bin = term_from_literal_binary(
-                        (const void *) name, strlen(name), &heap, g_global);
+            // Message: {ble_scan_event, <<Addr:6/binary>>, AddrType, RSSI, <<Name/binary>>}
+            #define SCAN_EVENT_HEAP_SIZE (TUPLE_SIZE(5) + TERM_BINARY_HEAP_SIZE(6) + TERM_BINARY_HEAP_SIZE(MAX_NAME_LEN))
+            BEGIN_WITH_STACK_HEAP(SCAN_EVENT_HEAP_SIZE, heap);
+            {
+                term atom = globalcontext_make_atom(g_global, ble_scan_event_atom);
+                term addr_bin = term_from_literal_binary(desc->addr.val, 6, &heap, g_global);
+                term addr_type = term_from_int(desc->addr.type);
+                term rssi = term_from_int(desc->rssi);
+                term name_bin = term_from_literal_binary(
+                    (const void *) name, strlen(name), &heap, g_global);
 
-                    term msg = port_heap_create_tuple_n(&heap, 5,
-                        (term[]){atom, addr_bin, addr_type, rssi, name_bin});
+                term msg = port_heap_create_tuple_n(&heap, 5,
+                    (term[]){atom, addr_bin, addr_type, rssi, name_bin});
 
-                    port_send_message_from_task(g_global,
-                        term_from_local_process_id(g_scan_subscriber_pid), msg);
-                }
-                END_WITH_STACK_HEAP(heap, g_global);
+                port_send_message_from_task(g_global,
+                    term_from_local_process_id(g_scan_subscriber_pid), msg);
             }
+            END_WITH_STACK_HEAP(heap, g_global);
         }
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         ESP_LOGI(TAG, "scan complete");
         g_scanning = false;
+        // Send {ble_scan_complete} to subscriber
+        if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(1), heap);
+            {
+                term atom = globalcontext_make_atom(g_global, ble_scan_complete_atom);
+                term msg = port_heap_create_tuple_n(&heap, 1, (term[]){atom});
+                port_send_message_from_task(g_global,
+                    term_from_local_process_id(g_scan_subscriber_pid), msg);
+            }
+            END_WITH_STACK_HEAP(heap, g_global);
+        }
         return 0;
 
     case BLE_GAP_EVENT_CONNECT: {
@@ -535,8 +490,6 @@ static term handle_init(Context *ctx)
     ble_hs_cfg.store_delete_cb = ble_store_config_delete;
 
     memset(g_conns, 0, sizeof(g_conns));
-    memset(g_scan_results, 0, sizeof(g_scan_results));
-    g_scan_count = 0;
 
     g_ble_initialized = true;
     nimble_port_freertos_init(host_task);
@@ -550,12 +503,6 @@ static term handle_scan_start(Context *ctx, const uint8_t *data, size_t len)
     if (!g_ble_initialized) {
         return make_error(ctx, RSP_ERR_STATE);
     }
-
-    // Clear previous results
-    xSemaphoreTake(g_data_lock, portMAX_DELAY);
-    memset(g_scan_results, 0, sizeof(g_scan_results));
-    g_scan_count = 0;
-    xSemaphoreGive(g_data_lock);
 
     // Optional: duration in seconds (default=10)
     uint8_t duration_sec = 10;
@@ -608,47 +555,6 @@ static term handle_subscribe_scan(Context *ctx, term caller_pid)
     g_scan_subscriber_pid = term_to_local_process_id(caller_pid);
     ESP_LOGI(TAG, "scan subscriber registered: pid=%d", (int) g_scan_subscriber_pid);
     return make_ok(ctx);
-}
-
-/**
- * Returns scan results as binary:
- * <<Count:8, [<<Addr:6/bytes, AddrType:8, RSSI:8/signed, NameLen:8, Name/bytes>>]>>
- */
-static term handle_scan_results(Context *ctx)
-{
-    if (!g_ble_initialized) {
-        return make_error(ctx, RSP_ERR_STATE);
-    }
-
-    xSemaphoreTake(g_data_lock, portMAX_DELAY);
-
-    // Calculate total size
-    size_t total = 1; // count byte
-    for (int i = 0; i < g_scan_count; i++) {
-        total += 6 + 1 + 1 + 1 + g_scan_results[i].name_len; // addr + addr_type + rssi + name_len + name
-    }
-
-    term bin = term_create_uninitialized_binary(1 + total, &ctx->heap, ctx->global);
-    uint8_t *out = (uint8_t *) term_binary_data(bin);
-    out[0] = RSP_OK;
-
-    uint8_t *p = out + 1;
-    *p++ = (uint8_t) g_scan_count;
-
-    for (int i = 0; i < g_scan_count; i++) {
-        scan_result_t *r = &g_scan_results[i];
-        memcpy(p, r->addr, 6); p += 6;
-        *p++ = r->addr_type;
-        *p++ = (uint8_t) r->rssi;
-        *p++ = r->name_len;
-        if (r->name_len > 0) {
-            memcpy(p, r->name, r->name_len);
-            p += r->name_len;
-        }
-    }
-
-    xSemaphoreGive(g_data_lock);
-    return bin;
 }
 
 /**
@@ -1004,9 +910,6 @@ static term handle_call(Context *ctx, term req, term caller_pid)
 
     case OP_SCAN_STOP:
         return handle_scan_stop(ctx);
-
-    case OP_SCAN_RESULTS:
-        return handle_scan_results(ctx);
 
     case OP_SUBSCRIBE_SCAN:
         return handle_subscribe_scan(ctx, caller_pid);

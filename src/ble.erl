@@ -6,7 +6,7 @@
 -module(ble).
 
 -export([open/0, stop/1]).
--export([scan_start/1, scan_start/2, scan_stop/1, scan_results/1]).
+-export([scan_start/1, scan_start/2, scan_stop/1]).
 -export([subscribe_scan/1]).
 -export([connect/3, disconnect/2, conn_state/2]).
 -export([gatt_read/4, gatt_write/5, gatt_write_nr/5]).
@@ -15,7 +15,6 @@
 -define(OP_INIT,         16#01).
 -define(OP_SCAN_START,   16#10).
 -define(OP_SCAN_STOP,    16#11).
--define(OP_SCAN_RESULTS, 16#12).
 -define(OP_SUBSCRIBE_SCAN, 16#13).
 -define(OP_CONNECT,      16#20).
 -define(OP_DISCONNECT,   16#21).
@@ -65,15 +64,6 @@ scan_stop(Port) ->
     case call(Port, <<?OP_SCAN_STOP>>) of
         {ok, _} -> ok;
         Error   -> Error
-    end.
-
-%% @doc Get scan results.
-%% Returns a list of #{addr, addr_type, rssi, name}.
--spec scan_results(port()) -> {ok, [map()]} | {error, term()}.
-scan_results(Port) ->
-    case call(Port, <<?OP_SCAN_RESULTS>>) of
-        {ok, Data} -> {ok, parse_scan_results(Data)};
-        Error      -> Error
     end.
 
 %% @doc Subscribe the calling process to receive async scan events.
@@ -161,23 +151,6 @@ call(Port, Request) ->
         {error, _} = Err ->
             Err
     end.
-
-parse_scan_results(<<Count:8, Rest/binary>>) ->
-    parse_scan_entries(Count, Rest, []).
-
-parse_scan_entries(0, _Rest, Acc) ->
-    lists:reverse(Acc);
-parse_scan_entries(N, <<Addr:6/binary, AddrType:8, RSSI:8/signed, NameLen:8,
-                        Name:NameLen/binary, Rest/binary>>, Acc) ->
-    Entry = #{
-        addr => Addr,
-        addr_type => AddrType,
-        rssi => RSSI,
-        name => Name
-    },
-    parse_scan_entries(N - 1, Rest, [Entry | Acc]);
-parse_scan_entries(_, _, Acc) ->
-    lists:reverse(Acc).
 
 decode_conn_state(0) -> idle;
 decode_conn_state(1) -> connecting;

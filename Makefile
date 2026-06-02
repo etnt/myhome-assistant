@@ -79,12 +79,20 @@ monitor:
 ## Build and flash everything
 all: flash
 
-.PHONY: logs status
+## Some nice short commands
+.PHONY: logs status scan ppscan
 logs:
 	curl -s http://$(IP):8080/api/logs | jq -r '.logs[] | "\(.ts) [\(.level)] \(.msg)"'
 
 status:
 	curl -s http://$(IP):8080/api/status | jq
+
+scan:
+	curl -s http://$(IP):8080/api/scan | jq -r '.scan.results | sort_by(.rssi) | reverse[] | "\(.addr)  \(.rssi)dBm  \(.name)"'
+
+ppscan:
+	curl -s http://$(IP):8080/api/scan | jq -r '.scan.results | map(select(.name != "")) | sort_by(.rssi) | reverse[] | "\(.addr)  \(.rssi)dBm  \(.name)"'
+
 
 ## Show available targets
 help:

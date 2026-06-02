@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc BLE device scanner.
-%%% Scans for advertising BLE devices and stores results.
-%%% Triggered on-demand via HTTP API or programmatically.
+%%% Scans for advertising BLE devices and accumulates results from
+%%% async events sent by the BLE port driver.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(myhome_scanner).
@@ -16,6 +16,8 @@
     port :: port(),
     results = [] :: [map()],
     scanning = false :: boolean(),
+    scan_from :: gen_server:from() | undefined,
+    scan_map = #{} :: #{binary() => map()},
     last_scan :: binary() | undefined
 }).
 
@@ -54,7 +56,6 @@ get_raw_results() ->
 %%====================================================================
 
 init(Port) ->
-    %% Subscribe to async scan events (Phase 1: cross-thread messaging test)
     case ble:subscribe_scan(Port) of
         ok ->
             myhome_log:log(info, "[scanner] Subscribed to async scan events");
@@ -65,24 +66,11 @@ init(Port) ->
 
 handle_call({scan, _Duration}, _From, #state{scanning = true} = State) ->
     {reply, {error, scan_in_progress}, State};
-handle_call({scan, Duration}, _From, #state{port = Port} = State) ->
+handle_call({scan, Duration}, From, #state{port = Port} = State) ->
     case ble:scan_start(Port, Duration) of
         ok ->
-            %% Wait for scan to complete, then collect results
-            timer:sleep((Duration + 1) * 1000),
-            case ble:scan_results(Port) of
-                {ok, Results} ->
-                    Timestamp = format_timestamp(),
-                    NewState = State#state{
-                        results = Results,
-                        scanning = false,
-                        last_scan = Timestamp
-                    },
-                    myhome_log:log(info, "[scanner] Found ~p device(s)", [length(Results)]),
-                    {reply, {ok, length(Results)}, NewState};
-                {error, Reason} ->
-                    {reply, {error, Reason}, State#state{scanning = false}}
-            end;
+            %% Don't reply yet — we'll reply when ble_scan_complete arrives
+            {noreply, State#state{scanning = true, scan_from = From, scan_map = #{}}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -101,12 +89,37 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({ble_scan_event, _Addr, _AddrType, _RSSI, Name}, State) ->
-    %% Phase 1: print to serial to verify async delivery
-    io:format("ASYNC_BLE: ~p~n", [Name]),
+handle_info({ble_scan_event, Addr, AddrType, RSSI, Name}, #state{scanning = true, scan_map = Map} = State) ->
+    %% Dedup by address, update RSSI, prefer non-empty name
+    Entry = case maps:get(Addr, Map, undefined) of
+        undefined ->
+            #{addr => Addr, addr_type => AddrType, rssi => RSSI, name => Name};
+        Existing ->
+            NewName = case Name of
+                <<>> -> maps:get(name, Existing);
+                _ -> Name
+            end,
+            Existing#{rssi => RSSI, name => NewName}
+    end,
+    {noreply, State#state{scan_map = maps:put(Addr, Entry, Map)}};
+handle_info({ble_scan_event, _Addr, _AddrType, _RSSI, _Name}, State) ->
+    %% Not scanning — ignore stray events
+    {noreply, State};
+handle_info({ble_scan_complete}, #state{scanning = true, scan_from = From, scan_map = Map} = State) ->
+    Results = maps:values(Map),
+    myhome_log:log(info, "[scanner] Found ~p device(s)", [length(Results)]),
+    Timestamp = format_timestamp(),
+    gen_server:reply(From, {ok, length(Results)}),
+    {noreply, State#state{
+        results = Results,
+        scanning = false,
+        scan_from = undefined,
+        scan_map = #{},
+        last_scan = Timestamp
+    }};
+handle_info({ble_scan_complete}, State) ->
     {noreply, State};
 handle_info(_Msg, State) ->
-    io:format("myhome_scanner:handle_info: ~w~n", [_Msg]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -131,5 +144,4 @@ format_addr(<<A, B, C, D, E, F>>) ->
                                    [F, E, D, C, B, A])).
 
 format_timestamp() ->
-    %% Simple timestamp — erlang:system_time not always available on AtomVM
     iolist_to_binary(io_lib:format("scan_~p", [erlang:monotonic_time()])).
