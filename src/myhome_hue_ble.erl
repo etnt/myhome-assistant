@@ -10,7 +10,7 @@
 %% Public API
 -export([start_link/3]).
 -export([set_power/2, set_brightness/2, set_color_temp/2]).
--export([set_color_xy/3, set_state/2, get_state/1]).
+-export([set_color_xy/3, set_state/2, get_state/1, read_state/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -102,6 +102,11 @@ set_state(Name, State) when is_map(State) ->
 get_state(Name) ->
     gen_server:call(Name, get_state, ?CALL_TIMEOUT).
 
+%% @doc Read the actual bulb state via BLE GATT (connects on-demand).
+-spec read_state(atom()) -> {ok, map()} | {error, term()}.
+read_state(Name) ->
+    gen_server:call(Name, read_state, ?CALL_TIMEOUT).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -149,6 +154,9 @@ handle_call(get_state, _From, State) ->
     #state{power = Power, brightness = Bri, color_temp = Temp, connected = Conn} = State,
     Reply = {ok, #{power => Power, brightness => Bri, color_temp => Temp, connected => Conn}},
     {reply, Reply, State};
+
+handle_call(read_state, From, State) ->
+    do_cmd(read_all, From, State);
 
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -278,6 +286,27 @@ execute_cmd({write_multi, Props}, #state{conn_handle = Handle} = State) ->
         ok -> update_cached_state(State, Props);
         _  -> State
     end,
+    {Result, NewState};
+execute_cmd(read_all, #state{conn_handle = Handle} = State) ->
+    Power = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_POWER) of
+        {ok, <<P>>} -> P =:= 1;
+        _ -> undefined
+    end,
+    Bri = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_BRIGHTNESS) of
+        {ok, <<B>>} -> B;
+        _ -> undefined
+    end,
+    CT = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_COLOR_TEMP) of
+        {ok, <<T:16/little>>} -> T;
+        _ -> undefined
+    end,
+    XY = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_COLOR_XY) of
+        {ok, <<X:16/big, Y:16/big>>} -> {X, Y};
+        _ -> undefined
+    end,
+    Result = {ok, #{power => Power, brightness => Bri,
+                    color_temp => CT, color_xy => XY}},
+    NewState = State#state{power = Power, brightness = Bri, color_temp = CT},
     {Result, NewState}.
 
 update_cached_from_write(ChrUUID, Value, State) ->

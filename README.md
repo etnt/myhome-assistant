@@ -104,7 +104,11 @@ myhome_hue_ble:set_color_xy(bulb_1, 30146, 26869).
 %% Combined state change (single BLE connection, most efficient)
 myhome_hue_ble:set_state(bulb_1, #{power => true, brightness => 254, color_temp => 370}).
 
-%% Read current state from bulb
+%% Read actual bulb state via BLE (connects on-demand)
+myhome_hue_ble:read_state(bulb_1).
+%% => {ok, #{power => true, brightness => 200, color_temp => 370, color_xy => {30146, 26869}}}
+
+%% Read cached state (no BLE connection)
 myhome_hue_ble:get_state(bulb_1).
 ```
 
@@ -125,6 +129,10 @@ curl -X POST http://<esp-ip>:8080/api/bulb/1/color_temp -d '{"value":370}'
 # Set color via CIE 1931 XY chromaticity (0-65535, where 65535 = 1.0)
 # Useful for saturated colors that can't be expressed as white temperature
 curl -X POST http://<esp-ip>:8080/api/bulb/1/color_xy -d '{"x":30146,"y":26869}'
+
+# Read actual bulb state (connects via BLE, reads GATT characteristics)
+curl http://<esp-ip>:8080/api/bulb/1/state
+# => {"status":"ok","power":true,"brightness":200,"color_temp":370,"color_x":30146,"color_y":26869}
 
 # Set multiple properties at once
 curl -X POST http://<esp-ip>:8080/api/bulb/1/state \

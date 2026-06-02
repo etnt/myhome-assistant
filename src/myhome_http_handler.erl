@@ -153,6 +153,24 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"color_xy">>], HttpRequest) ->
             {400, #{}, <<"Bad Request: x and y must be 0-65535">>}
     end;
 
+do_handle(get, [<<"bulb">>, BulbNum, <<"state">>], _HttpRequest) ->
+    Name = bulb_name(BulbNum),
+    case myhome_hue_ble:read_state(Name) of
+        {ok, State} ->
+            %% Convert color_xy tuple to separate fields
+            Reply = case maps:find(color_xy, State) of
+                {ok, {X, Y}} ->
+                    maps:remove(color_xy, State#{status => ok, color_x => X, color_y => Y});
+                {ok, undefined} ->
+                    maps:remove(color_xy, State#{status => ok});
+                error ->
+                    State#{status => ok}
+            end,
+            json_reply(Reply);
+        {error, Reason} ->
+            json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
 do_handle(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,
