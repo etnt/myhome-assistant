@@ -65,10 +65,12 @@
     brightness :: integer() | undefined,
     color_temp :: integer() | undefined,
     %% Reconnect
-    reconnect_timer :: reference() | undefined
+    reconnect_timer :: reference() | undefined,
+    connect_retries = 0 :: non_neg_integer()
 }).
 
--define(RECONNECT_DELAY, 5000).
+-define(RECONNECT_DELAY, 10000).
+-define(MAX_CONNECT_RETRIES, 3).
 
 %%====================================================================
 %% Public API
@@ -209,16 +211,21 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(connect, #state{connect_retries = N} = State) when N >= ?MAX_CONNECT_RETRIES ->
+    myhome_log:log(warning, "[~p] giving up after ~p connect attempts",
+              [State#state.name, N]),
+    {noreply, State};
 handle_info(connect, State) ->
     case do_connect(State) of
         {ok, NewState} ->
             myhome_log:log(info, "[~p] connected to ~s", [State#state.name, format_addr(State#state.addr)]),
-            {noreply, NewState};
+            {noreply, NewState#state{connect_retries = 0}};
         {error, _Reason} ->
-            myhome_log:log(warning, "[~p] connect to ~s failed, retrying in ~pms",
-                      [State#state.name, format_addr(State#state.addr), ?RECONNECT_DELAY]),
+            Retries = State#state.connect_retries + 1,
+            myhome_log:log(warning, "[~p] connect failed (~p/~p), retrying in ~pms",
+                      [State#state.name, Retries, ?MAX_CONNECT_RETRIES, ?RECONNECT_DELAY]),
             Ref = erlang:send_after(?RECONNECT_DELAY, self(), connect),
-            {noreply, State#state{reconnect_timer = Ref}}
+            {noreply, State#state{reconnect_timer = Ref, connect_retries = Retries}}
     end;
 
 handle_info(_Msg, State) ->

@@ -21,6 +21,7 @@ PORT ?= /dev/cu.usbmodem5B414826621
 ATOMVM_DIR := AtomVM
 ESP32_DIR := $(ATOMVM_DIR)/src/platforms/esp32
 APP_OFFSET ?= 0x250000
+IP ?= 192.168.1.115
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 
@@ -77,6 +78,13 @@ monitor:
 
 ## Build and flash everything
 all: flash
+
+.PHONY: logs status
+logs:
+	curl -s http://$(IP):8080/api/logs | jq -r '.logs[] | "\(.ts) [\(.level)] \(.msg)"'
+
+status:
+	curl -s http://$(IP):8080/api/status | jq
 
 ## Show available targets
 help:

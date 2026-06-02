@@ -54,6 +54,13 @@ get_raw_results() ->
 %%====================================================================
 
 init(Port) ->
+    %% Subscribe to async scan events (Phase 1: cross-thread messaging test)
+    case ble:subscribe_scan(Port) of
+        ok ->
+            myhome_log:log(info, "[scanner] Subscribed to async scan events");
+        {error, Reason} ->
+            myhome_log:log(warning, "[scanner] Failed to subscribe: ~p", [Reason])
+    end,
     {ok, #state{port = Port}}.
 
 handle_call({scan, _Duration}, _From, #state{scanning = true} = State) ->
@@ -94,7 +101,12 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info({ble_scan_event, _Addr, _AddrType, _RSSI, Name}, State) ->
+    %% Phase 1: print to serial to verify async delivery
+    io:format("ASYNC_BLE: ~p~n", [Name]),
+    {noreply, State};
 handle_info(_Msg, State) ->
+    io:format("myhome_scanner:handle_info: ~w~n", [_Msg]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->

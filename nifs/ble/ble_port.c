@@ -17,6 +17,7 @@
 #include <context.h>
 #include <globalcontext.h>
 #include <mailbox.h>
+#include <memory.h>
 #include <port.h>
 #include <portnifloader.h>
 #include <term.h>
@@ -53,6 +54,7 @@ enum {
     OP_SCAN_START   = 0x10,
     OP_SCAN_STOP    = 0x11,
     OP_SCAN_RESULTS = 0x12,
+    OP_SUBSCRIBE_SCAN = 0x13,  // Subscribe to async scan events
 
     // Connection
     OP_CONNECT      = 0x20,
@@ -138,6 +140,15 @@ static uint16_t g_read_len;
 // NimBLE state
 static bool g_ble_initialized = false;
 static uint8_t g_own_addr_type;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async messaging (Phase 1: cross-thread message delivery)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static GlobalContext *g_global = NULL;
+static int32_t g_scan_subscriber_pid = -1;  // PID subscribed to scan events (-1 = none)
+
+static const char *const ble_scan_event_atom = ATOM_STR("\xE", "ble_scan_event");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility: build response binaries
@@ -293,6 +304,38 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC:
         scan_add_result(&event->disc);
+
+        // Phase 1: send async scan event to subscriber (if any)
+        // Only send for devices with a name to avoid flooding with every advertisement
+        if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+            const struct ble_gap_disc_desc *desc = &event->disc;
+            // Parse name from advertisement
+            char name[MAX_NAME_LEN] = {0};
+            uint8_t name_len = 0;
+            parse_adv_name(desc->data, desc->length_data, name, &name_len);
+
+            if (name_len > 0) {
+                ESP_LOGI(TAG, "async send: name=%s pid=%d", name, (int)g_scan_subscriber_pid);
+                // Message: {ble_scan_event, <<Addr:6/binary>>, AddrType, RSSI, <<Name/binary>>}
+                #define SCAN_EVENT_HEAP_SIZE (TUPLE_SIZE(5) + TERM_BINARY_HEAP_SIZE(6) + TERM_BINARY_HEAP_SIZE(MAX_NAME_LEN))
+                BEGIN_WITH_STACK_HEAP(SCAN_EVENT_HEAP_SIZE, heap);
+                {
+                    term atom = globalcontext_make_atom(g_global, ble_scan_event_atom);
+                    term addr_bin = term_from_literal_binary(desc->addr.val, 6, &heap, g_global);
+                    term addr_type = term_from_int(desc->addr.type);
+                    term rssi = term_from_int(desc->rssi);
+                    term name_bin = term_from_literal_binary(
+                        (const void *) name, strlen(name), &heap, g_global);
+
+                    term msg = port_heap_create_tuple_n(&heap, 5,
+                        (term[]){atom, addr_bin, addr_type, rssi, name_bin});
+
+                    port_send_message_from_task(g_global,
+                        term_from_local_process_id(g_scan_subscriber_pid), msg);
+                }
+                END_WITH_STACK_HEAP(heap, g_global);
+            }
+        }
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -345,6 +388,15 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             int idx = conn_find_by_handle(handle);
             if (idx >= 0) {
                 g_conns[idx].state = CONN_STATE_BONDED;
+            }
+        } else {
+            // Bonding failed — disconnect to free the radio (prevents WiFi starvation)
+            ESP_LOGW(TAG, "bonding failed (status=%d), disconnecting handle=%u", status, handle);
+            ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
+            int idx = conn_find_by_handle(handle);
+            if (idx >= 0) {
+                g_conns[idx].state = CONN_STATE_IDLE;
+                g_conns[idx].conn_handle = 0;
             }
         }
         return 0;
@@ -514,8 +566,8 @@ static term handle_scan_start(Context *ctx, const uint8_t *data, size_t len)
     struct ble_gap_disc_params params;
     memset(&params, 0, sizeof(params));
     params.passive = 0;  // active scan to get names
-    params.itvl = 0x0010;
-    params.window = 0x0010;
+    params.itvl = 0x0100;   // 160ms interval — leaves gaps for WiFi
+    params.window = 0x0030;  // 30ms window — ~19% BLE duty cycle
     params.filter_duplicates = 0;
 
     int32_t duration_ms = (int32_t) duration_sec * 1000;
@@ -539,6 +591,22 @@ static term handle_scan_stop(Context *ctx)
         ble_gap_disc_cancel();
         g_scanning = false;
     }
+    return make_ok(ctx);
+}
+
+/**
+ * Subscribe calling process to receive async scan events.
+ * Request: <<OP_SUBSCRIBE_SCAN>>
+ * Effect: Each advertisement will send {ble_scan_event, Addr, AddrType, RSSI, Name}
+ *         to the calling process asynchronously from NimBLE's task.
+ */
+static term handle_subscribe_scan(Context *ctx, term caller_pid)
+{
+    if (!g_ble_initialized) {
+        return make_error(ctx, RSP_ERR_STATE);
+    }
+    g_scan_subscriber_pid = term_to_local_process_id(caller_pid);
+    ESP_LOGI(TAG, "scan subscriber registered: pid=%d", (int) g_scan_subscriber_pid);
     return make_ok(ctx);
 }
 
@@ -912,7 +980,7 @@ static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, boo
 // Port message dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
-static term handle_call(Context *ctx, term req)
+static term handle_call(Context *ctx, term req, term caller_pid)
 {
     if (!term_is_binary(req)) {
         return make_error(ctx, RSP_ERR_ARGS);
@@ -939,6 +1007,9 @@ static term handle_call(Context *ctx, term req)
 
     case OP_SCAN_RESULTS:
         return handle_scan_results(ctx);
+
+    case OP_SUBSCRIBE_SCAN:
+        return handle_subscribe_scan(ctx, caller_pid);
 
     case OP_CONNECT:
         return handle_connect(ctx, data, len);
@@ -984,7 +1055,7 @@ static NativeHandlerResult ble_port_native_handler(Context *ctx)
         return NativeContinue;
     }
 
-    term reply = handle_call(ctx, gen_message.req);
+    term reply = handle_call(ctx, gen_message.req, gen_message.pid);
     port_send_reply(ctx, gen_message.pid, gen_message.ref, reply);
 
     return NativeContinue;
@@ -1012,6 +1083,7 @@ Context *ble_port_create_port(GlobalContext *global, term opts)
     }
 
     ctx->native_handler = ble_port_native_handler;
+    g_global = global;
     return ctx;
 }
 

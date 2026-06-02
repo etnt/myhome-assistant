@@ -115,6 +115,106 @@ Sending Erlang messages from NimBLE callbacks requires:
 2. Using AtomVM's `globalcontext_send_message()` from a non-Erlang thread
 3. Proper locking (AtomVM may not be fully thread-safe for this — needs verification)
 
+## Implementation Approach
+
+Incremental migration in 4 phases. Each phase produces a working system that
+can be flashed and tested before proceeding.
+
+### Phase 1: Verify Cross-Thread Messaging
+
+**Goal:** Confirm that AtomVM can receive messages sent from NimBLE's FreeRTOS task.
+
+1. Add a minimal test: register the port owner PID in C during `init`
+2. In the existing `gap_event_cb` (scan callback), send a simple message to the
+   owner PID: `{ble_adv_raw, Addr, AddrType, RSSI, AdvData}`
+3. Add a temporary Erlang process that receives and logs these messages
+4. If messages arrive correctly → proceed. If not → investigate AtomVM's
+   `globalcontext_send_message()` thread safety or use a FreeRTOS queue + polling.
+
+**Fallback:** If cross-thread send doesn't work, use a shared ring buffer in C
+that the Erlang side polls via `port:call` on a timer (less elegant but functional).
+
+### Phase 2: Async Scan Events
+
+**Goal:** Replace synchronous scan_start/scan_results with event-driven scanning.
+
+1. C `scan_start` initiates NimBLE discovery, returns immediately with `ok`
+2. Each advertisement fires a message to the owner: `{ble_adv, Addr, AddrType, RSSI, Name}`
+   (parse AD data in C minimally — just extract name — or send raw and parse in Erlang)
+3. Scan complete sends `{ble_scan_complete, Reason}`
+4. Move scan result dedup/caching to `myhome_scanner.erl` (Erlang map)
+5. Remove `g_scan_results[]`, `scan_add_result()`, `parse_adv_name()` from C
+
+### Phase 3: Async Connect + Security Events
+
+**Goal:** Non-blocking connection and bond management.
+
+1. C `connect` initiates `ble_gap_connect()`, returns immediately
+2. Events sent to owner:
+   - `{ble_connected, ConnHandle, Addr, Status}`
+   - `{ble_disconnected, ConnHandle, Reason}`
+   - `{ble_enc_change, ConnHandle, Status}`
+3. New `security` opcode calls `ble_gap_security_initiate()`
+4. Erlang gen_server manages connection state machine:
+   - `connecting → connected → encrypting → bonded`
+   - On `enc_change` with status=1285: delete bond, disconnect, retry
+5. Remove `g_conns[]` slot management, `conn_alloc`, `conn_find_*` from C
+6. Remove semaphore waiting from connect path
+
+### Phase 4: Async GATT Operations
+
+**Goal:** Non-blocking reads/writes with Erlang-managed timeouts.
+
+1. Add `disc_chars` opcode — discovers all characteristics, sends results as
+   message: `{ble_chars, ConnHandle, [{UUID, ValHandle, Properties}]}`
+2. Cache characteristic handles in Erlang (per-connection map)
+3. `gatt_write` takes `ValHandle` directly (no per-write discovery!)
+4. Write result sent as `{ble_write_result, ConnHandle, ValHandle, Status}`
+5. Read result sent as `{ble_read_result, ConnHandle, UUID, Status, Data}`
+6. Erlang handles retries and timeouts via `receive...after`
+7. Remove `discover_char_handle()`, `disc_chr_cb`, `gatt_write_cb`,
+   `gatt_read_by_uuid_cb`, and all semaphore code from C
+
+### Architecture After Refactor
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Erlang                                              │
+│                                                     │
+│  myhome_ble_conn (gen_server)                       │
+│    - owns the port                                  │
+│    - connection state machine per handle            │
+│    - characteristic handle cache                    │
+│    - timeout management (receive...after)           │
+│    - auto-rebond on enc_change failure              │
+│    - scan result dedup (map by address)             │
+│                                                     │
+│  myhome_hue_ble (gen_server, per bulb)              │
+│    - calls myhome_ble_conn for GATT ops             │
+│    - Hue protocol encoding (UUIDs, TLV)             │
+│    - light state caching                            │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│ C (ble_port.c, ~275 lines)                          │
+│    - NimBLE init + config                           │
+│    - Thin wrappers: scan, connect, disconnect,      │
+│      security, gatt_read, gatt_write, disc_chars    │
+│    - Callbacks → send Erlang messages               │
+│    - No state management, no timeouts, no parsing   │
+└─────────────────────────────────────────────────────┘
+```
+
+### Key Benefits Over Current Design
+
+| Problem | Current | After Refactor |
+|---------|---------|----------------|
+| HTTP hangs during BLE ops | port:call blocks scheduler | Async messages, never blocks |
+| Timeout cascades (C/port/gen_server) | 3 layers to tune | Single `receive...after` |
+| Stale semaphore after timeout | Drain hack needed | No semaphores at all |
+| Bond failure (status=1285) | Manual reset required | Auto-detect and rebond |
+| First write slow (char discovery) | Discovery on every write | Cache handles after first discovery |
+| Radio contention drops | Timeout + disconnect | Retry with backoff in Erlang |
+
 ## Next Steps
 
 1. Verify AtomVM supports `globalcontext_send_message()` from arbitrary FreeRTOS tasks

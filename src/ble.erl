@@ -7,6 +7,7 @@
 
 -export([open/0, stop/1]).
 -export([scan_start/1, scan_start/2, scan_stop/1, scan_results/1]).
+-export([subscribe_scan/1]).
 -export([connect/3, disconnect/2, conn_state/2]).
 -export([gatt_read/4, gatt_write/5, gatt_write_nr/5]).
 
@@ -15,6 +16,7 @@
 -define(OP_SCAN_START,   16#10).
 -define(OP_SCAN_STOP,    16#11).
 -define(OP_SCAN_RESULTS, 16#12).
+-define(OP_SUBSCRIBE_SCAN, 16#13).
 -define(OP_CONNECT,      16#20).
 -define(OP_DISCONNECT,   16#21).
 -define(OP_CONN_STATE,   16#22).
@@ -72,6 +74,16 @@ scan_results(Port) ->
     case call(Port, <<?OP_SCAN_RESULTS>>) of
         {ok, Data} -> {ok, parse_scan_results(Data)};
         Error      -> Error
+    end.
+
+%% @doc Subscribe the calling process to receive async scan events.
+%% Each advertisement will arrive as {ble_scan_event, Addr, AddrType, RSSI, Name}
+%% where Addr and Name are binaries.
+-spec subscribe_scan(port()) -> ok | {error, term()}.
+subscribe_scan(Port) ->
+    case call(Port, <<?OP_SUBSCRIBE_SCAN>>) of
+        {ok, _} -> ok;
+        Error   -> Error
     end.
 
 %%--------------------------------------------------------------------
