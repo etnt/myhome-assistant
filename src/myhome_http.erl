@@ -27,7 +27,7 @@ start_link() ->
 init([]) ->
     SSID = myhome_config:wifi_ssid(),
     PSK = myhome_config:wifi_psk(),
-    io:format("Connecting to WiFi (~s)...~n", [SSID]),
+    myhome_log:log(info, "Connecting to WiFi (~s)...", [SSID]),
     Creds = [{ssid, SSID}, {psk, PSK}],
     case network:wait_for_sta(Creds, 30000) of
         {ok, {Address, _Netmask, _Gateway}} ->
@@ -40,15 +40,17 @@ init([]) ->
             case httpd:start(Port, HttpConfig) of
                 {ok, _} ->
                     io:format("HTTP API listening on port ~p~n", [Port]),
-                    io:format("Try: curl http://~s:~p/api/status~n",
+                    myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
+                    myhome_log:log(info, "Try: curl http://~s:~p/api/status",
                               [format_ip(Address), Port]),
                     {ok, #state{}};
                 {error, Reason} ->
-                    io:format("HTTP server failed: ~p~n", [Reason]),
+                    io:format("HTTP server FAILED: ~p~n", [Reason]),
+                    myhome_log:log(error, "HTTP server failed: ~p", [Reason]),
                     {stop, {http_start_failed, Reason}}
             end;
         {error, Reason} ->
-            io:format("WiFi failed: ~p~n", [Reason]),
+            myhome_log:log(error, "WiFi failed: ~p", [Reason]),
             {stop, {wifi_failed, Reason}}
     end.
 

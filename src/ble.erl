@@ -141,7 +141,7 @@ gatt_write_nr(Port, ConnIdx, SvcUUID, ChrUUID, Value)
 
 -spec call(port(), binary()) -> {ok, binary()} | {error, term()}.
 call(Port, Request) ->
-    case port:call(Port, Request, 15000) of
+    case port:call(Port, Request, 30000) of
         <<?RSP_OK, Payload/binary>> ->
             {ok, Payload};
         <<?RSP_ERR, Code/binary>> ->

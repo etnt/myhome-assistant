@@ -82,7 +82,7 @@
 start_link(Port, Addr, AddrType, Name) ->
     gen_server:start_link({local, Name}, ?MODULE, {Port, Addr, AddrType, Name}, []).
 
--define(CALL_TIMEOUT, 15000).
+-define(CALL_TIMEOUT, 35000).
 
 -spec set_power(atom(), boolean()) -> ok | {error, term()}.
 set_power(Name, On) ->
@@ -92,8 +92,8 @@ set_power(Name, On) ->
 set_brightness(Name, Bri) when Bri >= 1, Bri =< 254 ->
     gen_server:call(Name, {set_brightness, Bri}, ?CALL_TIMEOUT).
 
--spec set_color_temp(atom(), 0..255) -> ok | {error, term()}.
-set_color_temp(Name, Temp) when Temp >= 0, Temp =< 255 ->
+-spec set_color_temp(atom(), 153..500) -> ok | {error, term()}.
+set_color_temp(Name, Temp) when Temp >= 153, Temp =< 500 ->
     gen_server:call(Name, {set_color_temp, Temp}, ?CALL_TIMEOUT).
 
 -spec set_color_xy(atom(), 0..65535, 0..65535) -> ok | {error, term()}.
@@ -133,7 +133,7 @@ init({Port, Addr, AddrType, Name}) ->
     erlang:send_after(Delay, self(), connect),
     {ok, State}.
 
-handle_call({set_power, On}, _From, #state{connected = false} = State) ->
+handle_call({set_power, _On}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call({set_power, On}, _From, #state{port = Port, conn_idx = Idx} = State) ->
     Value = case On of true -> <<16#01>>; false -> <<16#00>> end,
@@ -144,7 +144,7 @@ handle_call({set_power, On}, _From, #state{port = Port, conn_idx = Idx} = State)
     end,
     {reply, Result, NewState};
 
-handle_call({set_brightness, Bri}, _From, #state{connected = false} = State) ->
+handle_call({set_brightness, _Bri}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call({set_brightness, Bri}, _From, #state{port = Port, conn_idx = Idx} = State) ->
     Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<Bri:8>>),
@@ -154,23 +154,23 @@ handle_call({set_brightness, Bri}, _From, #state{port = Port, conn_idx = Idx} = 
     end,
     {reply, Result, NewState};
 
-handle_call({set_color_temp, Temp}, _From, #state{connected = false} = State) ->
+handle_call({set_color_temp, _Temp}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call({set_color_temp, Temp}, _From, #state{port = Port, conn_idx = Idx} = State) ->
-    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<Temp:8>>),
+    Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<Temp:16/little>>),
     NewState = case Result of
         ok -> State#state{color_temp = Temp};
         _  -> State
     end,
     {reply, Result, NewState};
 
-handle_call({set_color_xy, X, Y}, _From, #state{connected = false} = State) ->
+handle_call({set_color_xy, _X, _Y}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call({set_color_xy, X, Y}, _From, #state{port = Port, conn_idx = Idx} = State) ->
     Result = ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>),
     {reply, Result, State};
 
-handle_call({set_state, Props}, _From, #state{connected = false} = State) ->
+handle_call({set_state, _Props}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call({set_state, Props}, _From, #state{port = Port, conn_idx = Idx} = State) ->
     %% Write each property to its individual characteristic
@@ -181,7 +181,7 @@ handle_call({set_state, Props}, _From, #state{port = Port, conn_idx = Idx} = Sta
         ({brightness, B}) ->
             ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<B:8>>);
         ({color_temp, T}) ->
-            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<T:8>>);
+            ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<T:16/little>>);
         ({color_xy, {X, Y}}) ->
             ble:gatt_write(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>);
         (_) -> ok
@@ -199,8 +199,8 @@ handle_call({set_state, Props}, _From, #state{port = Port, conn_idx = Idx} = Sta
 handle_call(get_state, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
 handle_call(get_state, _From, State) ->
-    %% Read individual characteristics and return current state
-    Reply = read_current_state(State),
+    #state{power = Power, brightness = Bri, color_temp = Temp, connected = Conn} = State,
+    Reply = {ok, #{power => Power, brightness => Bri, color_temp => Temp, connected => Conn}},
     {reply, Reply, State};
 
 handle_call(_Req, _From, State) ->
@@ -212,11 +212,11 @@ handle_cast(_Msg, State) ->
 handle_info(connect, State) ->
     case do_connect(State) of
         {ok, NewState} ->
-            io:format("[~p] connected to bulb~n", [State#state.name]),
+            myhome_log:log(info, "[~p] connected to ~s", [State#state.name, format_addr(State#state.addr)]),
             {noreply, NewState};
         {error, _Reason} ->
-            io:format("[~p] connect failed, retrying in ~pms~n",
-                      [State#state.name, ?RECONNECT_DELAY]),
+            myhome_log:log(warning, "[~p] connect to ~s failed, retrying in ~pms",
+                      [State#state.name, format_addr(State#state.addr), ?RECONNECT_DELAY]),
             Ref = erlang:send_after(?RECONNECT_DELAY, self(), connect),
             {noreply, State#state{reconnect_timer = Ref}}
     end;
@@ -256,8 +256,8 @@ build_combined_cmd(Props) ->
         ({power, false}) -> {true, <<?TLV_POWER, 16#01, 16#00>>};
         ({brightness, B}) when B >= 1, B =< 254 ->
             {true, <<?TLV_BRIGHTNESS, 16#01, B:8>>};
-        ({color_temp, T}) when T >= 0, T =< 255 ->
-            {true, <<?TLV_COLOR_TEMP, 16#02, T:8, 16#01>>};
+        ({color_temp, T}) when T >= 153, T =< 500 ->
+            {true, <<?TLV_COLOR_TEMP, 16#02, T:16/little>>};
         ({color_xy, {X, Y}}) when X >= 0, X =< 65535, Y >= 0, Y =< 65535 ->
             {true, <<?TLV_COLOR_XY, 16#04, X:16/big, Y:16/big>>};
         (_) -> false
@@ -276,7 +276,8 @@ read_current_state(#state{port = Port, conn_idx = Idx}) ->
         _ -> undefined
     end,
     Temp = case ble:gatt_read(Port, Idx, ?SVC_LIGHT, ?CHR_COLOR_TEMP) of
-        {ok, <<T:8, _/binary>>} -> T;
+        {ok, <<T:16/little>>} -> T;
+        {ok, <<T:16/little, _/binary>>} -> T;
         _ -> undefined
     end,
     {ok, #{power => Power, brightness => Bri, color_temp => Temp}}.
@@ -294,3 +295,7 @@ update_cached_state(State, Props) ->
         {ok, T} -> S2#state{color_temp = T};
         error   -> S2
     end.
+
+format_addr(<<A, B, C, D, E, F>>) ->
+    io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
+                  [F, E, D, C, B, A]).

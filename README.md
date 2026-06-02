@@ -13,6 +13,7 @@ AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 ```
 ESP32-S3 (AtomVM/Erlang)
   ├── myhome_top_sup (rest_for_one)
+  │     ├── myhome_log (in-memory log ring buffer)
   │     ├── myhome_scanner ──BLE scan──► all nearby devices
   │     └── myhome_sup (one_for_one)
   │           ├── myhome_http (WiFi + HTTP API)
@@ -118,6 +119,22 @@ curl http://<esp-ip>:8080/api/scan
 
 # Trigger discovery and pairing of new Hue bulbs
 curl -X POST http://<esp-ip>:8080/api/discover
+
+# View system logs (newest first)
+curl http://<esp-ip>:8080/api/logs
+
+# Pretty printed as oneliners
+curl http://<esp-ip>:8080/api/logs | jq -r '.logs[] | "\(.ts) [\(.level)] \(.msg)"'
+
+# Filter logs by level
+curl http://<esp-ip>:8080/api/logs?level=error
+
+# Limit number of entries
+curl http://<esp-ip>:8080/api/logs?limit=20
+
+# 1. Factory-reset bulbs (power-cycle 5x) so they enter pairing mode
+# 2. Then clear ESP32 bonds + config and reboot:
+curl -X POST http://192.168.1.115:8080/api/reset
 ```
 
 
@@ -205,6 +222,7 @@ the WiFi access point, or reduce BLE activity.
 ├── src/
 │   ├── myhome_app.erl        Application entry point (start/0)
 │   ├── myhome_top_sup.erl    Top-level supervisor (rest_for_one)
+│   ├── myhome_log.erl        In-memory log server (ring buffer via queue)
 │   ├── myhome_sup.erl        Secondary supervisor (one_for_one)
 │   ├── myhome_http.erl       WiFi connection + HTTP server
 │   ├── myhome_scanner.erl    On-demand BLE device scanner

@@ -23,6 +23,20 @@ handle_api_request(get, [<<"status">>], _HttpRequest, _Args) ->
     Bulbs = get_bulb_status(),
     {ok, #{status => ok, bulbs => Bulbs}};
 
+handle_api_request(get, [<<"logs">>], HttpRequest, _Args) ->
+    try
+        Opts = parse_log_opts(HttpRequest),
+        Logs = myhome_log:get_logs(Opts),
+        JsonLogs = [#{seq => maps:get(seq, E),
+                      ts => maps:get(ts, E),
+                      level => maps:get(level, E),
+                      msg => binary_to_list(maps:get(msg, E))}
+                    || E <- Logs],
+        {ok, #{status => ok, count => length(JsonLogs), logs => JsonLogs}}
+    catch C:R ->
+        {ok, #{status => error, reason => list_to_binary(io_lib:format("~p:~p", [C, R]))}}
+    end;
+
 handle_api_request(get, [<<"scan">>], _HttpRequest, _Args) ->
     case myhome_scanner:get_results() of
         {ok, Results} ->
@@ -51,6 +65,17 @@ handle_api_request(post, [<<"discover">>], _HttpRequest, _Args) ->
         {error, Reason} ->
             {ok, #{status => error, reason => to_bin(Reason)}}
     end;
+
+handle_api_request(post, [<<"reset">>], _HttpRequest, _Args) ->
+    myhome_log:log(info, "Factory reset requested via API"),
+    %% Clear app config (bulb addresses)
+    try esp:nvs_erase_all(myhome) catch _:_ -> ok end,
+    %% Clear NimBLE bond table
+    try esp:nvs_erase_all(nimble_bond) catch _:_ -> ok end,
+    try esp:nvs_erase_all(nimble_cccd) catch _:_ -> ok end,
+    %% Respond before restarting
+    spawn(fun() -> timer:sleep(500), esp:restart() end),
+    {ok, #{status => ok, message => <<"Resetting. Device will reboot in 500ms.">>}};
 
 handle_api_request(post, [<<"bulb">>, BulbNum, <<"power">>], HttpRequest, _Args) ->
     Name = bulb_name(BulbNum),
@@ -124,7 +149,9 @@ get_bulb_status() ->
         case whereis(Name) of
             undefined -> false;
             _Pid ->
-                case catch myhome_hue_ble:get_state(Name) of
+                Result = try myhome_hue_ble:get_state(Name)
+                         catch _:_ -> {error, crashed} end,
+                case Result of
                     {ok, State} -> {true, State#{name => Name}};
                     _ -> {true, #{name => Name, connected => false}}
                 end
@@ -205,3 +232,18 @@ take_digits(_, Acc) -> Acc.
 
 to_bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8);
 to_bin(Other) -> list_to_binary(io_lib:format("~p", [Other])).
+
+parse_log_opts(HttpRequest) ->
+    Params = maps:get(params, HttpRequest, #{}),
+    Opts0 = #{},
+    Opts1 = case maps:get(<<"level">>, Params, undefined) of
+        undefined -> Opts0;
+        LevelBin -> Opts0#{level => binary_to_atom(LevelBin, utf8)}
+    end,
+    case maps:get(<<"limit">>, Params, undefined) of
+        undefined -> Opts1;
+        LimitBin ->
+            try Opts1#{limit => binary_to_integer(LimitBin)}
+            catch _:_ -> Opts1
+            end
+    end.

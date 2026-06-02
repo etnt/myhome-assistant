@@ -16,6 +16,14 @@ start_link(Port) ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, Port).
 
 init(Port) ->
+    LogSpec = #{
+        id => myhome_log,
+        start => {myhome_log, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     ScannerSpec = #{
         id => myhome_scanner,
         start => {myhome_scanner, start_link, [Port]},
@@ -38,4 +46,4 @@ init(Port) ->
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, SubSupSpec]}}.
+    {ok, {SupFlags, [LogSpec, ScannerSpec, SubSupSpec]}}.

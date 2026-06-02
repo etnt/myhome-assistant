@@ -71,7 +71,7 @@ handle_call({scan, Duration}, _From, #state{port = Port} = State) ->
                         scanning = false,
                         last_scan = Timestamp
                     },
-                    io:format("[scanner] Found ~p device(s)~n", [length(Results)]),
+                    myhome_log:log(info, "[scanner] Found ~p device(s)", [length(Results)]),
                     {reply, {ok, length(Results)}, NewState};
                 {error, Reason} ->
                     {reply, {error, Reason}, State#state{scanning = false}}

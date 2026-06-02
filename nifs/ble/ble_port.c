@@ -83,7 +83,7 @@ enum {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define MAX_CONNECTIONS 2
-#define OP_TIMEOUT_MS   10000  // 10s timeout for BLE operations
+#define OP_TIMEOUT_MS   20000  // 20s timeout for BLE operations (first write needs full service discovery)
 
 typedef enum {
     CONN_STATE_IDLE = 0,
@@ -755,6 +755,9 @@ static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
     g_read_len = 0;
     g_op_rc = -1;
 
+    // Drain any stale semaphore from a previous timed-out operation
+    xSemaphoreTake(g_op_sem, 0);
+
     int rc = ble_gattc_read_by_uuid(g_conns[idx].conn_handle,
                                     1, 0xFFFF,  // search all handles
                                     &char_uuid.u,
@@ -826,6 +829,9 @@ static int discover_char_handle(uint16_t conn_handle, const uint8_t *svc_uuid_be
     g_disc_char_handle = 0;
     g_op_rc = -1;
 
+    // Drain any stale semaphore from a previous timed-out operation
+    xSemaphoreTake(g_op_sem, 0);
+
     int rc = ble_gattc_disc_all_chrs(conn_handle, 1, 0xFFFF, disc_chr_cb, NULL);
     if (rc != 0) {
         return rc;
@@ -871,6 +877,10 @@ static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, boo
 
     if (with_response) {
         g_op_rc = -1;
+
+        // Drain any stale semaphore from a previous timed-out operation
+        xSemaphoreTake(g_op_sem, 0);
+
         rc = ble_gattc_write_flat(g_conns[idx].conn_handle, val_handle,
                                   value, value_len, gatt_write_cb, NULL);
         if (rc != 0) {

@@ -74,18 +74,18 @@ handle_info(init_bulbs, #state{port = Port} = State) ->
     Config = load_config(),
     case Config of
         [] ->
-            io:format("No bulbs configured, starting discovery...~n"),
+            myhome_log:log(info, "No bulbs configured, starting discovery..."),
             case do_discovery(Port) of
                 {ok, [_|_] = Paired} ->
                     BulbConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
                     start_bulb_children(Port, BulbConfig),
                     {noreply, State#state{config = BulbConfig}};
                 _ ->
-                    io:format("No bulbs paired. Use POST /api/discover to retry.~n"),
+                    myhome_log:log(warning, "No bulbs paired. Use POST /api/discover to retry."),
                     {noreply, State}
             end;
         _ ->
-            io:format("Starting ~p bulb(s) from NVS config~n", [length(Config)]),
+            myhome_log:log(info, "Starting ~p bulb(s) from NVS config", [length(Config)]),
             start_bulb_children(Port, Config),
             {noreply, State#state{config = Config}}
     end;
@@ -100,26 +100,26 @@ terminate(_Reason, _State) ->
 %%====================================================================
 
 do_discovery(Port) ->
-    io:format("~n=== Hue Bulb Discovery ===~n"),
-    io:format("Make sure your Hue bulbs are in pairing mode~n"),
-    io:format("(power-cycle the bulb -- it stays in pairing mode for 30s)~n~n"),
-    io:format("Scanning for ~p seconds...~n", [?SCAN_DURATION]),
+    myhome_log:log(info, "=== Hue Bulb Discovery ==="),
+    myhome_log:log(info, "Make sure your Hue bulbs are in pairing mode"),
+    myhome_log:log(info, "(power-cycle the bulb -- it stays in pairing mode for 30s)"),
+    myhome_log:log(info, "Scanning for ~p seconds...", [?SCAN_DURATION]),
 
     case scan_for_hue() of
         {ok, []} ->
-            io:format("No Hue bulbs found.~n"),
+            myhome_log:log(info, "No Hue bulbs found."),
             {ok, []};
         {ok, Bulbs} ->
-            io:format("~nFound ~p Hue bulb(s):~n", [length(Bulbs)]),
+            myhome_log:log(info, "Found ~p Hue bulb(s):", [length(Bulbs)]),
             print_bulbs(Bulbs),
-            io:format("~nAttempting to pair with each bulb...~n"),
+            myhome_log:log(info, "Attempting to pair with each bulb..."),
             Paired = pair_all(Port, Bulbs),
-            io:format("~n=== Pairing complete ===~n"),
+            myhome_log:log(info, "=== Pairing complete ==="),
             print_paired(Paired),
             save_config(Paired),
             {ok, Paired};
         {error, Reason} ->
-            io:format("Scan failed: ~p~n", [Reason]),
+            myhome_log:log(error, "Scan failed: ~p", [Reason]),
             {error, Reason}
     end.
 
@@ -151,11 +151,11 @@ start_bulb_children(Port, Config) ->
         },
         case supervisor:start_child(myhome_sup, ChildSpec) of
             {ok, _Pid} ->
-                io:format("Started ~p~n", [Name]);
+                myhome_log:log(info, "Started ~p", [Name]);
             {error, {already_started, _}} ->
-                io:format("~p already running~n", [Name]);
+                myhome_log:log(info, "~p already running", [Name]);
             {error, Reason} ->
-                io:format("Failed to start ~p: ~p~n", [Name, Reason])
+                myhome_log:log(error, "Failed to start ~p: ~p", [Name, Reason])
         end
     end, Config).
 
@@ -164,26 +164,26 @@ start_bulb_children(Port, Config) ->
 %%====================================================================
 
 pair(Port, Addr, AddrType) ->
-    io:format("  Connecting to ~s...", [format_addr(Addr)]),
+    myhome_log:log(info, "Connecting to ~s...", [format_addr(Addr)]),
     case ble:connect(Port, Addr, AddrType) of
         {ok, Idx} ->
             timer:sleep(2000),
             case ble:conn_state(Port, Idx) of
                 {ok, bonded} ->
-                    io:format(" bonded!~n"),
+                    myhome_log:log(info, "~s bonded!", [format_addr(Addr)]),
                     ble:disconnect(Port, Idx),
                     ok;
                 {ok, connected} ->
-                    io:format(" connected (bond pending)~n"),
+                    myhome_log:log(info, "~s connected (bond pending)", [format_addr(Addr)]),
                     ble:disconnect(Port, Idx),
                     ok;
                 {ok, Other} ->
-                    io:format(" unexpected state: ~p~n", [Other]),
+                    myhome_log:log(warning, "~s unexpected state: ~p", [format_addr(Addr), Other]),
                     ble:disconnect(Port, Idx),
                     {error, {unexpected_state, Other}}
             end;
         {error, Reason} ->
-            io:format(" failed: ~p~n", [Reason]),
+            myhome_log:log(error, "~s connect failed: ~p", [format_addr(Addr), Reason]),
             {error, Reason}
     end.
 
@@ -230,7 +230,7 @@ load_bulbs(N, Acc) ->
     Key = list_to_binary("bulb_" ++ integer_to_list(N) ++ "_addr"),
     case esp:nvs_get_binary(myhome, Key) of
         {ok, Addr} when byte_size(Addr) =:= 6 ->
-            io:format("Loaded ~p from NVS: ~s~n", [Name, format_addr(Addr)]),
+            myhome_log:log(info, "Loaded ~p from NVS: ~s", [Name, format_addr(Addr)]),
             load_bulbs(N + 1, [{Name, Addr, 1} | Acc]);
         _ ->
             lists:reverse(Acc)
@@ -243,9 +243,9 @@ save_config(Paired) ->
         try
             esp:nvs_set_binary(myhome, list_to_binary(Key), Addr),
             esp:nvs_set_binary(myhome, list_to_binary(NameKey), DisplayName),
-            io:format("Saved ~p (~s) to NVS~n", [Name, DisplayName])
+            myhome_log:log(info, "Saved ~p (~s) to NVS", [Name, DisplayName])
         catch _:_ ->
-            io:format("Warning: could not save ~p to NVS~n", [Name])
+            myhome_log:log(warning, "Could not save ~p to NVS", [Name])
         end
     end, Paired).
 
@@ -274,14 +274,14 @@ lower_char(C) -> C.
 
 print_bulbs(Bulbs) ->
     lists:foldl(fun(#{addr := Addr, rssi := RSSI, name := Name}, N) ->
-        io:format("  ~p. ~s (~s) RSSI: ~p dBm~n",
+        myhome_log:log(info, "  ~p. ~s (~s) RSSI: ~p dBm",
                   [N, Name, format_addr(Addr), RSSI]),
         N + 1
     end, 1, Bulbs).
 
 print_paired(Paired) ->
     lists:foreach(fun({Name, Addr, _AddrType, DisplayName}) ->
-        io:format("  ~p: ~s (~s)~n", [Name, DisplayName, format_addr(Addr)])
+        myhome_log:log(info, "  ~p: ~s (~s)", [Name, DisplayName, format_addr(Addr)])
     end, Paired).
 
 format_addr(<<A, B, C, D, E, F>>) ->

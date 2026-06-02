@@ -17,7 +17,7 @@ start() ->
             %% Start supervision tree (scanner → HTTP → discovery → bulbs)
             case myhome_top_sup:start_link(Port) of
                 {ok, _} ->
-                    io:format("MyHome Assistant running~n"),
+                    myhome_log:log(info, "MyHome Assistant running"),
                     loop();
                 {error, Reason} ->
                     io:format("Failed to start supervisor: ~p~n", [Reason]),
@@ -33,5 +33,6 @@ loop() ->
         stop -> ok;
         _Msg -> loop()
     after 60000 ->
+        io:format("."),
         loop()
     end.
