@@ -33,11 +33,7 @@ init([]) ->
         {ok, {Address, _Netmask, _Gateway}} ->
             io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
             Port = myhome_config:http_port(),
-            HttpConfig = [
-                {[<<"api">>], #{handler => httpd_api_handler,
-                                handler_config => #{module => myhome_http_handler, args => #{}}}}
-            ],
-            case httpd:start(Port, HttpConfig) of
+            case tiny_httpd:start_link(Port, myhome_http_handler) of
                 {ok, _} ->
                     io:format("HTTP API listening on port ~p~n", [Port]),
                     myhome_log:log(info, "HTTP API listening on port ~p", [Port]),

@@ -80,19 +80,24 @@ monitor:
 all: flash
 
 ## Some nice short commands
-.PHONY: logs status scan ppscan
+.PHONY: logs status scan doscan ppscan discover
 logs:
-	curl -s http://$(IP):8080/api/logs | jq -r '.logs[] | "\(.ts) [\(.level)] \(.msg)"'
+	@curl -s http://$(IP):8080/api/logs | jq -r '.logs | reverse[] | "\(.ts) [\(.level)] \(.msg)"'
 
 status:
-	curl -s http://$(IP):8080/api/status | jq
+	@curl -s http://$(IP):8080/api/status | jq
 
 scan:
-	curl -s http://$(IP):8080/api/scan | jq -r '.scan.results | sort_by(.rssi) | reverse[] | "\(.addr)  \(.rssi)dBm  \(.name)"'
+	@curl -s http://$(IP):8080/api/scan 
+
+doscan:
+	@curl -s -X POST http://$(IP):8080/api/scan 
 
 ppscan:
-	curl -s http://$(IP):8080/api/scan | jq -r '.scan.results | map(select(.name != "")) | sort_by(.rssi) | reverse[] | "\(.addr)  \(.rssi)dBm  \(.name)"'
+	@curl -s http://$(IP):8080/api/scan | jq -r '.scan.results | if type == "array" then map(select(.name != "")) | sort_by(.rssi) | reverse[] | "\(.addr)  \(.rssi)dBm  \(.name)" else "No scan results. Run: curl -X POST http://$(IP):8080/api/scan" end'
 
+discover:
+	@curl -s -X POST http://$(IP):8080/api/discover
 
 ## Show available targets
 help:

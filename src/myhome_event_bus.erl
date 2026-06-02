@@ -69,10 +69,10 @@ handle_call({subscribe, Pid, FilterFun}, _From, #state{subs = Subs} = State) ->
     end;
 
 handle_call({unsubscribe, Pid}, _From, #state{subs = Subs} = State) ->
-    case maps:take(Pid, Subs) of
-        {#{mon := Mon}, NewSubs} ->
+    case maps:find(Pid, Subs) of
+        {ok, #{mon := Mon}} ->
             erlang:demonitor(Mon, [flush]),
-            {reply, ok, State#state{subs = NewSubs}};
+            {reply, ok, State#state{subs = maps:remove(Pid, Subs)}};
         error ->
             {reply, ok, State}
     end;
@@ -82,7 +82,8 @@ handle_call(_Req, _From, State) ->
 
 handle_cast({publish, Event}, #state{subs = Subs} = State) ->
     maps:foreach(fun(Pid, #{filter := FilterFun}) ->
-        case catch FilterFun(Event) of
+        Match = try FilterFun(Event) catch C:R -> io:format("[event_bus] filter crash: ~p:~p~n", [C, R]), false end,
+        case Match of
             true -> Pid ! {ble_event, Event};
             _ -> ok
         end

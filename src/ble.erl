@@ -2,6 +2,10 @@
 %%% @doc BLE port server.
 %%% Owns the native BLE port, serializes all commands, and publishes
 %%% async events (scan, connect, disconnect, encryption) to the event bus.
+%%%
+%%% Phase 4: GATT read/write are non-blocking. The port returns ok
+%%% immediately, and results arrive as async messages. This module
+%%% correlates results to waiting callers via a pending ops map.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(ble).
@@ -10,8 +14,9 @@
 %% API
 -export([start_link/0]).
 -export([scan_start/0, scan_start/1, scan_stop/0]).
--export([connect/2, disconnect/1, security/1]).
+-export([connect/2, disconnect/1, security/1, update_conn_params/1]).
 -export([gatt_read/3, gatt_write/4, gatt_write_nr/4]).
+-export([discover_services/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -24,17 +29,25 @@
 -define(OP_CONNECT,      16#20).
 -define(OP_DISCONNECT,   16#21).
 -define(OP_SECURITY,     16#22).
+-define(OP_UPDATE_PARAMS,16#23).
 -define(OP_GATT_READ,    16#30).
 -define(OP_GATT_WRITE,   16#31).
 -define(OP_GATT_WRITE_NR,16#32).
+-define(OP_DISC_SVCS,    16#34).
 
 %% Response status
 -define(RSP_OK,  16#00).
 -define(RSP_ERR, 16#01).
 
 -record(state, {
-    port :: port()
+    port :: port(),
+    %% Pending async GATT ops: ConnHandle -> {From, OpType, TRef}
+    pending :: #{non_neg_integer() => {gen_server:from(), atom(), reference()}},
+    %% Characteristic handle cache: ConnHandle -> #{ChrUUID -> ValHandle}
+    chr_cache :: #{non_neg_integer() => #{binary() => non_neg_integer()}}
 }).
+
+-define(GATT_TIMEOUT, 15000).
 
 %%====================================================================
 %% API
@@ -64,50 +77,49 @@ scan_stop() ->
 %% Connection
 %%--------------------------------------------------------------------
 
-%% @doc Initiate connection to a BLE device by address (non-blocking).
-%% Addr is a 6-byte binary (little-endian MAC).
-%% Returns ok immediately. Connection result arrives via the event bus
-%% as {ble_connected, ConnHandle, Status}.
 -spec connect(Addr :: binary(), AddrType :: 0..3) -> ok | {error, term()}.
 connect(Addr, AddrType) when byte_size(Addr) =:= 6 ->
     gen_server:call(?MODULE, {connect, Addr, AddrType}, 5000).
 
-%% @doc Disconnect by connection handle.
 -spec disconnect(ConnHandle :: non_neg_integer()) -> ok | {error, term()}.
 disconnect(ConnHandle) ->
     gen_server:call(?MODULE, {disconnect, ConnHandle}, 5000).
 
-%% @doc Initiate security (pairing/bonding) on an active connection.
-%% Result arrives via the event bus as {ble_enc_change, ConnHandle, Status}.
 -spec security(ConnHandle :: non_neg_integer()) -> ok | {error, term()}.
 security(ConnHandle) ->
     gen_server:call(?MODULE, {security, ConnHandle}, 5000).
 
+-spec update_conn_params(ConnHandle :: non_neg_integer()) -> ok | {error, term()}.
+update_conn_params(ConnHandle) ->
+    gen_server:call(?MODULE, {update_conn_params, ConnHandle}, 5000).
+
 %%--------------------------------------------------------------------
-%% GATT Operations
+%% GATT Operations (async internally — caller blocks on gen_server:call)
 %%--------------------------------------------------------------------
 
-%% @doc Read a GATT characteristic by service and characteristic UUID.
-%% UUIDs are 16-byte binaries in big-endian (natural) order.
 -spec gatt_read(ConnHandle :: non_neg_integer(), SvcUUID :: binary(), ChrUUID :: binary()) ->
     {ok, binary()} | {error, term()}.
 gatt_read(ConnHandle, SvcUUID, ChrUUID)
   when byte_size(SvcUUID) =:= 16, byte_size(ChrUUID) =:= 16 ->
-    gen_server:call(?MODULE, {gatt_read, ConnHandle, SvcUUID, ChrUUID}, 15000).
+    gen_server:call(?MODULE, {gatt_read, ConnHandle, SvcUUID, ChrUUID}, ?GATT_TIMEOUT + 5000).
 
-%% @doc Write a GATT characteristic (with response).
 -spec gatt_write(ConnHandle :: non_neg_integer(), SvcUUID :: binary(), ChrUUID :: binary(), Value :: binary()) ->
     ok | {error, term()}.
 gatt_write(ConnHandle, SvcUUID, ChrUUID, Value)
   when byte_size(SvcUUID) =:= 16, byte_size(ChrUUID) =:= 16 ->
-    gen_server:call(?MODULE, {gatt_write, ConnHandle, SvcUUID, ChrUUID, Value}, 15000).
+    gen_server:call(?MODULE, {gatt_write, ConnHandle, SvcUUID, ChrUUID, Value}, ?GATT_TIMEOUT + 5000).
 
-%% @doc Write a GATT characteristic without response (fast path for light control).
 -spec gatt_write_nr(ConnHandle :: non_neg_integer(), SvcUUID :: binary(), ChrUUID :: binary(), Value :: binary()) ->
     ok | {error, term()}.
 gatt_write_nr(ConnHandle, SvcUUID, ChrUUID, Value)
   when byte_size(SvcUUID) =:= 16, byte_size(ChrUUID) =:= 16 ->
-    gen_server:call(?MODULE, {gatt_write_nr, ConnHandle, SvcUUID, ChrUUID, Value}, 15000).
+    gen_server:call(?MODULE, {gatt_write_nr, ConnHandle, SvcUUID, ChrUUID, Value}, ?GATT_TIMEOUT + 5000).
+
+%% @doc Discover all characteristics on a connection. Caches results.
+-spec discover_services(ConnHandle :: non_neg_integer()) ->
+    ok | {error, term()}.
+discover_services(ConnHandle) ->
+    gen_server:call(?MODULE, {discover_services, ConnHandle}, ?GATT_TIMEOUT + 5000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -117,15 +129,18 @@ init([]) ->
     Port = open_port({spawn, "ble_port"}, []),
     case port_call(Port, <<?OP_INIT>>) of
         {ok, _} ->
-            %% Subscribe ourselves to async events from the port
             case port_call(Port, <<?OP_SUBSCRIBE_SCAN>>) of
                 {ok, _} -> ok;
-                _ -> ok  %% best-effort
+                _ -> ok
             end,
-            {ok, #state{port = Port}};
+            {ok, #state{port = Port, pending = #{}, chr_cache = #{}}};
         Error ->
             {stop, Error}
     end.
+
+%%--------------------------------------------------------------------
+%% Synchronous ops (scan, connect, disconnect, security)
+%%--------------------------------------------------------------------
 
 handle_call({scan_start, Duration}, _From, #state{port = Port} = State) ->
     Reply = case port_call(Port, <<?OP_SCAN_START, Duration:8>>) of
@@ -153,7 +168,9 @@ handle_call({disconnect, ConnHandle}, _From, #state{port = Port} = State) ->
         {ok, _} -> ok;
         Error   -> Error
     end,
-    {reply, Reply, State};
+    %% Clear cache for this connection
+    NewCache = maps:remove(ConnHandle, State#state.chr_cache),
+    {reply, Reply, State#state{chr_cache = NewCache}};
 
 handle_call({security, ConnHandle}, _From, #state{port = Port} = State) ->
     Reply = case port_call(Port, <<?OP_SECURITY, ConnHandle:16/little>>) of
@@ -162,23 +179,103 @@ handle_call({security, ConnHandle}, _From, #state{port = Port} = State) ->
     end,
     {reply, Reply, State};
 
-handle_call({gatt_read, ConnHandle, SvcUUID, ChrUUID}, _From, #state{port = Port} = State) ->
-    Reply = port_call(Port, <<?OP_GATT_READ, ConnHandle:16/little, SvcUUID:16/binary, ChrUUID:16/binary>>),
-    {reply, Reply, State};
-
-handle_call({gatt_write, ConnHandle, SvcUUID, ChrUUID, Value}, _From, #state{port = Port} = State) ->
-    Reply = case port_call(Port, <<?OP_GATT_WRITE, ConnHandle:16/little, SvcUUID:16/binary, ChrUUID:16/binary, Value/binary>>) of
+handle_call({update_conn_params, ConnHandle}, _From, #state{port = Port} = State) ->
+    Reply = case port_call(Port, <<?OP_UPDATE_PARAMS, ConnHandle:16/little>>) of
         {ok, _} -> ok;
         Error   -> Error
     end,
     {reply, Reply, State};
 
-handle_call({gatt_write_nr, ConnHandle, SvcUUID, ChrUUID, Value}, _From, #state{port = Port} = State) ->
-    Reply = case port_call(Port, <<?OP_GATT_WRITE_NR, ConnHandle:16/little, SvcUUID:16/binary, ChrUUID:16/binary, Value/binary>>) of
-        {ok, _} -> ok;
-        Error   -> Error
-    end,
-    {reply, Reply, State};
+%%--------------------------------------------------------------------
+%% Async GATT ops — send command, defer reply until result arrives
+%%--------------------------------------------------------------------
+
+handle_call({gatt_read, ConnHandle, _SvcUUID, ChrUUID}, From, #state{port = Port} = State) ->
+    case maps:is_key(ConnHandle, State#state.pending) of
+        true ->
+            {reply, {error, busy}, State};
+        false ->
+            case port_call(Port, <<?OP_GATT_READ, ConnHandle:16/little, ChrUUID:16/binary>>) of
+                {ok, _} ->
+                    TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                    Pending = maps:put(ConnHandle, {From, gatt_read, TRef}, State#state.pending),
+                    {noreply, State#state{pending = Pending}};
+                Error ->
+                    {reply, Error, State}
+            end
+    end;
+
+handle_call({gatt_write, ConnHandle, _SvcUUID, ChrUUID, Value}, From, #state{port = Port} = State) ->
+    case maps:is_key(ConnHandle, State#state.pending) of
+        true ->
+            {reply, {error, busy}, State};
+        false ->
+            case get_val_handle(ConnHandle, ChrUUID, State) of
+                {ok, ValHandle} ->
+                    case port_call(Port, <<?OP_GATT_WRITE, ConnHandle:16/little,
+                                           ValHandle:16/little, Value/binary>>) of
+                        {ok, _} ->
+                            TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                            Pending = maps:put(ConnHandle, {From, gatt_write, TRef}, State#state.pending),
+                            {noreply, State#state{pending = Pending}};
+                        Error ->
+                            {reply, Error, State}
+                    end;
+                {error, no_cache} ->
+                    %% Need discovery first — initiate and queue the write
+                    case port_call(Port, <<?OP_DISC_SVCS, ConnHandle:16/little>>) of
+                        {ok, _} ->
+                            TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                            Cont = {write_after_disc, ChrUUID, Value},
+                            Pending = maps:put(ConnHandle, {From, {disc_for, Cont}, TRef}, State#state.pending),
+                            {noreply, State#state{pending = Pending}};
+                        Error ->
+                            {reply, Error, State}
+                    end
+            end
+    end;
+
+handle_call({gatt_write_nr, ConnHandle, _SvcUUID, ChrUUID, Value}, From, #state{port = Port} = State) ->
+    case maps:is_key(ConnHandle, State#state.pending) of
+        true ->
+            {reply, {error, busy}, State};
+        false ->
+            case get_val_handle(ConnHandle, ChrUUID, State) of
+                {ok, ValHandle} ->
+                    Reply = case port_call(Port, <<?OP_GATT_WRITE_NR, ConnHandle:16/little,
+                                                   ValHandle:16/little, Value/binary>>) of
+                        {ok, _} -> ok;
+                        Error   -> Error
+                    end,
+                    {reply, Reply, State};
+                {error, no_cache} ->
+                    %% Need discovery first
+                    case port_call(Port, <<?OP_DISC_SVCS, ConnHandle:16/little>>) of
+                        {ok, _} ->
+                            TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                            Cont = {write_nr_after_disc, ChrUUID, Value},
+                            Pending = maps:put(ConnHandle, {From, {disc_for, Cont}, TRef}, State#state.pending),
+                            {noreply, State#state{pending = Pending}};
+                        Error ->
+                            {reply, Error, State}
+                    end
+            end
+    end;
+
+handle_call({discover_services, ConnHandle}, From, #state{port = Port} = State) ->
+    case maps:is_key(ConnHandle, State#state.pending) of
+        true ->
+            {reply, {error, busy}, State};
+        false ->
+            case port_call(Port, <<?OP_DISC_SVCS, ConnHandle:16/little>>) of
+                {ok, _} ->
+                    TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                    Pending = maps:put(ConnHandle, {From, disc_svcs, TRef}, State#state.pending),
+                    {noreply, State#state{pending = Pending}};
+                Error ->
+                    {reply, Error, State}
+            end
+    end;
 
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -186,7 +283,82 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%% Async events from the port — publish to event bus
+%%--------------------------------------------------------------------
+%% Async event handling
+%%--------------------------------------------------------------------
+
+%% GATT read result from port
+handle_info({ble_gatt_read, ConnHandle, Status, Data}, State) ->
+    case maps_take(ConnHandle, State#state.pending) of
+        {{From, gatt_read, TRef}, Pending} ->
+            erlang:cancel_timer(TRef),
+            Reply = case Status of
+                0 -> {ok, Data};
+                _ -> {error, {ble_gatt_error, Status}}
+            end,
+            gen_server:reply(From, Reply),
+            {noreply, State#state{pending = Pending}};
+        _ ->
+            {noreply, State}
+    end;
+
+%% GATT write result from port
+handle_info({ble_gatt_write, ConnHandle, Status}, State) ->
+    case maps_take(ConnHandle, State#state.pending) of
+        {{From, gatt_write, TRef}, Pending} ->
+            erlang:cancel_timer(TRef),
+            Reply = case Status of
+                0 -> ok;
+                _ -> {error, {ble_gatt_error, Status}}
+            end,
+            gen_server:reply(From, Reply),
+            {noreply, State#state{pending = Pending}};
+        _ ->
+            {noreply, State}
+    end;
+
+%% Discovery complete from port
+handle_info({ble_disc_complete, ConnHandle, Status, Data}, State) ->
+    case maps_take(ConnHandle, State#state.pending) of
+        {{From, disc_svcs, TRef}, Pending} ->
+            erlang:cancel_timer(TRef),
+            case Status of
+                0 ->
+                    CacheMap = parse_disc_data(Data),
+                    NewCache = maps:put(ConnHandle, CacheMap, State#state.chr_cache),
+                    gen_server:reply(From, ok),
+                    {noreply, State#state{pending = Pending, chr_cache = NewCache}};
+                _ ->
+                    gen_server:reply(From, {error, {ble_disc_error, Status}}),
+                    {noreply, State#state{pending = Pending}}
+            end;
+        {{From, {disc_for, Cont}, TRef}, Pending} ->
+            erlang:cancel_timer(TRef),
+            case Status of
+                0 ->
+                    CacheMap = parse_disc_data(Data),
+                    NewCache = maps:put(ConnHandle, CacheMap, State#state.chr_cache),
+                    NewState = State#state{pending = Pending, chr_cache = NewCache},
+                    handle_disc_continuation(ConnHandle, From, Cont, NewState);
+                _ ->
+                    gen_server:reply(From, {error, {ble_disc_error, Status}}),
+                    {noreply, State#state{pending = Pending}}
+            end;
+        _ ->
+            {noreply, State}
+    end;
+
+%% GATT timeout
+handle_info({gatt_timeout, ConnHandle}, State) ->
+    case maps_take(ConnHandle, State#state.pending) of
+        {{From, _Op, _TRef}, Pending} ->
+            gen_server:reply(From, {error, timeout}),
+            {noreply, State#state{pending = Pending}};
+        error ->
+            {noreply, State}
+    end;
+
+%% Broadcast events — publish to event bus
 handle_info({ble_scan_event, _, _, _, _} = Event, State) ->
     myhome_event_bus:publish(Event),
     {noreply, State};
@@ -196,9 +368,19 @@ handle_info({ble_scan_complete} = Event, State) ->
 handle_info({ble_connected, _, _} = Event, State) ->
     myhome_event_bus:publish(Event),
     {noreply, State};
-handle_info({ble_disconnected, _, _} = Event, State) ->
+handle_info({ble_disconnected, ConnHandle, _} = Event, State) ->
+    %% Clear cache and any pending ops for disconnected handle
+    NewCache = maps:remove(ConnHandle, State#state.chr_cache),
+    NewState = case maps_take(ConnHandle, State#state.pending) of
+        {{From, _Op, TRef}, Pending} ->
+            erlang:cancel_timer(TRef),
+            gen_server:reply(From, {error, disconnected}),
+            State#state{pending = Pending, chr_cache = NewCache};
+        error ->
+            State#state{chr_cache = NewCache}
+    end,
     myhome_event_bus:publish(Event),
-    {noreply, State};
+    {noreply, NewState};
 handle_info({ble_enc_change, _, _} = Event, State) ->
     myhome_event_bus:publish(Event),
     {noreply, State};
@@ -217,8 +399,78 @@ port_call(Port, Request) ->
     case port:call(Port, Request, 30000) of
         <<?RSP_OK, Payload/binary>> ->
             {ok, Payload};
+        <<?RSP_ERR, Code, Rc>> ->
+            {error, {ble_error, Code, Rc}};
         <<?RSP_ERR, Code/binary>> ->
             {error, {ble_error, Code}};
         {error, _} = Err ->
             Err
+    end.
+
+%% Look up cached ValHandle for a characteristic UUID on a connection
+-spec get_val_handle(non_neg_integer(), binary(), #state{}) ->
+    {ok, non_neg_integer()} | {error, no_cache}.
+get_val_handle(ConnHandle, ChrUUID, #state{chr_cache = Cache}) ->
+    case maps:find(ConnHandle, Cache) of
+        {ok, ConnCache} ->
+            case maps:find(ChrUUID, ConnCache) of
+                {ok, ValHandle} -> {ok, ValHandle};
+                error -> {error, no_cache}
+            end;
+        error ->
+            {error, no_cache}
+    end.
+
+%% maps:take/2 polyfill for AtomVM (which lacks it)
+maps_take(Key, Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> {Value, maps:remove(Key, Map)};
+        error -> error
+    end.
+
+%% Parse discovery result binary into a map of ChrUUID -> ValHandle
+-spec parse_disc_data(binary()) -> #{binary() => non_neg_integer()}.
+parse_disc_data(<<Count:16/little, Rest/binary>>) ->
+    parse_disc_entries(Count, Rest, #{});
+parse_disc_data(_) ->
+    #{}.
+
+parse_disc_entries(0, _Rest, Acc) ->
+    Acc;
+parse_disc_entries(N, <<UUID:16/binary, ValHandle:16/little, _Props:8, Rest/binary>>, Acc) ->
+    parse_disc_entries(N - 1, Rest, maps:put(UUID, ValHandle, Acc));
+parse_disc_entries(_, _, Acc) ->
+    Acc.
+
+%% After discovery completes, execute the queued GATT operation
+handle_disc_continuation(ConnHandle, From, {write_after_disc, ChrUUID, Value}, State) ->
+    case get_val_handle(ConnHandle, ChrUUID, State) of
+        {ok, ValHandle} ->
+            case port_call(State#state.port, <<?OP_GATT_WRITE, ConnHandle:16/little,
+                                               ValHandle:16/little, Value/binary>>) of
+                {ok, _} ->
+                    TRef = erlang:send_after(?GATT_TIMEOUT, self(), {gatt_timeout, ConnHandle}),
+                    Pending = maps:put(ConnHandle, {From, gatt_write, TRef}, State#state.pending),
+                    {noreply, State#state{pending = Pending}};
+                Error ->
+                    gen_server:reply(From, Error),
+                    {noreply, State}
+            end;
+        {error, no_cache} ->
+            gen_server:reply(From, {error, char_not_found}),
+            {noreply, State}
+    end;
+handle_disc_continuation(ConnHandle, From, {write_nr_after_disc, ChrUUID, Value}, State) ->
+    case get_val_handle(ConnHandle, ChrUUID, State) of
+        {ok, ValHandle} ->
+            Reply = case port_call(State#state.port, <<?OP_GATT_WRITE_NR, ConnHandle:16/little,
+                                                       ValHandle:16/little, Value/binary>>) of
+                {ok, _} -> ok;
+                Error   -> Error
+            end,
+            gen_server:reply(From, Reply),
+            {noreply, State};
+        {error, no_cache} ->
+            gen_server:reply(From, {error, char_not_found}),
+            {noreply, State}
     end.

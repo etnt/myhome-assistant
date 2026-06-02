@@ -33,14 +33,14 @@ log(Level, Format, Args) ->
     try
         Msg = io_lib:format(Format, Args),
         gen_server:cast(?MODULE, {log, Level, iolist_to_binary(Msg)})
-    catch _:_ -> ok
+    catch C:R -> io:format("[log] crash formatting ~p: ~p:~p~n", [Format, C, R]), ok
     end.
 
 -spec log(atom(), string()) -> ok.
 log(Level, Message) ->
     try
         gen_server:cast(?MODULE, {log, Level, iolist_to_binary(Message)})
-    catch _:_ -> ok
+    catch C:R -> io:format("[log] crash: ~p:~p~n", [C, R]), ok
     end.
 
 -spec get_logs() -> [map()].
@@ -59,7 +59,13 @@ init([]) ->
     {ok, #state{queue = queue:new(), count = 0, seq = 0}}.
 
 handle_call({get_logs, Opts}, _From, State) ->
-    Logs = format_logs(State, Opts),
+    Logs =  try
+                format_logs(State, Opts)
+            catch
+                C:R ->
+                io:format("[log] get_logs crash: ~p:~p~n", [C, R]),
+                []
+            end,
     {reply, Logs, State};
 
 handle_call(_Req, _From, State) ->

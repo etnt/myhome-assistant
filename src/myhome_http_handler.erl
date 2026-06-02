@@ -24,36 +24,52 @@
 %%%-------------------------------------------------------------------
 -module(myhome_http_handler).
 
--behavior(httpd_api_handler).
--export([handle_api_request/4]).
+-export([handle_request/3]).
 
-handle_api_request(get, [<<"status">>], _HttpRequest, _Args) ->
+handle_request(Method, [<<"api">> | Path], Request) ->
+    try
+        do_handle(Method, Path, Request)
+    catch
+        exit:{noproc, _} ->
+            io:format("[http] noproc crash in handler~n"),
+            json_reply(#{status => error, reason => <<"process not running">>});
+        Class:Reason ->
+            io:format("[http] handler crash: ~p:~p~n", [Class, Reason]),
+            Msg = iolist_to_binary(io_lib:format("~p:~p", [Class, Reason])),
+            myhome_log:log(error, "[http] handler crash: ~s", [Msg]),
+            json_reply(#{status => error, reason => Msg})
+    end;
+handle_request(_Method, _Path, _Request) ->
+    {404, #{}, <<"Not Found">>}.
+
+do_handle(get, [<<"status">>], _HttpRequest) ->
     Bulbs = get_bulb_status(),
-    {ok, #{status => ok, bulbs => Bulbs}};
+    json_reply(#{status => ok, bulbs => Bulbs});
 
-handle_api_request(get, [<<"logs">>], HttpRequest, _Args) ->
+do_handle(get, [<<"logs">>], HttpRequest) ->
     try
         Opts = parse_log_opts(HttpRequest),
         Logs = myhome_log:get_logs(Opts),
         JsonLogs = [#{seq => maps:get(seq, E),
                       ts => maps:get(ts, E),
                       level => maps:get(level, E),
-                      msg => binary_to_list(maps:get(msg, E))}
+                      msg => maps:get(msg, E)}
                     || E <- Logs],
-        {ok, #{status => ok, count => length(JsonLogs), logs => JsonLogs}}
+        json_reply(#{status => ok, count => length(JsonLogs), logs => JsonLogs})
     catch C:R ->
-        {ok, #{status => error, reason => list_to_binary(io_lib:format("~p:~p", [C, R]))}}
+        io:format("[http] logs crash: ~p:~p~n", [C, R]),
+        json_reply(#{status => error, reason => iolist_to_binary(io_lib:format("~p:~p", [C, R]))})
     end;
 
-handle_api_request(get, [<<"scan">>], _HttpRequest, _Args) ->
+do_handle(get, [<<"scan">>], _HttpRequest) ->
     case myhome_scanner:get_results() of
         {ok, Results} ->
-            {ok, #{status => ok, scan => Results}};
+            json_reply(#{status => ok, scan => Results});
         {error, Reason} ->
-            {ok, #{status => error, reason => to_bin(Reason)}}
+            json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
-handle_api_request(post, [<<"scan">>], HttpRequest, _Args) ->
+do_handle(post, [<<"scan">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     Duration = case parse_json_int(Body, <<"duration">>) of
         {ok, D} when D >= 1, D =< 30 -> D;
@@ -61,20 +77,20 @@ handle_api_request(post, [<<"scan">>], HttpRequest, _Args) ->
     end,
     case myhome_scanner:scan(Duration) of
         {ok, Count} ->
-            {ok, #{status => ok, devices_found => Count}};
+            json_reply(#{status => ok, devices_found => Count});
         {error, Reason} ->
-            {ok, #{status => error, reason => to_bin(Reason)}}
+            json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
-handle_api_request(post, [<<"discover">>], _HttpRequest, _Args) ->
+do_handle(post, [<<"discover">>], _HttpRequest) ->
     case myhome_discovery:run_discovery() of
         {ok, Count} ->
-            {ok, #{status => ok, bulbs_paired => Count}};
+            json_reply(#{status => ok, bulbs_paired => Count});
         {error, Reason} ->
-            {ok, #{status => error, reason => to_bin(Reason)}}
+            json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
-handle_api_request(post, [<<"reset">>], _HttpRequest, _Args) ->
+do_handle(post, [<<"reset">>], _HttpRequest) ->
     myhome_log:log(info, "Factory reset requested via API"),
     %% Clear app config (bulb addresses)
     try esp:nvs_erase_all(myhome) catch _:_ -> ok end,
@@ -83,62 +99,75 @@ handle_api_request(post, [<<"reset">>], _HttpRequest, _Args) ->
     try esp:nvs_erase_all(nimble_cccd) catch _:_ -> ok end,
     %% Respond before restarting
     spawn(fun() -> timer:sleep(500), esp:restart() end),
-    {ok, #{status => ok, message => <<"Resetting. Device will reboot in 500ms.">>}};
+    json_reply(#{status => ok, message => <<"Resetting. Device will reboot in 500ms.">>});
 
-handle_api_request(post, [<<"bulb">>, BulbNum, <<"power">>], HttpRequest, _Args) ->
+do_handle(post, [<<"bulb">>, BulbNum, <<"power">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,
     case parse_json_bool(Body, <<"on">>) of
         {ok, On} ->
             case myhome_hue_ble:set_power(Name, On) of
-                ok -> {ok, #{status => ok}};
-                {error, Reason} -> {ok, #{status => error, reason => to_bin(Reason)}}
+                ok -> json_reply(#{status => ok});
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         error ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(post, [<<"bulb">>, BulbNum, <<"brightness">>], HttpRequest, _Args) ->
+do_handle(post, [<<"bulb">>, BulbNum, <<"brightness">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"value">>) of
         {ok, Val} when Val >= 1, Val =< 254 ->
             case myhome_hue_ble:set_brightness(Name, Val) of
-                ok -> {ok, #{status => ok}};
-                {error, Reason} -> {ok, #{status => error, reason => to_bin(Reason)}}
+                ok -> json_reply(#{status => ok});
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         _ ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(post, [<<"bulb">>, BulbNum, <<"color_temp">>], HttpRequest, _Args) ->
+do_handle(post, [<<"bulb">>, BulbNum, <<"color_temp">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"value">>) of
-        {ok, Val} when Val >= 0, Val =< 255 ->
+        {ok, Val} when Val >= 153, Val =< 500 ->
             case myhome_hue_ble:set_color_temp(Name, Val) of
-                ok -> {ok, #{status => ok}};
-                {error, Reason} -> {ok, #{status => error, reason => to_bin(Reason)}}
+                ok -> json_reply(#{status => ok});
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         _ ->
-            bad_request
+            {400, #{}, <<"Bad Request: color_temp must be 153-500 (mirek)">>}
     end;
 
-handle_api_request(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest, _Args) ->
+do_handle(post, [<<"bulb">>, BulbNum, <<"color_xy">>], HttpRequest) ->
+    Name = bulb_name(BulbNum),
+    #{body := Body} = HttpRequest,
+    case {parse_json_int(Body, <<"x">>), parse_json_int(Body, <<"y">>)} of
+        {{ok, X}, {ok, Y}} when X >= 0, X =< 65535, Y >= 0, Y =< 65535 ->
+            case myhome_hue_ble:set_color_xy(Name, X, Y) of
+                ok -> json_reply(#{status => ok});
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        _ ->
+            {400, #{}, <<"Bad Request: x and y must be 0-65535">>}
+    end;
+
+do_handle(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,
     Props = parse_state_body(Body),
     case Props of
         #{} when map_size(Props) > 0 ->
             case myhome_hue_ble:set_state(Name, Props) of
-                ok -> {ok, #{status => ok}};
-                {error, Reason} -> {ok, #{status => error, reason => to_bin(Reason)}}
+                ok -> json_reply(#{status => ok});
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         _ ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(get, [<<"connections">>], _HttpRequest, _Args) ->
+do_handle(get, [<<"connections">>], _HttpRequest) ->
     case myhome_ble_conn:get_connections() of
         {ok, Conns} ->
             JsonConns = [#{addr => addr_to_hex(maps:get(addr, C)),
@@ -146,12 +175,12 @@ handle_api_request(get, [<<"connections">>], _HttpRequest, _Args) ->
                            state => maps:get(state, C),
                            since => maps:get(since, C)}
                          || C <- Conns],
-            {ok, #{status => ok, connections => JsonConns}};
+            json_reply(#{status => ok, connections => JsonConns});
         {error, Reason} ->
-            {ok, #{status => error, reason => to_bin(Reason)}}
+            json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
-handle_api_request(post, [<<"connect">>], HttpRequest, _Args) ->
+do_handle(post, [<<"connect">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     case parse_json_string(Body, <<"addr">>) of
         {ok, AddrHex} ->
@@ -163,47 +192,47 @@ handle_api_request(post, [<<"connect">>], HttpRequest, _Args) ->
                     end,
                     case myhome_ble_conn:connect(Addr, AddrType) of
                         ok ->
-                            {ok, #{status => ok, message => <<"connecting">>}};
+                            json_reply(#{status => ok, message => <<"connecting">>});
                         {error, Reason} ->
-                            {ok, #{status => error, reason => to_bin(Reason)}}
+                            json_reply(#{status => error, reason => to_bin(Reason)})
                     end;
                 error ->
-                    bad_request
+                    {400, #{}, <<"Bad Request">>}
             end;
         error ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(post, [<<"disconnect">>], HttpRequest, _Args) ->
+do_handle(post, [<<"disconnect">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"handle">>) of
         {ok, Handle} ->
             case myhome_ble_conn:disconnect(Handle) of
                 ok ->
-                    {ok, #{status => ok}};
+                    json_reply(#{status => ok});
                 {error, Reason} ->
-                    {ok, #{status => error, reason => to_bin(Reason)}}
+                    json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         _ ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(post, [<<"security">>], HttpRequest, _Args) ->
+do_handle(post, [<<"security">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"handle">>) of
         {ok, Handle} ->
             case myhome_ble_conn:security(Handle) of
                 ok ->
-                    {ok, #{status => ok, message => <<"security initiated">>}};
+                    json_reply(#{status => ok, message => <<"security initiated">>});
                 {error, Reason} ->
-                    {ok, #{status => error, reason => to_bin(Reason)}}
+                    json_reply(#{status => error, reason => to_bin(Reason)})
             end;
         _ ->
-            bad_request
+            {400, #{}, <<"Bad Request">>}
     end;
 
-handle_api_request(_Method, _Path, _HttpRequest, _Args) ->
-    not_found.
+do_handle(_Method, _Path, _HttpRequest) ->
+    {404, #{}, <<"Not Found">>}.
 
 %%====================================================================
 %% Internal
@@ -222,7 +251,10 @@ get_bulb_status() ->
             undefined -> false;
             _Pid ->
                 Result = try myhome_hue_ble:get_state(Name)
-                         catch _:_ -> {error, crashed} end,
+                         catch C2:R2 ->
+                             io:format("[http] get_state(~p) crash: ~p:~p~n", [Name, C2, R2]),
+                             {error, crashed}
+                         end,
                 case Result of
                     {ok, State} -> {true, State#{name => Name}};
                     _ -> {true, #{name => Name, connected => false}}
@@ -260,7 +292,7 @@ parse_state_body(Body) ->
         _ -> Props1
     end,
     case parse_json_int(Body, <<"color_temp">>) of
-        {ok, CT} when CT >= 0, CT =< 255 -> Props2#{color_temp => CT};
+        {ok, CT} when CT >= 153, CT =< 500 -> Props2#{color_temp => CT};
         _ -> Props2
     end.
 
@@ -345,9 +377,14 @@ hex_to_addr(_) -> error.
 
 %% Convert 6-byte binary to "AA:BB:CC:DD:EE:FF"
 addr_to_hex(<<A, B, C, D, E, F>>) ->
-    list_to_binary(io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
-                                 [A, B, C, D, E, F]));
+    iolist_to_binary(lists:join(":", [byte_to_hex(X) || X <- [A, B, C, D, E, F]]));
 addr_to_hex(_) -> <<"unknown">>.
+
+byte_to_hex(B) ->
+    [hex_char(B bsr 4), hex_char(B band 16#0F)].
+
+hex_char(N) when N < 10 -> N + $0;
+hex_char(N) -> N - 10 + $A.
 
 parse_log_opts(HttpRequest) ->
     Params = maps:get(params, HttpRequest, #{}),
@@ -363,3 +400,7 @@ parse_log_opts(HttpRequest) ->
             catch _:_ -> Opts1
             end
     end.
+
+json_reply(Map) ->
+    Body = tiny_json:encode(Map),
+    {200, #{<<"Content-Type">> => <<"application/json">>}, Body}.

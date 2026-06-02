@@ -158,12 +158,27 @@ pair(Addr, AddrType) ->
         {ok, ConnHandle} ->
             myhome_log:log(info, "~s connected (handle=~p), initiating security...",
                            [format_addr(Addr), ConnHandle]),
+            %% Subscribe to enc_change events temporarily
+            Self = self(),
+            Filter = fun({ble_enc_change, H, _}) when H =:= ConnHandle -> true;
+                        (_) -> false end,
+            myhome_event_bus:subscribe(Self, Filter),
             ble:security(ConnHandle),
-            %% Wait for encryption change event
-            timer:sleep(5000),
-            myhome_log:log(info, "~s security initiated, disconnecting", [format_addr(Addr)]),
+            %% Wait for enc_change result (up to 10s)
+            Result = receive
+                {ble_event, {ble_enc_change, ConnHandle, 0}} ->
+                    myhome_log:log(info, "~s pairing successful!", [format_addr(Addr)]),
+                    ok;
+                {ble_event, {ble_enc_change, ConnHandle, Status}} ->
+                    myhome_log:log(error, "~s pairing FAILED (status=~p)", [format_addr(Addr), Status]),
+                    {error, {security_failed, Status}}
+            after 10000 ->
+                myhome_log:log(error, "~s pairing timeout (no enc_change received)", [format_addr(Addr)]),
+                {error, pairing_timeout}
+            end,
+            myhome_event_bus:unsubscribe(Self),
             ble:disconnect(ConnHandle),
-            ok;
+            Result;
         {error, Reason} ->
             myhome_log:log(error, "~s connect failed: ~p", [format_addr(Addr), Reason]),
             {error, Reason}
@@ -202,31 +217,36 @@ next_bulb_number(N) ->
 
 load_config() ->
     try load_bulbs(1, [])
-    catch _:_ -> []
+    catch C:R ->
+        io:format("[discovery] load_config crash: ~p:~p~n", [C, R]),
+        []
     end.
 
 load_bulbs(N, Acc) when N > 4 ->
     lists:reverse(Acc);
 load_bulbs(N, Acc) ->
     Name = list_to_atom("bulb_" ++ integer_to_list(N)),
-    Key = list_to_binary("bulb_" ++ integer_to_list(N) ++ "_addr"),
-    case esp:nvs_get_binary(myhome, Key) of
-        {ok, Addr} when byte_size(Addr) =:= 6 ->
+    Key = list_to_atom("bulb_" ++ integer_to_list(N) ++ "_addr"),
+    try esp:nvs_get_binary(myhome, Key) of
+        Addr when is_binary(Addr), byte_size(Addr) =:= 6 ->
             myhome_log:log(info, "Loaded ~p from NVS: ~s", [Name, format_addr(Addr)]),
             load_bulbs(N + 1, [{Name, Addr, 1} | Acc]);
         _ ->
             lists:reverse(Acc)
+    catch _:_ ->
+        lists:reverse(Acc)
     end.
 
 save_config(Paired) ->
     lists:foreach(fun({Name, Addr, _AddrType, DisplayName}) ->
-        Key = atom_to_list(Name) ++ "_addr",
-        NameKey = atom_to_list(Name) ++ "_name",
+        Key = list_to_atom(atom_to_list(Name) ++ "_addr"),
+        NameKey = list_to_atom(atom_to_list(Name) ++ "_name"),
         try
-            esp:nvs_set_binary(myhome, list_to_binary(Key), Addr),
-            esp:nvs_set_binary(myhome, list_to_binary(NameKey), DisplayName),
+            esp:nvs_set_binary(myhome, Key, Addr),
+            esp:nvs_set_binary(myhome, NameKey, DisplayName),
             myhome_log:log(info, "Saved ~p (~s) to NVS", [Name, DisplayName])
-        catch _:_ ->
+        catch C:R ->
+            io:format("[discovery] save NVS ~p crash: ~p:~p~n", [Name, C, R]),
             myhome_log:log(warning, "Could not save ~p to NVS", [Name])
         end
     end, Paired).
@@ -267,5 +287,10 @@ print_paired(Paired) ->
     end, Paired).
 
 format_addr(<<A, B, C, D, E, F>>) ->
-    io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
-                  [F, E, D, C, B, A]).
+    iolist_to_binary(lists:join(":", [byte_to_hex(X) || X <- [F, E, D, C, B, A]])).
+
+byte_to_hex(B) ->
+    [hex_char(B bsr 4), hex_char(B band 16#0F)].
+
+hex_char(N) when N < 10 -> N + $0;
+hex_char(N) -> N - 10 + $A.

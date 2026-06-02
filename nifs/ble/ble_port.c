@@ -26,7 +26,6 @@
 #include <trace.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -59,12 +58,14 @@ enum {
     OP_CONNECT      = 0x20,
     OP_DISCONNECT   = 0x21,
     OP_SECURITY     = 0x22,
+    OP_UPDATE_PARAMS = 0x23,  // Update connection parameters
 
     // GATT operations
     OP_GATT_READ    = 0x30,
     OP_GATT_WRITE   = 0x31,
     OP_GATT_WRITE_NR = 0x32,  // write no-response
     OP_SUBSCRIBE    = 0x33,
+    OP_DISC_SVCS    = 0x34,   // discover all characteristics
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,18 +88,21 @@ enum {
 static bool g_scanning = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Synchronization for async BLE operations
+// GATT discovery buffer (Phase 4: async)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static SemaphoreHandle_t g_op_sem;      // signals operation completion
-static SemaphoreHandle_t g_data_lock;   // protects shared state
-static int g_op_rc;                     // result code from async op
-
-// GATT read result buffer
 #define MAX_GATT_READ 128
-#define GATT_TIMEOUT_MS 10000
-static uint8_t g_read_buf[MAX_GATT_READ];
-static uint16_t g_read_len;
+#define MAX_DISC_CHARS 32
+
+struct disc_chr_entry {
+    uint8_t uuid_be[16];     // UUID in big-endian (natural) order
+    uint16_t val_handle;
+    uint8_t properties;
+};
+
+static struct disc_chr_entry g_disc_results[MAX_DISC_CHARS];
+static uint16_t g_disc_count;
+static uint16_t g_disc_conn_handle;
 
 // NimBLE state
 static bool g_ble_initialized = false;
@@ -116,6 +120,9 @@ static const char *const ble_scan_complete_atom = ATOM_STR("\x11", "ble_scan_com
 static const char *const ble_connected_atom = ATOM_STR("\xD", "ble_connected");
 static const char *const ble_disconnected_atom = ATOM_STR("\x10", "ble_disconnected");
 static const char *const ble_enc_change_atom = ATOM_STR("\xE", "ble_enc_change");
+static const char *const ble_gatt_read_atom = ATOM_STR("\xD", "ble_gatt_read");
+static const char *const ble_gatt_write_atom = ATOM_STR("\xE", "ble_gatt_write");
+static const char *const ble_disc_complete_atom = ATOM_STR("\x11", "ble_disc_complete");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility: build response binaries
@@ -307,48 +314,187 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         return BLE_GAP_REPEAT_PAIRING_RETRY;
     }
 
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        int status = event->conn_update.status;
+        uint16_t handle = event->conn_update.conn_handle;
+        if (status == 0) {
+            struct ble_gap_conn_desc desc;
+            ble_gap_conn_find(handle, &desc);
+            ESP_LOGI(TAG, "conn update OK: handle=%u itvl=%u latency=%u timeout=%u",
+                     handle, desc.conn_itvl, desc.conn_latency, desc.supervision_timeout);
+        } else {
+            ESP_LOGW(TAG, "conn update FAILED: handle=%u status=%d", handle, status);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ: {
+        // Auto-accept any peer-initiated param update requests
+        ESP_LOGI(TAG, "conn update req from peer: handle=%u",
+                 event->conn_update_req.conn_handle);
+        return 0;
+    }
+
     default:
         return 0;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NimBLE: GATT client callbacks
+// NimBLE: GATT client callbacks (Phase 4: async — send results as messages)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int gatt_read_cb(uint16_t conn_handle,
-                        const struct ble_gatt_error *error,
-                        struct ble_gatt_attr *attr, void *arg)
+/**
+ * Callback for ble_gattc_read_by_uuid.
+ * Called once with data (status==0), then once with BLE_HS_EDONE.
+ * We accumulate data on the first call, send the message on completion.
+ */
+static uint8_t g_async_read_buf[MAX_GATT_READ];
+static uint16_t g_async_read_len;
+static uint16_t g_async_read_conn;
+
+static int gatt_read_by_uuid_cb(uint16_t conn_handle,
+                                const struct ble_gatt_error *error,
+                                struct ble_gatt_attr *attr, void *arg)
 {
-    (void) conn_handle;
     (void) arg;
 
-    if (error->status == 0) {
-        g_read_len = OS_MBUF_PKTLEN(attr->om);
-        if (g_read_len > MAX_GATT_READ) {
-            g_read_len = MAX_GATT_READ;
+    if (error->status == 0 && attr != NULL) {
+        // Data received — accumulate
+        g_async_read_len = OS_MBUF_PKTLEN(attr->om);
+        if (g_async_read_len > MAX_GATT_READ) {
+            g_async_read_len = MAX_GATT_READ;
         }
-        os_mbuf_copydata(attr->om, 0, g_read_len, g_read_buf);
-        g_op_rc = 0;
-    } else {
-        g_op_rc = error->status;
-        g_read_len = 0;
+        os_mbuf_copydata(attr->om, 0, g_async_read_len, g_async_read_buf);
+        g_async_read_conn = conn_handle;
+        return 0;
     }
 
-    xSemaphoreGive(g_op_sem);
+    // Completion callback — send result to subscriber
+    if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+        int status = 0;
+        if (error->status == BLE_HS_EDONE) {
+            status = (g_async_read_len == 0) ? BLE_HS_ENOENT : 0;
+        } else {
+            status = error->status;
+            g_async_read_len = 0;
+        }
+
+        // Message: {ble_gatt_read, ConnHandle, Status, Data}
+        #define GATT_READ_HEAP_SIZE (TUPLE_SIZE(4) + TERM_BINARY_HEAP_SIZE(MAX_GATT_READ))
+        BEGIN_WITH_STACK_HEAP(GATT_READ_HEAP_SIZE, heap);
+        {
+            term atom = globalcontext_make_atom(g_global, ble_gatt_read_atom);
+            term t_handle = term_from_int(conn_handle);
+            term t_status = term_from_int(status);
+            term t_data = term_from_literal_binary(
+                g_async_read_buf, g_async_read_len, &heap, g_global);
+
+            term msg = port_heap_create_tuple_n(&heap, 4,
+                (term[]){atom, t_handle, t_status, t_data});
+
+            port_send_message_from_task(g_global,
+                term_from_local_process_id(g_scan_subscriber_pid), msg);
+        }
+        END_WITH_STACK_HEAP(heap, g_global);
+    }
+
+    g_async_read_len = 0;
     return 0;
 }
 
+/**
+ * Callback for ble_gattc_write_flat.
+ * Sends {ble_gatt_write, ConnHandle, Status} to subscriber.
+ */
 static int gatt_write_cb(uint16_t conn_handle,
                          const struct ble_gatt_error *error,
                          struct ble_gatt_attr *attr, void *arg)
 {
-    (void) conn_handle;
     (void) attr;
     (void) arg;
 
-    g_op_rc = error->status;
-    xSemaphoreGive(g_op_sem);
+    if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+        // Message: {ble_gatt_write, ConnHandle, Status}
+        BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+        {
+            term atom = globalcontext_make_atom(g_global, ble_gatt_write_atom);
+            term t_handle = term_from_int(conn_handle);
+            term t_status = term_from_int(error->status);
+
+            term msg = port_heap_create_tuple_n(&heap, 3,
+                (term[]){atom, t_handle, t_status});
+
+            port_send_message_from_task(g_global,
+                term_from_local_process_id(g_scan_subscriber_pid), msg);
+        }
+        END_WITH_STACK_HEAP(heap, g_global);
+    }
+
+    return 0;
+}
+
+/**
+ * Callback for ble_gattc_disc_all_chrs.
+ * Accumulates results, sends {ble_disc_complete, ConnHandle, Status, Data}
+ * on completion.
+ */
+static int disc_all_chrs_cb(uint16_t conn_handle,
+                            const struct ble_gatt_error *error,
+                            const struct ble_gatt_chr *chr, void *arg)
+{
+    (void) arg;
+
+    if (error->status == 0 && chr != NULL) {
+        // Accumulate characteristic
+        if (g_disc_count < MAX_DISC_CHARS && chr->uuid.u.type == BLE_UUID_TYPE_128) {
+            struct disc_chr_entry *entry = &g_disc_results[g_disc_count];
+            // Convert from NimBLE little-endian to big-endian (natural)
+            for (int i = 0; i < 16; i++) {
+                entry->uuid_be[i] = ((ble_uuid128_t *)&chr->uuid)->value[15 - i];
+            }
+            entry->val_handle = chr->val_handle;
+            entry->properties = chr->properties;
+            g_disc_count++;
+        }
+        return 0;
+    }
+
+    // Discovery complete — send results to subscriber
+    if (g_scan_subscriber_pid >= 0 && g_global != NULL) {
+        int status = (error->status == BLE_HS_EDONE) ? 0 : error->status;
+
+        // Pack results as binary: <<Count:16/little, (UUID:16/bytes, ValHandle:16/little, Props:8)*>>
+        size_t data_len = 2 + (size_t)g_disc_count * 19;  // 16 + 2 + 1 per entry
+        uint8_t data_buf[2 + MAX_DISC_CHARS * 19];
+        data_buf[0] = g_disc_count & 0xFF;
+        data_buf[1] = (g_disc_count >> 8) & 0xFF;
+        for (uint16_t i = 0; i < g_disc_count; i++) {
+            uint8_t *p = &data_buf[2 + i * 19];
+            memcpy(p, g_disc_results[i].uuid_be, 16);
+            p[16] = g_disc_results[i].val_handle & 0xFF;
+            p[17] = (g_disc_results[i].val_handle >> 8) & 0xFF;
+            p[18] = g_disc_results[i].properties;
+        }
+
+        // Message: {ble_disc_complete, ConnHandle, Status, Data}
+        #define DISC_HEAP_SIZE (TUPLE_SIZE(4) + TERM_BINARY_HEAP_SIZE(2 + MAX_DISC_CHARS * 19))
+        BEGIN_WITH_STACK_HEAP(DISC_HEAP_SIZE, heap);
+        {
+            term atom = globalcontext_make_atom(g_global, ble_disc_complete_atom);
+            term t_handle = term_from_int(conn_handle);
+            term t_status = term_from_int(status);
+            term t_data = term_from_literal_binary(data_buf, data_len, &heap, g_global);
+
+            term msg = port_heap_create_tuple_n(&heap, 4,
+                (term[]){atom, t_handle, t_status, t_data});
+
+            port_send_message_from_task(g_global,
+                term_from_local_process_id(g_scan_subscriber_pid), msg);
+        }
+        END_WITH_STACK_HEAP(heap, g_global);
+    }
+
     return 0;
 }
 
@@ -414,17 +560,14 @@ static term handle_init(Context *ctx)
         return make_error(ctx, RSP_ERR_STATE);
     }
 
-    g_op_sem = xSemaphoreCreateBinary();
-    g_data_lock = xSemaphoreCreateMutex();
-
     nimble_port_init();
 
-    // Configure security: enable bonding, MITM not required, Legacy Pairing
+    // Configure security: enable bonding, MITM not required, prefer Secure Connections
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 0;  // Legacy Pairing — required by some Hue firmware
+    ble_hs_cfg.sm_sc = 1;  // Prefer LESC; falls back to Legacy if peer doesn't support SC
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.store_read_cb = ble_store_config_read;
@@ -436,6 +579,12 @@ static term handle_init(Context *ctx)
 
     ESP_LOGI(TAG, "BLE initialized");
     return make_ok(ctx);
+}
+
+static term make_error_with_rc(Context *ctx, uint8_t code, int rc)
+{
+    uint8_t payload[2] = {code, (uint8_t) rc};
+    return make_response(ctx, RSP_ERR, payload, 2);
 }
 
 static term handle_scan_start(Context *ctx, const uint8_t *data, size_t len)
@@ -450,6 +599,13 @@ static term handle_scan_start(Context *ctx, const uint8_t *data, size_t len)
         duration_sec = data[1];
     }
 
+    // Defensively cancel any prior scan/connect to free the GAP
+    if (g_scanning) {
+        ESP_LOGW(TAG, "scan still active, cancelling before restart");
+        ble_gap_disc_cancel();
+        g_scanning = false;
+    }
+
     struct ble_gap_disc_params params;
     memset(&params, 0, sizeof(params));
     params.passive = 0;  // active scan to get names
@@ -460,8 +616,8 @@ static term handle_scan_start(Context *ctx, const uint8_t *data, size_t len)
     int32_t duration_ms = (int32_t) duration_sec * 1000;
     int rc = ble_gap_disc(g_own_addr_type, duration_ms, &params, gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
-        return make_error(ctx, RSP_ERR_BLE);
+        ESP_LOGE(TAG, "ble_gap_disc failed: rc=%d", rc);
+        return make_error_with_rc(ctx, RSP_ERR_BLE, rc);
     }
 
     g_scanning = true;
@@ -523,11 +679,26 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
     peer_addr.type = addr_type;
     memcpy(peer_addr.val, addr, 6);
 
+    // Use fast connection parameters initially.
+    // Pairing (LESC) requires multiple SM round-trips, so we need
+    // a short interval here. After bonding succeeds, Erlang calls
+    // OP_UPDATE_PARAMS to switch to slow params for WiFi coexistence.
+    struct ble_gap_conn_params conn_params = {
+        .scan_itvl = 16,              // 10ms scan interval during connect
+        .scan_window = 16,            // 10ms scan window
+        .itvl_min = 24,               // 30ms min — fast for SM handshake
+        .itvl_max = 40,               // 50ms max
+        .latency = 0,                 // no latency during pairing
+        .supervision_timeout = 200,   // 2s supervision timeout
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+
     int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 30000,
-                             NULL, gap_event_cb, NULL);
+                             &conn_params, gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
-        return make_error(ctx, RSP_ERR_BLE);
+        ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
+        return make_error_with_rc(ctx, RSP_ERR_BLE, rc);
     }
 
     ESP_LOGI(TAG, "connect initiated");
@@ -580,66 +751,71 @@ static term handle_security(Context *ctx, const uint8_t *data, size_t len)
 }
 
 /**
- * GATT Read by UUID.
- * Request: <<OP_GATT_READ, ConnHandle:16/little, ServiceUUID:16/bytes, CharUUID:16/bytes>>
- * Response: <<RSP_OK, Data/bytes>>
- *
- * Uses ble_gattc_read_long with service discovery. For simplicity,
- * we read using the characteristic UUID directly with ble_gattc_read_by_uuid.
+ * Update connection parameters on an active connection.
+ * Used after bonding to switch from fast (pairing) to slow (WiFi-friendly) params.
+ * Request: <<OP_UPDATE_PARAMS, Handle:16/little>>
  */
-static int gatt_read_by_uuid_cb(uint16_t conn_handle,
-                                const struct ble_gatt_error *error,
-                                struct ble_gatt_attr *attr, void *arg)
+static term handle_update_params(Context *ctx, const uint8_t *data, size_t len)
 {
-    (void) conn_handle;
-    (void) arg;
-
-    if (error->status == 0 && attr != NULL) {
-        g_read_len = OS_MBUF_PKTLEN(attr->om);
-        if (g_read_len > MAX_GATT_READ) {
-            g_read_len = MAX_GATT_READ;
-        }
-        os_mbuf_copydata(attr->om, 0, g_read_len, g_read_buf);
-        g_op_rc = 0;
-        // Don't signal yet — wait for the completion call (status != 0)
-        return 0;
+    if (!g_ble_initialized) {
+        return make_error(ctx, RSP_ERR_STATE);
+    }
+    if (len < 3) { // opcode + handle(2)
+        return make_error(ctx, RSP_ERR_ARGS);
     }
 
-    // Final callback with status indicating end
-    if (error->status == BLE_HS_EDONE) {
-        // Already got the data in a previous call
-        if (g_read_len == 0) {
-            g_op_rc = BLE_HS_ENOENT;
-        }
-    } else if (error->status != 0) {
-        g_op_rc = error->status;
-        g_read_len = 0;
-    }
+    uint16_t handle = data[1] | ((uint16_t)data[2] << 8);
 
-    xSemaphoreGive(g_op_sem);
-    return 0;
+    struct ble_gap_upd_params params = {
+        .itvl_min = 320,              // 400ms — WiFi-friendly
+        .itvl_max = 640,              // 800ms
+        .latency = 4,                 // skip up to 4 events when idle
+        .supervision_timeout = 1000,  // 10s
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+
+    int rc = ble_gap_update_params(handle, &params);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_update_params failed: %d", rc);
+        return make_error(ctx, RSP_ERR_BLE);
+    }
+    ESP_LOGI(TAG, "conn params update requested: handle=%u itvl=320-640", handle);
+    return make_ok(ctx);
 }
 
+/**
+ * GATT Read by UUID (async).
+ * Request: <<OP_GATT_READ, ConnHandle:16/little, ChrUUID:16/bytes>>
+ * Response: <<RSP_OK>> immediately.
+ * Result sent async as: {ble_gatt_read, ConnHandle, Status, Data}
+ */
 static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
 {
-    // opcode(1) + conn_handle(2) + service_uuid(16) + char_uuid(16) = 35
-    if (len < 35) {
+    // opcode(1) + conn_handle(2) + char_uuid(16) = 19 minimum
+    // For backward compat also accept svc_uuid(16) + char_uuid(16) = 35
+    if (len < 19) {
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
     uint16_t conn_handle = data[1] | ((uint16_t)data[2] << 8);
 
+    // ChrUUID is at offset 19 if SvcUUID present (35-byte format),
+    // or at offset 3 if only ChrUUID present (19-byte format)
+    const uint8_t *chr_uuid_be;
+    if (len >= 35) {
+        chr_uuid_be = &data[19];  // skip SvcUUID for backward compat
+    } else {
+        chr_uuid_be = &data[3];
+    }
+
     ble_uuid128_t char_uuid;
-    uuid128_from_be(&data[19], &char_uuid);  // char UUID at offset 3+16=19
+    uuid128_from_be(chr_uuid_be, &char_uuid);
 
-    g_read_len = 0;
-    g_op_rc = -1;
-
-    // Drain any stale semaphore from a previous timed-out operation
-    xSemaphoreTake(g_op_sem, 0);
+    g_async_read_len = 0;
 
     int rc = ble_gattc_read_by_uuid(conn_handle,
-                                    1, 0xFFFF,  // search all handles
+                                    1, 0xFFFF,
                                     &char_uuid.u,
                                     gatt_read_by_uuid_cb, NULL);
     if (rc != 0) {
@@ -647,138 +823,74 @@ static term handle_gatt_read(Context *ctx, const uint8_t *data, size_t len)
         return make_error(ctx, RSP_ERR_BLE);
     }
 
-    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
-        return make_error(ctx, RSP_ERR_TIMEOUT);
-    }
-
-    if (g_op_rc != 0) {
-        uint8_t err = (uint8_t) g_op_rc;
-        return make_response(ctx, RSP_ERR, &err, 1);
-    }
-
-    return make_ok_payload(ctx, g_read_buf, g_read_len);
+    return make_ok(ctx);
 }
 
 /**
- * GATT Write (with response).
- * Request: <<OP_GATT_WRITE, ConnHandle:16/little, ServiceUUID:16/bytes, CharUUID:16/bytes, Value/bytes>>
+ * GATT Write (async, takes ValHandle directly).
+ * Request: <<OP_GATT_WRITE, ConnHandle:16/little, ValHandle:16/little, Value/bytes>>
+ * Response: <<RSP_OK>> immediately.
+ * Result sent async as: {ble_gatt_write, ConnHandle, Status}
  *
- * We discover the characteristic handle first via disc_all_chrs, then write.
- * For simplicity, we use a two-step approach: discover handle, then write.
+ * GATT Write No-Response (sync, takes ValHandle directly).
+ * Request: <<OP_GATT_WRITE_NR, ConnHandle:16/little, ValHandle:16/little, Value/bytes>>
+ * Response: <<RSP_OK>> immediately (no async result).
  */
-
-// State for characteristic handle discovery
-static uint16_t g_disc_char_handle;
-static ble_uuid128_t g_disc_target_uuid;
-
-static int disc_chr_cb(uint16_t conn_handle,
-                       const struct ble_gatt_error *error,
-                       const struct ble_gatt_chr *chr, void *arg)
-{
-    (void) conn_handle;
-    (void) arg;
-
-    if (error->status == 0 && chr != NULL) {
-        if (ble_uuid_cmp(&chr->uuid.u, &g_disc_target_uuid.u) == 0) {
-            g_disc_char_handle = chr->val_handle;
-            g_op_rc = 0;
-        }
-        return 0;
-    }
-
-    // Discovery complete
-    if (error->status == BLE_HS_EDONE) {
-        if (g_disc_char_handle == 0) {
-            g_op_rc = BLE_HS_ENOENT;
-        }
-    } else {
-        g_op_rc = error->status;
-    }
-
-    xSemaphoreGive(g_op_sem);
-    return 0;
-}
-
-static int discover_char_handle(uint16_t conn_handle, const uint8_t *svc_uuid_be,
-                                const uint8_t *chr_uuid_be, uint16_t *out_handle)
-{
-    ble_uuid128_t svc_uuid;
-    uuid128_from_be(svc_uuid_be, &svc_uuid);
-    uuid128_from_be(chr_uuid_be, &g_disc_target_uuid);
-
-    g_disc_char_handle = 0;
-    g_op_rc = -1;
-
-    // Drain any stale semaphore from a previous timed-out operation
-    xSemaphoreTake(g_op_sem, 0);
-
-    int rc = ble_gattc_disc_all_chrs(conn_handle, 1, 0xFFFF, disc_chr_cb, NULL);
-    if (rc != 0) {
-        return rc;
-    }
-
-    if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
-        return BLE_HS_ETIMEOUT;
-    }
-
-    if (g_op_rc != 0) {
-        return g_op_rc;
-    }
-
-    *out_handle = g_disc_char_handle;
-    return 0;
-}
-
 static term handle_gatt_write(Context *ctx, const uint8_t *data, size_t len, bool with_response)
 {
-    // opcode(1) + conn_handle(2) + service_uuid(16) + char_uuid(16) + value(1+)
-    if (len < 36) {
+    // opcode(1) + conn_handle(2) + val_handle(2) + value(1+) = 6 minimum
+    if (len < 6) {
         return make_error(ctx, RSP_ERR_ARGS);
     }
 
     uint16_t conn_handle = data[1] | ((uint16_t)data[2] << 8);
+    uint16_t val_handle  = data[3] | ((uint16_t)data[4] << 8);
+    const uint8_t *value = &data[5];
+    size_t value_len = len - 5;
 
-    const uint8_t *svc_uuid = &data[3];
-    const uint8_t *chr_uuid = &data[19];
-    const uint8_t *value = &data[35];
-    size_t value_len = len - 35;
-
-    // Discover the characteristic handle
-    uint16_t val_handle;
-    int rc = discover_char_handle(conn_handle, svc_uuid, chr_uuid, &val_handle);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "characteristic discovery failed: %d", rc);
-        return make_error(ctx, RSP_ERR_BLE);
-    }
-
+    int rc;
     if (with_response) {
-        g_op_rc = -1;
-
-        // Drain any stale semaphore from a previous timed-out operation
-        xSemaphoreTake(g_op_sem, 0);
-
         rc = ble_gattc_write_flat(conn_handle, val_handle,
                                   value, value_len, gatt_write_cb, NULL);
         if (rc != 0) {
             ESP_LOGE(TAG, "ble_gattc_write_flat failed: %d", rc);
             return make_error(ctx, RSP_ERR_BLE);
         }
-
-        if (xSemaphoreTake(g_op_sem, pdMS_TO_TICKS(GATT_TIMEOUT_MS)) != pdTRUE) {
-            return make_error(ctx, RSP_ERR_TIMEOUT);
-        }
-
-        if (g_op_rc != 0) {
-            return make_error(ctx, RSP_ERR_BLE);
-        }
     } else {
-        // Write without response (faster, used for light control)
         rc = ble_gattc_write_no_rsp_flat(conn_handle, val_handle,
                                          value, value_len);
         if (rc != 0) {
             ESP_LOGE(TAG, "ble_gattc_write_no_rsp_flat failed: %d", rc);
             return make_error(ctx, RSP_ERR_BLE);
         }
+    }
+
+    return make_ok(ctx);
+}
+
+/**
+ * Discover all characteristics on a connection (async).
+ * Request: <<OP_DISC_SVCS, ConnHandle:16/little>>
+ * Response: <<RSP_OK>> immediately.
+ * Result sent async as: {ble_disc_complete, ConnHandle, Status, Data}
+ * where Data = <<Count:16/little, (ChrUUID:16/bytes, ValHandle:16/little, Props:8)*>>
+ */
+static term handle_disc_svcs(Context *ctx, const uint8_t *data, size_t len)
+{
+    if (len < 3) {  // opcode + conn_handle(2)
+        return make_error(ctx, RSP_ERR_ARGS);
+    }
+
+    uint16_t conn_handle = data[1] | ((uint16_t)data[2] << 8);
+
+    g_disc_count = 0;
+    g_disc_conn_handle = conn_handle;
+
+    int rc = ble_gattc_disc_all_chrs(conn_handle, 1, 0xFFFF,
+                                     disc_all_chrs_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_all_chrs failed: %d", rc);
+        return make_error(ctx, RSP_ERR_BLE);
     }
 
     return make_ok(ctx);
@@ -825,6 +937,9 @@ static term handle_call(Context *ctx, term req, term caller_pid)
     case OP_SECURITY:
         return handle_security(ctx, data, len);
 
+    case OP_UPDATE_PARAMS:
+        return handle_update_params(ctx, data, len);
+
     case OP_GATT_READ:
         return handle_gatt_read(ctx, data, len);
 
@@ -833,6 +948,9 @@ static term handle_call(Context *ctx, term req, term caller_pid)
 
     case OP_GATT_WRITE_NR:
         return handle_gatt_write(ctx, data, len, false);
+
+    case OP_DISC_SVCS:
+        return handle_disc_svcs(ctx, data, len);
 
     default:
         return make_error(ctx, RSP_ERR_ARGS);

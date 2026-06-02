@@ -75,12 +75,18 @@ handle_call({scan, Duration}, From, State) ->
             {reply, {error, Reason}, State}
     end;
 handle_call(get_results, _From, State) ->
-    Reply = #{
-        results => format_results(State#state.results),
-        scanning => State#state.scanning,
-        last_scan => State#state.last_scan
-    },
-    {reply, {ok, Reply}, State};
+    try
+        Reply = {ok, #{
+            results => format_results(State#state.results),
+            scanning => State#state.scanning,
+            last_scan => State#state.last_scan
+        }},
+        {reply, Reply, State}
+    catch
+        C:R ->
+            io:format("[scanner] get_results crash: ~p:~p~n", [C, R]),
+            {reply, {error, {C, R}}, State}
+    end;
 handle_call(get_raw_results, _From, State) ->
     {reply, {ok, State#state.results}, State};
 handle_call(_Req, _From, State) ->
@@ -140,13 +146,23 @@ format_results(Results) ->
             addr => format_addr(Addr),
             addr_type => AddrType,
             rssi => RSSI,
-            name => Name
+            name => safe_name(Name)
         }
     end, Results).
 
+%% Ensure name is a valid binary string (strip non-printable bytes)
+safe_name(<<>>) -> <<>>;
+safe_name(Name) when is_binary(Name) -> Name;
+safe_name(_) -> <<>>.
+
 format_addr(<<A, B, C, D, E, F>>) ->
-    iolist_to_binary(io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
-                                   [F, E, D, C, B, A])).
+    iolist_to_binary(lists:join(":", [byte_to_hex(X) || X <- [F, E, D, C, B, A]])).
+
+byte_to_hex(B) ->
+    [hex_char(B bsr 4), hex_char(B band 16#0F)].
+
+hex_char(N) when N < 10 -> N + $0;
+hex_char(N) -> N - 10 + $A.
 
 format_timestamp() ->
     iolist_to_binary(io_lib:format("scan_~p", [erlang:monotonic_time()])).

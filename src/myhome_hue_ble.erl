@@ -53,13 +53,15 @@
     power     :: boolean() | undefined,
     brightness :: integer() | undefined,
     color_temp :: integer() | undefined,
-    %% Reconnect
-    reconnect_timer :: reference() | undefined,
-    connect_retries = 0 :: non_neg_integer()
+    %% Connect-on-demand: pending command waiting for encryption
+    pending_cmd :: term() | undefined,
+    pending_from :: term() | undefined,
+    %% Idle disconnect timer
+    idle_timer :: reference() | undefined
 }).
 
--define(RECONNECT_DELAY, 10000).
--define(MAX_CONNECT_RETRIES, 3).
+%% Disconnect after 5s idle to free radio for WiFi
+-define(IDLE_DISCONNECT_MS, 5000).
 
 %%====================================================================
 %% Public API
@@ -105,6 +107,12 @@ get_state(Name) ->
 %%====================================================================
 
 init({Addr, AddrType, Name}) ->
+    %% Subscribe to BLE events (enc_change, disconnected)
+    myhome_event_bus:subscribe(self(), fun
+        ({ble_enc_change, _, _}) -> true;
+        ({ble_disconnected, _, _}) -> true;
+        (_) -> false
+    end),
     State = #state{
         name = Name,
         addr = Addr,
@@ -112,57 +120,144 @@ init({Addr, AddrType, Name}) ->
         conn_handle = undefined,
         connected = false
     },
-    %% Stagger connection attempts to avoid NimBLE EALREADY errors
-    Delay = case Name of
-        bulb_1 -> 100;
-        bulb_2 -> 3000;
-        bulb_3 -> 6000;
-        _      -> 9000
-    end,
-    erlang:send_after(Delay, self(), connect),
+    %% Connect-on-demand: no connection at startup.
+    %% WiFi stays healthy until a command actually needs BLE.
+    myhome_log:log(info, "[~p] ready (connect-on-demand)", [Name]),
     {ok, State}.
 
-handle_call({set_power, _On}, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call({set_power, On}, _From, #state{conn_handle = Handle} = State) ->
-    Value = case On of true -> <<16#01>>; false -> <<16#00>> end,
-    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_POWER, Value),
+handle_call({set_power, On}, From, State) ->
+    Cmd = {write, ?CHR_POWER, case On of true -> <<16#01>>; false -> <<16#00>> end},
+    do_cmd(Cmd, From, State);
+
+handle_call({set_brightness, Bri}, From, State) ->
+    Cmd = {write, ?CHR_BRIGHTNESS, <<Bri:8>>},
+    do_cmd(Cmd, From, State);
+
+handle_call({set_color_temp, Temp}, From, State) ->
+    Cmd = {write, ?CHR_COLOR_TEMP, <<Temp:16/little>>},
+    do_cmd(Cmd, From, State);
+
+handle_call({set_color_xy, X, Y}, From, State) ->
+    Cmd = {write, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>},
+    do_cmd(Cmd, From, State);
+
+handle_call({set_state, Props}, From, State) ->
+    Cmd = {write_multi, Props},
+    do_cmd(Cmd, From, State);
+
+handle_call(get_state, _From, State) ->
+    #state{power = Power, brightness = Bri, color_temp = Temp, connected = Conn} = State,
+    Reply = {ok, #{power => Power, brightness => Bri, color_temp => Temp, connected => Conn}},
+    {reply, Reply, State};
+
+handle_call(_Req, _From, State) ->
+    {reply, {error, unknown_request}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+%% Encryption established — execute pending command
+handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
+            #state{conn_handle = ConnHandle, pending_cmd = Cmd, pending_from = From} = State)
+  when Cmd =/= undefined ->
+    case Status of
+        0 ->
+            myhome_log:log(info, "[~p] encrypted, executing command", [State#state.name]),
+            {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
+            gen_server:reply(From, Reply),
+            TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
+            {noreply, NewState#state{pending_cmd = undefined, pending_from = undefined,
+                                     idle_timer = TRef}};
+        _ ->
+            myhome_log:log(error, "[~p] security failed (status=~p)", [State#state.name, Status]),
+            gen_server:reply(From, {error, {security_failed, Status}}),
+            myhome_ble_conn:disconnect(ConnHandle),
+            {noreply, State#state{conn_handle = undefined, connected = false,
+                                  pending_cmd = undefined, pending_from = undefined}}
+    end;
+
+%% Encryption event but no pending command (e.g., reconnect without command)
+handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
+            #state{conn_handle = ConnHandle} = State) ->
+    case Status of
+        0 ->
+            myhome_log:log(info, "[~p] encrypted (no pending cmd)", [State#state.name]),
+            TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
+            {noreply, State#state{connected = true, idle_timer = TRef}};
+        _ ->
+            myhome_ble_conn:disconnect(ConnHandle),
+            {noreply, State#state{conn_handle = undefined, connected = false}}
+    end;
+
+handle_info({ble_event, {ble_disconnected, ConnHandle, Reason}},
+            #state{conn_handle = ConnHandle} = State) ->
+    myhome_log:log(info, "[~p] disconnected (reason=~p)", [State#state.name, Reason]),
+    %% If there was a pending command, fail it
+    NewState = case State#state.pending_from of
+        undefined -> State;
+        From ->
+            gen_server:reply(From, {error, disconnected}),
+            State#state{pending_cmd = undefined, pending_from = undefined}
+    end,
+    cancel_idle_timer(NewState#state.idle_timer),
+    {noreply, NewState#state{conn_handle = undefined, connected = false, idle_timer = undefined}};
+
+%% Idle timeout — disconnect to free radio for WiFi
+handle_info(idle_disconnect, #state{conn_handle = Handle, connected = true} = State)
+  when Handle =/= undefined ->
+    myhome_log:log(info, "[~p] idle disconnect", [State#state.name]),
+    myhome_ble_conn:disconnect(Handle),
+    {noreply, State#state{conn_handle = undefined, connected = false, idle_timer = undefined}};
+handle_info(idle_disconnect, State) ->
+    {noreply, State#state{idle_timer = undefined}};
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{conn_handle = undefined}) ->
+    ok;
+terminate(_Reason, #state{conn_handle = Handle}) ->
+    myhome_ble_conn:disconnect(Handle),
+    ok.
+
+%%====================================================================
+%% Internal functions
+%%====================================================================
+
+%% Execute a command — connect on-demand if needed
+do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
+  when Handle =/= undefined ->
+    %% Already connected and encrypted — execute immediately
+    cancel_idle_timer(State#state.idle_timer),
+    {Reply, NewState} = execute_cmd(Cmd, State),
+    TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
+    {reply, Reply, NewState#state{idle_timer = TRef}};
+do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
+    %% Not connected — initiate connection, store pending command
+    case myhome_ble_conn:connect_sync(State#state.addr, State#state.addr_type) of
+        {ok, ConnHandle} ->
+            myhome_log:log(info, "[~p] connected, securing...", [State#state.name]),
+            ble:security(ConnHandle),
+            %% Wait for enc_change in handle_info before executing
+            {noreply, State#state{conn_handle = ConnHandle, connected = false,
+                                  pending_cmd = Cmd, pending_from = From}};
+        {error, Reason} ->
+            myhome_log:log(warning, "[~p] connect failed: ~p", [State#state.name, Reason]),
+            {reply, {error, {connect_failed, Reason}}, State}
+    end;
+do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
+    %% Already have a pending command (connection in progress)
+    {reply, {error, busy}, State}.
+
+%% Execute a GATT write command on an encrypted connection
+execute_cmd({write, ChrUUID, Value}, #state{conn_handle = Handle} = State) ->
+    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ChrUUID, Value),
     NewState = case Result of
-        ok -> State#state{power = On};
+        ok -> update_cached_from_write(ChrUUID, Value, State);
         _  -> State
     end,
-    {reply, Result, NewState};
-
-handle_call({set_brightness, _Bri}, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call({set_brightness, Bri}, _From, #state{conn_handle = Handle} = State) ->
-    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<Bri:8>>),
-    NewState = case Result of
-        ok -> State#state{brightness = Bri};
-        _  -> State
-    end,
-    {reply, Result, NewState};
-
-handle_call({set_color_temp, _Temp}, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call({set_color_temp, Temp}, _From, #state{conn_handle = Handle} = State) ->
-    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<Temp:16/little>>),
-    NewState = case Result of
-        ok -> State#state{color_temp = Temp};
-        _  -> State
-    end,
-    {reply, Result, NewState};
-
-handle_call({set_color_xy, _X, _Y}, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call({set_color_xy, X, Y}, _From, #state{conn_handle = Handle} = State) ->
-    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>),
-    {reply, Result, State};
-
-handle_call({set_state, _Props}, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call({set_state, Props}, _From, #state{conn_handle = Handle} = State) ->
-    %% Write each property to its individual characteristic
+    {Result, NewState};
+execute_cmd({write_multi, Props}, #state{conn_handle = Handle} = State) ->
     Results = lists:map(fun
         ({power, On}) ->
             Val = case On of true -> <<16#01>>; false -> <<16#00>> end,
@@ -183,59 +278,25 @@ handle_call({set_state, Props}, _From, #state{conn_handle = Handle} = State) ->
         ok -> update_cached_state(State, Props);
         _  -> State
     end,
-    {reply, Result, NewState};
+    {Result, NewState}.
 
-handle_call(get_state, _From, #state{connected = false} = State) ->
-    {reply, {error, not_connected}, State};
-handle_call(get_state, _From, State) ->
-    #state{power = Power, brightness = Bri, color_temp = Temp, connected = Conn} = State,
-    Reply = {ok, #{power => Power, brightness => Bri, color_temp => Temp, connected => Conn}},
-    {reply, Reply, State};
-
-handle_call(_Req, _From, State) ->
-    {reply, {error, unknown_request}, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(connect, #state{connect_retries = N} = State) when N >= ?MAX_CONNECT_RETRIES ->
-    myhome_log:log(warning, "[~p] giving up after ~p connect attempts",
-              [State#state.name, N]),
-    {noreply, State};
-handle_info(connect, State) ->
-    case do_connect(State) of
-        {ok, NewState} ->
-            myhome_log:log(info, "[~p] connected to ~s", [State#state.name, format_addr(State#state.addr)]),
-            {noreply, NewState#state{connect_retries = 0}};
-        {error, _Reason} ->
-            Retries = State#state.connect_retries + 1,
-            myhome_log:log(warning, "[~p] connect failed (~p/~p), retrying in ~pms",
-                      [State#state.name, Retries, ?MAX_CONNECT_RETRIES, ?RECONNECT_DELAY]),
-            Ref = erlang:send_after(?RECONNECT_DELAY, self(), connect),
-            {noreply, State#state{reconnect_timer = Ref, connect_retries = Retries}}
-    end;
-
-handle_info(_Msg, State) ->
-    {noreply, State}.
-
-terminate(_Reason, #state{conn_handle = undefined}) ->
-    ok;
-terminate(_Reason, #state{conn_handle = Handle}) ->
-    myhome_ble_conn:disconnect(Handle),
-    ok.
-
-%%====================================================================
-%% Internal functions
-%%====================================================================
-
-do_connect(#state{addr = Addr, addr_type = AddrType} = State) ->
-    case myhome_ble_conn:connect_sync(Addr, AddrType) of
-        {ok, ConnHandle} ->
-            {ok, State#state{conn_handle = ConnHandle, connected = true,
-                             reconnect_timer = undefined}};
-        {error, Reason} ->
-            {error, Reason}
+update_cached_from_write(ChrUUID, Value, State) ->
+    case ChrUUID of
+        ?CHR_POWER ->
+            <<P>> = Value,
+            State#state{power = P =:= 1};
+        ?CHR_BRIGHTNESS ->
+            <<B>> = Value,
+            State#state{brightness = B};
+        ?CHR_COLOR_TEMP ->
+            <<T:16/little>> = Value,
+            State#state{color_temp = T};
+        _ ->
+            State
     end.
+
+cancel_idle_timer(undefined) -> ok;
+cancel_idle_timer(TRef) -> erlang:cancel_timer(TRef).
 
 update_cached_state(State, Props) ->
     S1 = case maps:find(power, Props) of
@@ -250,7 +311,3 @@ update_cached_state(State, Props) ->
         {ok, T} -> S2#state{color_temp = T};
         error   -> S2
     end.
-
-format_addr(<<A, B, C, D, E, F>>) ->
-    io_lib:format("~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B:~2.16.0B",
-                  [F, E, D, C, B, A]).
