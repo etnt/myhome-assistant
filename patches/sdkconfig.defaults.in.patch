@@ -1,0 +1,37 @@
+--- a/src/platforms/esp32/sdkconfig.defaults.in
++++ b/src/platforms/esp32/sdkconfig.defaults.in
+@@ -4,3 +4,33 @@
+ CONFIG_LWIP_IPV6=n
+ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="@AVM_PARTITION_TABLE_FILENAME@"
+ CONFIG_APP_REPRODUCIBLE_BUILD=y
++
++# BLE (NimBLE) configuration for Hue light control
++CONFIG_BT_ENABLED=y
++CONFIG_BT_NIMBLE_ENABLED=y
++CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
++CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
++CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
++CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
++
++# Security / bonding
++CONFIG_BT_NIMBLE_SM_LEGACY=y
++CONFIG_BT_NIMBLE_SM_SC=y
++CONFIG_BT_NIMBLE_NVS_PERSIST=y
++
++# Connection parameters
++CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
++CONFIG_BT_NIMBLE_MAX_BONDS=3
++
++# Increase stack for BLE host task
++CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
++
++# Console over USB Serial/JTAG (the /dev/cu.usbmodem* port on Mac)
++CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
++
++# WiFi/BLE RF coexistence (time-division multiplexing on shared 2.4GHz radio)
++CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
++
++# Pin BT controller to core 1, WiFi to core 0 for optimal coexistence
++CONFIG_BT_CTRL_PINNED_TO_CORE=1
++CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
++CONFIG_ESP_WIFI_TASK_CORE_ID=0

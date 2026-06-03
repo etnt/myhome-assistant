@@ -37,12 +37,12 @@ install-esptool: .venv
 $(ATOMVM_DIR):
 	git clone --depth 1 git@github.com:etnt/AtomVM.git
 
-$(ESP32_DIR)/build/atomvm-esp32s3.img: $(ATOMVM_DIR) nifs/ble/ble_port.c sdkconfig.defaults
+$(ESP32_DIR)/build/atomvm-esp32s3.img: $(ATOMVM_DIR) nifs/ble/ble_port.c patches/sdkconfig.defaults.in.patch
 	@if [ ! -L $(ESP32_DIR)/components/ble_port ]; then \
 		ln -s $$(pwd)/nifs/ble $(ESP32_DIR)/components/ble_port; \
 	fi
 	@if ! grep -q "BT_NIMBLE_ENABLED" $(ESP32_DIR)/sdkconfig.defaults.in 2>/dev/null; then \
-		cat sdkconfig.defaults >> $(ESP32_DIR)/sdkconfig.defaults.in; \
+		cd $(ATOMVM_DIR) && git apply ../patches/sdkconfig.defaults.in.patch; \
 	fi
 	cd $(ESP32_DIR) && \
 		source $(IDF_PATH)/export.sh && \
