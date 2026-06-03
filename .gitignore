@@ -1,3 +1,7 @@
 _build/
 .rebar3/
 src/myhome_config.erl
+.vscode/
+AtomVM/
+rebar.lock
+sdkconfig.defaults
