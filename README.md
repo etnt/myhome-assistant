@@ -1,5 +1,5 @@
 # MyHome Assistant
-> Experiments with controlling things as home via ESP32+AtomVM+Erlang
+> Experiments with controlling things at home via ESP32+AtomVM+Erlang
 
 Control Philips Hue Bluetooth light bulbs directly from an ESP32-S3 running
 AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
