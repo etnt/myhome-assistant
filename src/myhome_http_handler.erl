@@ -33,7 +33,6 @@ handle_request(Method, [<<"api">> | Path], Request) ->
         do_handle(Method, Path, Request)
     catch
         exit:{noproc, _} ->
-            io:format("[http] noproc crash in handler~n"),
             json_reply(#{status => error, reason => <<"process not running">>});
         Class:Reason ->
             io:format("[http] handler crash: ~p:~p~n", [Class, Reason]),
@@ -210,6 +209,20 @@ do_handle(delete, [<<"bulb">>, BulbNum], _HttpRequest) ->
     case myhome_discovery:remove_bulb(Name) of
         ok -> json_reply(#{status => ok, removed => atom_to_binary(Name, utf8)});
         {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
+do_handle(get, [<<"sensors">>], _HttpRequest) ->
+    Readings = myhome_sensors:get_readings(),
+    json_reply(#{status => ok, sensors => Readings});
+
+do_handle(get, [<<"sensors">>, TypeBin], _HttpRequest) ->
+    Type = binary_to_existing_atom(TypeBin, utf8),
+    Readings = myhome_sensors:get_readings(),
+    case maps:find(Type, Readings) of
+        {ok, Data} ->
+            json_reply(#{status => ok, sensor => Type, data => Data});
+        error ->
+            json_reply(#{status => error, reason => <<"sensor not found">>})
     end;
 
 do_handle(get, [<<"connections">>], _HttpRequest) ->

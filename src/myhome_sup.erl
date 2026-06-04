@@ -47,10 +47,18 @@ init([]) ->
         type => worker
     },
 
+    SensorsSpec = #{
+        id => myhome_sensors,
+        start => {myhome_sensors, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec]}}.
+    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec, SensorsSpec]}}.

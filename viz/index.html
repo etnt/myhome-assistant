@@ -258,6 +258,32 @@ input[type="range"]::-webkit-slider-thumb:hover {
   font-size: 0.8rem;
 }
 
+/* Sensor cards */
+.sensor-card { }
+.sensor-grid { display: flex; flex-direction: column; gap: 0.5rem; }
+.sensor-row {
+  display: grid;
+  grid-template-columns: 1fr 7rem 9rem;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.3rem 0;
+  font-size: 0.9rem;
+}
+.sensor-val { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.sensor-minmax { font-size: 0.75rem; color: var(--accent2); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.quality-badge {
+  margin-top: 0.75rem;
+  padding: 0.3rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-align: center;
+  width: fit-content;
+}
+.quality-badge.good { background: var(--success); color: #1a1a2e; }
+.quality-badge.moderate { background: var(--accent2); color: #1a1a2e; }
+.quality-badge.poor { background: var(--accent); color: white; }
+
 .scan-item:last-child { border-bottom: none; }
 
 /* Toast notifications */
@@ -324,6 +350,9 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
   <!-- Bulb cards injected here -->
   <div id="bulbContainer"></div>
+
+  <!-- Sensor cards injected here -->
+  <div id="sensorContainer"></div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
@@ -539,6 +568,86 @@ function appendLog(level, msg) {
   area.scrollTop = area.scrollHeight;
 }
 
+// --- Sensors ---
+const sensorMinMax = {};
+
+function trackMinMax(key, value) {
+  const v = parseFloat(value);
+  if (!sensorMinMax[key]) sensorMinMax[key] = { min: v, max: v };
+  if (v < sensorMinMax[key].min) sensorMinMax[key].min = v;
+  if (v > sensorMinMax[key].max) sensorMinMax[key].max = v;
+  return sensorMinMax[key];
+}
+
+function sensorRow(label, value, unit, key) {
+  const mm = trackMinMax(key, value);
+  return `<div class="sensor-row">
+    <span>${label}</span>
+    <span class="sensor-val">${value} ${unit}</span>
+    <span class="sensor-minmax">↓${mm.min} ↑${mm.max}</span>
+  </div>`;
+}
+
+async function refreshSensors() {
+  const data = await api('GET', '/api/sensors');
+  if (data && data.status === 'ok' && data.sensors) {
+    renderSensors(data.sensors);
+  }
+}
+
+function renderSensors(sensors) {
+  const container = $('sensorContainer');
+  container.innerHTML = '';
+
+  if (sensors.bme680) {
+    const s = sensors.bme680;
+    const temp = s.temperature_c.toFixed(1);
+    const hum = s.humidity_pct.toFixed(1);
+    const pres = s.pressure_hpa.toFixed(1);
+    const gas = (s.gas_ohms / 1000).toFixed(1);
+    container.innerHTML += `
+      <div class="card sensor-card">
+        <h2>🌡 Environment (BME680)</h2>
+        <div class="sensor-grid">
+          ${sensorRow('Temperature', temp, '°C', 'bme680_temp')}
+          ${sensorRow('Humidity', hum, '%', 'bme680_hum')}
+          ${sensorRow('Pressure', pres, 'hPa', 'bme680_pres')}
+          ${sensorRow('Gas (VOC)', gas, 'kΩ', 'bme680_gas')}
+        </div>
+      </div>`;
+  }
+
+  if (sensors.sgp30) {
+    const s = sensors.sgp30;
+    let quality = 'Good', qclass = 'good';
+    if (s.eco2_ppm > 1000) { quality = 'Poor'; qclass = 'poor'; }
+    else if (s.eco2_ppm > 600) { quality = 'Moderate'; qclass = 'moderate'; }
+    container.innerHTML += `
+      <div class="card sensor-card">
+        <h2>🌬 Air Quality (SGP30)</h2>
+        <div class="sensor-grid">
+          ${sensorRow('eCO₂', s.eco2_ppm, 'ppm', 'sgp30_eco2')}
+          ${sensorRow('TVOC', s.tvoc_ppb, 'ppb', 'sgp30_tvoc')}
+        </div>
+        <div class="quality-badge ${qclass}">${quality}</div>
+      </div>`;
+  }
+
+  if (sensors.veml6030) {
+    const s = sensors.veml6030;
+    const lux = s.lux.toFixed(1);
+    const wlux = s.white_lux.toFixed(1);
+    container.innerHTML += `
+      <div class="card sensor-card">
+        <h2>☀ Light (VEML6030)</h2>
+        <div class="sensor-grid">
+          ${sensorRow('Ambient', lux, 'lux', 'veml_lux')}
+          ${sensorRow('White', wlux, 'lux', 'veml_white')}
+        </div>
+      </div>`;
+  }
+}
+
 // --- Init ---
 $('hostInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') checkStatus();
@@ -546,6 +655,9 @@ $('hostInput').addEventListener('keydown', e => {
 
 // Auto-connect on load
 setTimeout(checkStatus, 500);
+
+// Auto-refresh sensors every 5 seconds
+setInterval(refreshSensors, 5000);
 </script>
 </body>
 </html>
