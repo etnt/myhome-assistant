@@ -6,6 +6,15 @@ AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 
 <a href="myhome-assistant.jpg"><img src="myhome-assistant.jpg" width="600"></a>
 
+Goto: [https://etnt.github.io/myhome-assistant/](https://etnt.github.io/myhome-assistant/)
+
+or serve locally and open in a browser:
+
+```bash
+cd viz && python3 -m http.server 3000
+# open http://localhost:3000
+```
+
 ## Hardware
 
 - ESP32-S3 development board
