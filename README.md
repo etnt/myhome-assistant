@@ -4,6 +4,8 @@
 Control Philips Hue Bluetooth light bulbs directly from an ESP32-S3 running
 AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 
+<a href="myhome-assistant.jpg"><img src="myhome-assistant.jpg" width="600"></a>
+
 ## Hardware
 
 - ESP32-S3 development board
@@ -354,7 +356,7 @@ After changing the patch you must do a full rebuild: `rm -rf AtomVM/src/platform
 
 ## References
 
-[AtomVM] (https://doc.atomvm.org/latest/)
+[AtomVM](https://doc.atomvm.org/latest/)
 
 [BLE](https://learn.adafruit.com/introduction-to-bluetooth-low-energy/introduction)
 
