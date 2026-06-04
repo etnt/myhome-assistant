@@ -170,7 +170,7 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
   when Cmd =/= undefined ->
     case Status of
         0 ->
-            myhome_log:log(info, "[~p] encrypted, executing: ~p", [State#state.name, cmd_name(Cmd)]),
+            myhome_log:log(info, "[~p] encrypted, executing: ~s", [State#state.name, cmd_name(Cmd)]),
             {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
             gen_server:reply(From, Reply),
             TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
@@ -341,10 +341,10 @@ update_cached_state(State, Props) ->
         error   -> S2
     end.
 
-cmd_name({write, ?CHR_POWER, _}) -> set_power;
-cmd_name({write, ?CHR_BRIGHTNESS, _}) -> set_brightness;
-cmd_name({write, ?CHR_COLOR_TEMP, _}) -> set_color_temp;
-cmd_name({write, ?CHR_COLOR_XY, _}) -> set_color_xy;
-cmd_name({write_multi, _}) -> set_state;
-cmd_name(read_all) -> read_state;
-cmd_name(Other) -> Other.
+cmd_name({write, ?CHR_POWER, _}) -> "set_power";
+cmd_name({write, ?CHR_BRIGHTNESS, _}) -> "set_brightness";
+cmd_name({write, ?CHR_COLOR_TEMP, _}) -> "set_color_temp";
+cmd_name({write, ?CHR_COLOR_XY, _}) -> "set_color_xy";
+cmd_name({write_multi, _}) -> "set_state";
+cmd_name(read_all) -> "read_state";
+cmd_name(Other) -> io_lib:format("~p", [Other]).
