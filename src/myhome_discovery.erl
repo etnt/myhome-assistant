@@ -9,7 +9,7 @@
 -module(myhome_discovery).
 -behaviour(gen_server).
 
--export([start_link/0, run_discovery/0, get_config/0]).
+-export([start_link/0, run_discovery/0, get_config/0, remove_bulb/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SCAN_DURATION, 15).  %% seconds
@@ -38,6 +38,11 @@ run_discovery() ->
 get_config() ->
     gen_server:call(?MODULE, get_config).
 
+%% @doc Remove a bulb from NVS and stop its gen_server.
+-spec remove_bulb(atom()) -> ok | {error, term()}.
+remove_bulb(Name) ->
+    gen_server:call(?MODULE, {remove_bulb, Name}).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -61,6 +66,19 @@ handle_call(run_discovery, _From, State) ->
     end;
 handle_call(get_config, _From, State) ->
     {reply, {ok, State#state.config}, State};
+handle_call({remove_bulb, Name}, _From, State) ->
+    %% Erase from NVS
+    AddrKey = list_to_atom(atom_to_list(Name) ++ "_addr"),
+    NameKey = list_to_atom(atom_to_list(Name) ++ "_name"),
+    try esp:nvs_erase_key(myhome, AddrKey) catch _:_ -> ok end,
+    try esp:nvs_erase_key(myhome, NameKey) catch _:_ -> ok end,
+    %% Stop the child process
+    supervisor:terminate_child(myhome_sup, Name),
+    supervisor:delete_child(myhome_sup, Name),
+    %% Remove from in-memory config
+    NewConfig = lists:filter(fun({N, _, _}) -> N =/= Name end, State#state.config),
+    myhome_log:log(info, "Removed ~p", [Name]),
+    {reply, ok, State#state{config = NewConfig}};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
 

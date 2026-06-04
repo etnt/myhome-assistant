@@ -16,6 +16,8 @@
 %%%   POST /api/bulb/1/brightness — body: {"value": 200}
 %%%   POST /api/bulb/1/color_temp — body: {"value": 153}
 %%%   POST /api/bulb/1/state    — body: {"power":true,"brightness":200}
+%%%   GET  /api/bulb/1/state    — cached state (no BLE)
+%%%   POST /api/bulb/1/refresh  — live BLE GATT read (connects on-demand)
 %%%
 %%% Example:
 %%%   curl http://<ip>:8080/api/bulb/1/power -d '{"on":true}'
@@ -154,10 +156,28 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"color_xy">>], HttpRequest) ->
     end;
 
 do_handle(get, [<<"bulb">>, BulbNum, <<"state">>], _HttpRequest) ->
+    %% Return cached in-memory state (no BLE connection)
+    Name = bulb_name(BulbNum),
+    case myhome_hue_ble:get_state(Name) of
+        {ok, State} ->
+            Reply = case maps:find(color_xy, State) of
+                {ok, {X, Y}} ->
+                    maps:remove(color_xy, State#{status => ok, color_x => X, color_y => Y});
+                {ok, undefined} ->
+                    maps:remove(color_xy, State#{status => ok});
+                error ->
+                    State#{status => ok}
+            end,
+            json_reply(Reply);
+        {error, Reason} ->
+            json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
+do_handle(post, [<<"bulb">>, BulbNum, <<"refresh">>], _HttpRequest) ->
+    %% Live BLE read — connects on-demand to read actual GATT values
     Name = bulb_name(BulbNum),
     case myhome_hue_ble:read_state(Name) of
         {ok, State} ->
-            %% Convert color_xy tuple to separate fields
             Reply = case maps:find(color_xy, State) of
                 {ok, {X, Y}} ->
                     maps:remove(color_xy, State#{status => ok, color_x => X, color_y => Y});
@@ -185,6 +205,13 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest) ->
             {400, #{}, <<"Bad Request">>}
     end;
 
+do_handle(delete, [<<"bulb">>, BulbNum], _HttpRequest) ->
+    Name = bulb_name(BulbNum),
+    case myhome_discovery:remove_bulb(Name) of
+        ok -> json_reply(#{status => ok, removed => atom_to_binary(Name, utf8)});
+        {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
 do_handle(get, [<<"connections">>], _HttpRequest) ->
     case myhome_ble_conn:get_connections() of
         {ok, Conns} ->
@@ -197,6 +224,132 @@ do_handle(get, [<<"connections">>], _HttpRequest) ->
         {error, Reason} ->
             json_reply(#{status => error, reason => to_bin(Reason)})
     end;
+
+do_handle(get, [<<"nvs">>, <<"dump">>], _HttpRequest) ->
+    Map0 = #{status => ok},
+    %% Dump bulb config from 'myhome' namespace
+    Map1 = lists:foldl(fun(N, Acc) ->
+        NS = integer_to_list(N),
+        AddrKey = list_to_atom("bulb_" ++ NS ++ "_addr"),
+        NameKey = list_to_atom("bulb_" ++ NS ++ "_name"),
+        case try esp:nvs_get_binary(myhome, AddrKey) catch _:_ -> undefined end of
+            Addr when is_binary(Addr), byte_size(Addr) =:= 6 ->
+                AddrField = binary_to_atom(iolist_to_binary(["bulb_", NS, "_addr"]), utf8),
+                NameField = binary_to_atom(iolist_to_binary(["bulb_", NS, "_name"]), utf8),
+                Name = case try esp:nvs_get_binary(myhome, NameKey) catch _:_ -> undefined end of
+                    N2 when is_binary(N2) -> N2;
+                    _ -> <<"unknown">>
+                end,
+                Acc#{AddrField => addr_to_hex(Addr), NameField => Name};
+            _ ->
+                Acc
+        end
+    end, Map0, [1, 2, 3, 4]),
+    %% Dump NimBLE bond data (peer_sec_N, our_sec_N, indices 0..2)
+    Map2 = lists:foldl(fun(N, Acc) ->
+        NS = integer_to_list(N),
+        PeerKey = list_to_atom("peer_sec_" ++ NS),
+        OurKey = list_to_atom("our_sec_" ++ NS),
+        Acc1 = case try esp:nvs_get_binary(nimble_bond, PeerKey) catch _:_ -> undefined end of
+            PVal when is_binary(PVal), byte_size(PVal) > 0 ->
+                PField = binary_to_atom(iolist_to_binary(["bond_peer_sec_", NS]), utf8),
+                Acc#{PField => bin_to_hex(PVal)};
+            _ -> Acc
+        end,
+        case try esp:nvs_get_binary(nimble_bond, OurKey) catch _:_ -> undefined end of
+            OVal when is_binary(OVal), byte_size(OVal) > 0 ->
+                OField = binary_to_atom(iolist_to_binary(["bond_our_sec_", NS]), utf8),
+                Acc1#{OField => bin_to_hex(OVal)};
+            _ -> Acc1
+        end
+    end, Map1, [0, 1, 2]),
+    %% Dump local IRK
+    Map3 = case try esp:nvs_get_binary(nimble_bond, local_irk) catch _:_ -> undefined end of
+        Irk when is_binary(Irk), byte_size(Irk) > 0 ->
+            Map2#{bond_local_irk => bin_to_hex(Irk)};
+        _ -> Map2
+    end,
+    %% Dump NimBLE CCCD data (indices 0..7)
+    Map4 = lists:foldl(fun(N, Acc) ->
+        NS = integer_to_list(N),
+        CccdKey = list_to_atom("cccd_" ++ NS),
+        case try esp:nvs_get_binary(nimble_cccd, CccdKey) catch _:_ -> undefined end of
+            CVal when is_binary(CVal), byte_size(CVal) > 0 ->
+                CField = binary_to_atom(iolist_to_binary(["cccd_", NS]), utf8),
+                Acc#{CField => bin_to_hex(CVal)};
+            _ -> Acc
+        end
+    end, Map3, [0, 1, 2, 3, 4, 5, 6, 7]),
+    json_reply(Map4);
+
+do_handle(post, [<<"nvs">>, <<"restore">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    %% Restore bulb config
+    Restored = lists:filtermap(fun(N) ->
+        NS = integer_to_list(N),
+        AddrField = iolist_to_binary(["bulb_", NS, "_addr"]),
+        NameField = iolist_to_binary(["bulb_", NS, "_name"]),
+        case parse_json_string(Body, AddrField) of
+            {ok, AddrHex} ->
+                case hex_to_addr(AddrHex) of
+                    {ok, Addr} ->
+                        AddrKey = list_to_atom("bulb_" ++ NS ++ "_addr"),
+                        NameKey = list_to_atom("bulb_" ++ NS ++ "_name"),
+                        esp:nvs_set_binary(myhome, AddrKey, Addr),
+                        case parse_json_string(Body, NameField) of
+                            {ok, DispName} ->
+                                esp:nvs_set_binary(myhome, NameKey, DispName);
+                            _ ->
+                                esp:nvs_set_binary(myhome, NameKey, <<"Hue Bulb">>)
+                        end,
+                        {true, N};
+                    _ -> false
+                end;
+            _ -> false
+        end
+    end, [1, 2, 3, 4]),
+    %% Restore NimBLE bond data
+    BondCount = lists:foldl(fun(N, Cnt) ->
+        NS = integer_to_list(N),
+        PeerField = iolist_to_binary(["bond_peer_sec_", NS]),
+        OurField = iolist_to_binary(["bond_our_sec_", NS]),
+        C1 = case parse_json_string(Body, PeerField) of
+            {ok, PHex} ->
+                PeerKey = list_to_atom("peer_sec_" ++ NS),
+                esp:nvs_set_binary(nimble_bond, PeerKey, hex_to_bin(PHex)),
+                1;
+            _ -> 0
+        end,
+        C2 = case parse_json_string(Body, OurField) of
+            {ok, OHex} ->
+                OurKey = list_to_atom("our_sec_" ++ NS),
+                esp:nvs_set_binary(nimble_bond, OurKey, hex_to_bin(OHex)),
+                1;
+            _ -> 0
+        end,
+        Cnt + C1 + C2
+    end, 0, [0, 1, 2]),
+    %% Restore local IRK
+    BondCount2 = case parse_json_string(Body, <<"bond_local_irk">>) of
+        {ok, IrkHex} ->
+            esp:nvs_set_binary(nimble_bond, local_irk, hex_to_bin(IrkHex)),
+            BondCount + 1;
+        _ -> BondCount
+    end,
+    %% Restore CCCD data
+    CccdCount = lists:foldl(fun(N, Cnt) ->
+        NS = integer_to_list(N),
+        CccdField = iolist_to_binary(["cccd_", NS]),
+        case parse_json_string(Body, CccdField) of
+            {ok, CHex} ->
+                CccdKey = list_to_atom("cccd_" ++ NS),
+                esp:nvs_set_binary(nimble_cccd, CccdKey, hex_to_bin(CHex)),
+                Cnt + 1;
+            _ -> Cnt
+        end
+    end, 0, [0, 1, 2, 3, 4, 5, 6, 7]),
+    json_reply(#{status => ok, restored_slots => Restored,
+                 bond_keys => BondCount2, cccd_keys => CccdCount});
 
 do_handle(post, [<<"connect">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
@@ -403,6 +556,25 @@ byte_to_hex(B) ->
 
 hex_char(N) when N < 10 -> N + $0;
 hex_char(N) -> N - 10 + $A.
+
+%% Convert arbitrary binary to hex string (no separators)
+bin_to_hex(Bin) ->
+    iolist_to_binary([byte_to_hex(B) || <<B>> <= Bin]).
+
+%% Convert hex string back to binary
+hex_to_bin(Hex) ->
+    hex_to_bin(Hex, <<>>).
+hex_to_bin(<<H, L, Rest/binary>>, Acc) ->
+    Byte = (hex_val(H) bsl 4) bor hex_val(L),
+    hex_to_bin(Rest, <<Acc/binary, Byte>>);
+hex_to_bin(<<>>, Acc) ->
+    Acc;
+hex_to_bin(_, Acc) ->
+    Acc.
+
+hex_val(C) when C >= $0, C =< $9 -> C - $0;
+hex_val(C) when C >= $A, C =< $F -> C - $A + 10;
+hex_val(C) when C >= $a, C =< $f -> C - $a + 10.
 
 parse_log_opts(HttpRequest) ->
     Params = maps:get(params, HttpRequest, #{}),

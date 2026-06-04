@@ -46,7 +46,7 @@ connect(Addr, AddrType) when byte_size(Addr) =:= 6 ->
 %% @doc Connect and wait for the connection event. Returns handle on success.
 -spec connect_sync(binary(), 0..3) -> {ok, non_neg_integer()} | {error, term()}.
 connect_sync(Addr, AddrType) ->
-    connect_sync(Addr, AddrType, 35000).
+    connect_sync(Addr, AddrType, 10000).
 
 -spec connect_sync(binary(), 0..3, pos_integer()) -> {ok, non_neg_integer()} | {error, term()}.
 connect_sync(Addr, AddrType, Timeout) when byte_size(Addr) =:= 6 ->
@@ -220,6 +220,8 @@ handle_info({ble_enc_change, ConnHandle, Status}, State) ->
     {noreply, State};
 
 handle_info({connect_timeout, Addr}, #state{conns = Conns, connect_waiters = Waiters} = State) ->
+    %% Cancel the BLE GAP connect procedure to free the radio
+    ble:connect_cancel(),
     NewConns = maps:remove({pending, Addr}, Conns),
     NewWaiters = reply_to_waiter(Addr, {error, connect_timeout}, Waiters),
     {noreply, State#state{conns = NewConns, connect_waiters = NewWaiters}};

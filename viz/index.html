@@ -312,6 +312,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
     <h2>System</h2>
     <div class="system-actions">
       <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
+      <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
       <button class="btn btn-secondary" onclick="doScan()">Scan</button>
       <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
       <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
@@ -431,6 +432,21 @@ async function refreshBulbs() {
       }
     }
   }
+}
+
+async function doRefresh() {
+  appendLog('info', 'Reading live state from bulbs (BLE)...');
+  for (let i = 1; i <= NUM_BULBS; i++) {
+    const data = await api('POST', `/api/bulb/${i}/refresh`);
+    if (data && data.status === 'ok') {
+      bulbs[i] = data;
+      renderBulb(i, data);
+      appendLog('info', `Bulb ${i}: power=${data.power} bri=${data.brightness} ct=${data.color_temp}`);
+    } else if (data && data.status === 'error') {
+      if (data.reason === 'process not running') break; // no more bulbs
+    }
+  }
+  appendLog('info', 'Refresh complete');
 }
 
 function renderBulb(id, state) {

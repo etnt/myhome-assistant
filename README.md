@@ -109,6 +109,30 @@ make monitor
 The bulbs are controlled via the HTTP API; via `minicom`
 you'll see the obtained IP address, of the ESP32, being printed.
 
+### REST API
+
+| Method | Endpoint                   | Body                    | Description                |
+|--------|----------------------------|-------------------------|----------------------------|
+| GET    | `/api/status`              | —                       | List registered bulbs and connection state |
+| GET    | `/api/scan`                | —                       | Get last BLE scan results |
+| POST   | `/api/scan`                | `{"duration":10}`       | Trigger a BLE scan (blocks until done) |
+| POST   | `/api/discover`            | —                       | Scan, pair, and register new Hue bulbs |
+| POST   | `/api/reset`               | —                       | Factory reset (clear NVS + reboot) |
+| GET    | `/api/logs`                | —                       | System logs (params: `level`, `limit`) |
+| GET    | `/api/connections`         | —                       | List active BLE connections |
+| GET    | `/api/bulb/{n}/state`      | —                       | Cached bulb state (no BLE, instant) |
+| POST   | `/api/bulb/{n}/refresh`.   | —                       | Live BLE GATT read (connects on-demand) |
+| POST   | `/api/bulb/{n}/power`      | `{"on":true}`           | Turn bulb on/off |
+| POST   | `/api/bulb/{n}/brightness` | `{"value":200}`         | Set brightness (1–254) |
+| POST   | `/api/bulb/{n}/color_temp` | `{"value":370}`         | Set color temp (153–500 mirek) |
+| POST   | `/api/bulb/{n}/color_xy`   | `{"x":30146,"y":26869}` | Set CIE 1931 XY color |
+| POST   | `/api/bulb/{n}/state`      | `{"power":true,...}`    | Set multiple properties at once |
+| DELETE | `/api/bulb/{n}`            | —                       | Remove bulb from NVS and stop process |
+| GET    | `/api/nvs/dump`            | —                       | Dump all bulb NVS config (addr + name) |
+| POST   | `/api/nvs/restore`         | `{"bulb_1_addr":"AA:BB:..","bulb_1_name":"Lamp"}` | Restore bulb config to NVS |
+
+### Examples
+
 ```bash
 # Check status
 curl http://<esp-ip>:8080/api/status
@@ -126,6 +150,10 @@ curl -X POST http://<esp-ip>:8080/api/discover
 curl http://<esp-ip>:8080/api/logs
 
 # Read actual bulb state (connects via BLE, reads GATT characteristics)
+curl -X POST http://<esp-ip>:8080/api/bulb/1/refresh
+# => {"status":"ok","power":true,"brightness":200,"color_temp":366}
+
+# Get cached bulb state (no BLE connection, instant)
 curl http://<esp-ip>:8080/api/bulb/1/state
 # => {"status":"ok","power":true,"brightness":200,"color_temp":366}
 
@@ -150,6 +178,9 @@ curl -X POST http://<esp-ip>:8080/api/bulb/1/power -d '{"on":true}'
 curl -X POST http://<esp-ip>:8080/api/bulb/1/state \
   -d '{"power":true,"brightness":200,"color_temp":370}'
 
+# Remove a bulb (erases from NVS, stops process)
+curl -X DELETE http://<esp-ip>:8080/api/bulb/3
+
 # Pretty print scan result
 curl -s http://<esp-ip>:8080/api/scan | jq -r '.scan.results[] | select(.name != "") | "\(.addr) rssi=\(.rssi) \(.name)"'
 
@@ -161,6 +192,11 @@ curl http://<esp-ip>:8080/api/logs?level=error
 
 # Limit number of entries
 curl http://<esp-ip>:8080/api/logs?limit=20
+
+# Dump the NVS store (before flash or reset)
+curl http://192.168.1.115:8080/api/nvs/dump > nvs_backup.json
+# Restore the NVS store
+curl -X POST http://192.168.1.115:8080/api/nvs/restore -d @nvs_backup.json
 
 # 1. Factory-reset the bulbs so they enter pairing mode
 # 2. Then clear ESP32 bonds + config and reboot:

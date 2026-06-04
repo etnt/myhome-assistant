@@ -14,7 +14,7 @@
 %% API
 -export([start_link/0]).
 -export([scan_start/0, scan_start/1, scan_stop/0]).
--export([connect/2, disconnect/1, security/1, update_conn_params/1]).
+-export([connect/2, connect_cancel/0, disconnect/1, security/1, update_conn_params/1]).
 -export([gatt_read/3, gatt_write/4, gatt_write_nr/4]).
 -export([discover_services/1]).
 -export([register_conn/2]).
@@ -31,6 +31,7 @@
 -define(OP_DISCONNECT,   16#21).
 -define(OP_SECURITY,     16#22).
 -define(OP_UPDATE_PARAMS,16#23).
+-define(OP_CONNECT_CANCEL, 16#24).
 -define(OP_GATT_READ,    16#30).
 -define(OP_GATT_WRITE,   16#31).
 -define(OP_GATT_WRITE_NR,16#32).
@@ -83,6 +84,10 @@ scan_stop() ->
 -spec connect(Addr :: binary(), AddrType :: 0..3) -> ok | {error, term()}.
 connect(Addr, AddrType) when byte_size(Addr) =:= 6 ->
     gen_server:call(?MODULE, {connect, Addr, AddrType}, 5000).
+
+-spec connect_cancel() -> ok | {error, term()}.
+connect_cancel() ->
+    gen_server:call(?MODULE, connect_cancel, 5000).
 
 -spec disconnect(ConnHandle :: non_neg_integer()) -> ok | {error, term()}.
 disconnect(ConnHandle) ->
@@ -166,6 +171,13 @@ handle_call(scan_stop, _From, #state{port = Port} = State) ->
 
 handle_call({connect, Addr, AddrType}, _From, #state{port = Port} = State) ->
     Reply = case port_call(Port, <<?OP_CONNECT, Addr:6/binary, AddrType:8>>) of
+        {ok, _} -> ok;
+        Error   -> Error
+    end,
+    {reply, Reply, State};
+
+handle_call(connect_cancel, _From, #state{port = Port} = State) ->
+    Reply = case port_call(Port, <<?OP_CONNECT_CANCEL>>) of
         {ok, _} -> ok;
         Error   -> Error
     end,

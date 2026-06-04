@@ -64,15 +64,10 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(wifi_beacon_timeout, #state{reboot_timer = undefined} = State) ->
-    myhome_log:log(warning, "WiFi beacon timeout - starting reboot timer (~ps)",
-                   [?WIFI_REBOOT_TIMEOUT_MS div 1000]),
-    TRef = erlang:send_after(?WIFI_REBOOT_TIMEOUT_MS, self(), wifi_reboot),
-    {noreply, State#state{reboot_timer = TRef}};
-
 handle_info(wifi_beacon_timeout, State) ->
-    %% Timer already running, just log
-    myhome_log:log(warning, "WiFi beacon timeout (reboot timer active)"),
+    %% Beacon timeouts are expected during BLE radio activity — just log.
+    %% Only actual WiFi disconnect should trigger reboot logic.
+    myhome_log:log(warning, "WiFi beacon timeout (BLE radio contention?)"),
     {noreply, State};
 
 handle_info(disconnected, #state{reboot_timer = undefined} = State) ->

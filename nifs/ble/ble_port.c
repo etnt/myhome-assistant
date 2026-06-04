@@ -59,6 +59,7 @@ enum {
     OP_DISCONNECT   = 0x21,
     OP_SECURITY     = 0x22,
     OP_UPDATE_PARAMS = 0x23,  // Update connection parameters
+    OP_CONNECT_CANCEL = 0x24, // Cancel pending connect
 
     // GATT operations
     OP_GATT_READ    = 0x30,
@@ -694,7 +695,7 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
         .max_ce_len = 0,
     };
 
-    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 30000,
+    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 10000,
                              &conn_params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);
@@ -703,6 +704,23 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
 
     ESP_LOGI(TAG, "connect initiated");
     return make_ok(ctx);
+}
+
+/**
+ * Cancel a pending connect procedure.
+ * Request: <<OP_CONNECT_CANCEL>>
+ */
+static term handle_connect_cancel(Context *ctx)
+{
+    int rc = ble_gap_conn_cancel();
+    if (rc == 0) {
+        ESP_LOGI(TAG, "connect cancelled");
+        return make_ok(ctx);
+    } else {
+        // BLE_HS_EALREADY means no connect in progress — treat as ok
+        ESP_LOGW(TAG, "connect cancel: rc=%d", rc);
+        return make_ok(ctx);
+    }
 }
 
 /**
@@ -930,6 +948,9 @@ static term handle_call(Context *ctx, term req, term caller_pid)
 
     case OP_CONNECT:
         return handle_connect(ctx, data, len);
+
+    case OP_CONNECT_CANCEL:
+        return handle_connect_cancel(ctx);
 
     case OP_DISCONNECT:
         return handle_disconnect(ctx, data, len);
