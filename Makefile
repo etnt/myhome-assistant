@@ -80,7 +80,7 @@ monitor:
 all: flash
 
 ## Some nice short commands
-.PHONY: logs status scan doscan ppscan discover state1 state2
+.PHONY: logs status scan doscan ppscan discover state state% on% off%
 logs:
 	@curl -s http://$(IP):8080/api/logs | jq -r '.logs | reverse[] | "\(.ts) [\(.level)] \(.msg)"'
 
@@ -99,11 +99,16 @@ ppscan:
 discover:
 	@curl -s -X POST http://$(IP):8080/api/discover
 
-state1:
-	@curl -s http://$(IP):8080/api/bulb/1/state 
+state: state1 state2
 
-state2:
-	@curl -s http://$(IP):8080/api/bulb/2/state
+state%:
+	@curl -s http://$(IP):8080/api/bulb/$*/state | jq -r '"Bulb $*: power=\(.power) brightness=\(.brightness) color_temp=\(.color_temp) status=\(.status)"'
+
+on%:
+	@curl -s -X POST http://$(IP):8080/api/bulb/$*/power -d '{"on":true}'
+
+off%:
+	@curl -s -X POST http://$(IP):8080/api/bulb/$*/power -d '{"on":false}'
 
 ## Show available targets
 help:
