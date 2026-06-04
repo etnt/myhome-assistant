@@ -10,7 +10,10 @@
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--record(state, {}).
+%% Max seconds without WiFi recovery before rebooting
+-define(WIFI_REBOOT_TIMEOUT_MS, 30000).
+
+-record(state, {reboot_timer = undefined :: undefined | reference()}).
 
 %%====================================================================
 %% Public API
@@ -28,12 +31,17 @@ init([]) ->
     SSID = myhome_config:wifi_ssid(),
     PSK = myhome_config:wifi_psk(),
     myhome_log:log(info, "Connecting to WiFi (~s)...", [SSID]),
-    Creds = [{ssid, SSID}, {psk, PSK}],
+    Self = self(),
+    Creds = [{ssid, SSID}, {psk, PSK},
+             {beacon_timeout, fun() -> Self ! wifi_beacon_timeout end}],
     case network:wait_for_sta(Creds, 30000) of
         {ok, {Address, _Netmask, _Gateway}} ->
             io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
             Port = myhome_config:http_port(),
-            case tiny_httpd:start_link(Port, myhome_http_handler) of
+            Opts = #{cors => #{allow_origin => <<"*">>,
+                               allow_methods => <<"GET, POST, OPTIONS">>,
+                               allow_headers => <<"Content-Type">>}},
+            case tiny_httpd:start_link(any, Port, myhome_http_handler, Opts) of
                 {ok, _} ->
                     io:format("HTTP API listening on port ~p~n", [Port]),
                     myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
@@ -56,6 +64,41 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(wifi_beacon_timeout, #state{reboot_timer = undefined} = State) ->
+    myhome_log:log(warning, "WiFi beacon timeout - starting reboot timer (~ps)",
+                   [?WIFI_REBOOT_TIMEOUT_MS div 1000]),
+    TRef = erlang:send_after(?WIFI_REBOOT_TIMEOUT_MS, self(), wifi_reboot),
+    {noreply, State#state{reboot_timer = TRef}};
+
+handle_info(wifi_beacon_timeout, State) ->
+    %% Timer already running, just log
+    myhome_log:log(warning, "WiFi beacon timeout (reboot timer active)"),
+    {noreply, State};
+
+handle_info(disconnected, #state{reboot_timer = undefined} = State) ->
+    myhome_log:log(warning, "WiFi disconnected - starting reboot timer (~ps)",
+                   [?WIFI_REBOOT_TIMEOUT_MS div 1000]),
+    TRef = erlang:send_after(?WIFI_REBOOT_TIMEOUT_MS, self(), wifi_reboot),
+    %% Attempt to reconnect
+    network:sta_connect(),
+    {noreply, State#state{reboot_timer = TRef}};
+
+handle_info(disconnected, State) ->
+    myhome_log:log(warning, "WiFi disconnected (reboot timer active), reconnecting..."),
+    network:sta_connect(),
+    {noreply, State};
+
+handle_info(connected, #state{reboot_timer = TRef} = State) ->
+    myhome_log:log(info, "WiFi recovered"),
+    cancel_timer(TRef),
+    {noreply, State#state{reboot_timer = undefined}};
+
+handle_info(wifi_reboot, _State) ->
+    myhome_log:log(error, "WiFi not recovered after ~ps - rebooting!",
+                   [?WIFI_REBOOT_TIMEOUT_MS div 1000]),
+    esp:restart(),
+    {noreply, #state{}};
+
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -65,6 +108,9 @@ terminate(_Reason, _State) ->
 %%====================================================================
 %% Internal
 %%====================================================================
+
+cancel_timer(undefined) -> ok;
+cancel_timer(TRef) -> erlang:cancel_timer(TRef).
 
 format_ip({A, B, C, D}) ->
     io_lib:format("~p.~p.~p.~p", [A, B, C, D]).

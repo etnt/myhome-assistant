@@ -17,6 +17,7 @@
 -export([connect/2, disconnect/1, security/1, update_conn_params/1]).
 -export([gatt_read/3, gatt_write/4, gatt_write_nr/4]).
 -export([discover_services/1]).
+-export([register_conn/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -43,8 +44,10 @@
     port :: port(),
     %% Pending async GATT ops: ConnHandle -> {From, OpType, TRef}
     pending :: #{non_neg_integer() => {gen_server:from(), atom(), reference()}},
-    %% Characteristic handle cache: ConnHandle -> #{ChrUUID -> ValHandle}
-    chr_cache :: #{non_neg_integer() => #{binary() => non_neg_integer()}}
+    %% ConnHandle -> Addr mapping (set via register_conn/2)
+    conn_addrs :: #{non_neg_integer() => binary()},
+    %% Characteristic handle cache keyed by BLE address (stable across reconnects)
+    chr_cache :: #{binary() => #{binary() => non_neg_integer()}}
 }).
 
 -define(GATT_TIMEOUT, 15000).
@@ -121,6 +124,11 @@ gatt_write_nr(ConnHandle, SvcUUID, ChrUUID, Value)
 discover_services(ConnHandle) ->
     gen_server:call(?MODULE, {discover_services, ConnHandle}, ?GATT_TIMEOUT + 5000).
 
+%% @doc Register the BLE address for a conn_handle (enables address-based cache).
+-spec register_conn(ConnHandle :: non_neg_integer(), Addr :: binary()) -> ok.
+register_conn(ConnHandle, Addr) when byte_size(Addr) =:= 6 ->
+    gen_server:call(?MODULE, {register_conn, ConnHandle, Addr}, 5000).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -133,7 +141,7 @@ init([]) ->
                 {ok, _} -> ok;
                 _ -> ok
             end,
-            {ok, #state{port = Port, pending = #{}, chr_cache = #{}}};
+            {ok, #state{port = Port, pending = #{}, conn_addrs = #{}, chr_cache = #{}}};
         Error ->
             {stop, Error}
     end.
@@ -168,9 +176,13 @@ handle_call({disconnect, ConnHandle}, _From, #state{port = Port} = State) ->
         {ok, _} -> ok;
         Error   -> Error
     end,
-    %% Clear cache for this connection
-    NewCache = maps:remove(ConnHandle, State#state.chr_cache),
-    {reply, Reply, State#state{chr_cache = NewCache}};
+    %% Remove conn_handle→addr mapping but keep chr_cache (keyed by addr)
+    NewAddrs = maps:remove(ConnHandle, State#state.conn_addrs),
+    {reply, Reply, State#state{conn_addrs = NewAddrs}};
+
+handle_call({register_conn, ConnHandle, Addr}, _From, State) ->
+    NewAddrs = maps:put(ConnHandle, Addr, State#state.conn_addrs),
+    {reply, ok, State#state{conn_addrs = NewAddrs}};
 
 handle_call({security, ConnHandle}, _From, #state{port = Port} = State) ->
     Reply = case port_call(Port, <<?OP_SECURITY, ConnHandle:16/little>>) of
@@ -325,7 +337,7 @@ handle_info({ble_disc_complete, ConnHandle, Status, Data}, State) ->
             case Status of
                 0 ->
                     CacheMap = parse_disc_data(Data),
-                    NewCache = maps:put(ConnHandle, CacheMap, State#state.chr_cache),
+                    NewCache = cache_put(ConnHandle, CacheMap, State),
                     gen_server:reply(From, ok),
                     {noreply, State#state{pending = Pending, chr_cache = NewCache}};
                 _ ->
@@ -337,7 +349,7 @@ handle_info({ble_disc_complete, ConnHandle, Status, Data}, State) ->
             case Status of
                 0 ->
                     CacheMap = parse_disc_data(Data),
-                    NewCache = maps:put(ConnHandle, CacheMap, State#state.chr_cache),
+                    NewCache = cache_put(ConnHandle, CacheMap, State),
                     NewState = State#state{pending = Pending, chr_cache = NewCache},
                     handle_disc_continuation(ConnHandle, From, Cont, NewState);
                 _ ->
@@ -369,15 +381,15 @@ handle_info({ble_connected, _, _} = Event, State) ->
     myhome_event_bus:publish(Event),
     {noreply, State};
 handle_info({ble_disconnected, ConnHandle, _} = Event, State) ->
-    %% Clear cache and any pending ops for disconnected handle
-    NewCache = maps:remove(ConnHandle, State#state.chr_cache),
+    %% Clear pending ops and conn_addr mapping, keep chr_cache (keyed by addr)
+    NewAddrs = maps:remove(ConnHandle, State#state.conn_addrs),
     NewState = case maps_take(ConnHandle, State#state.pending) of
         {{From, _Op, TRef}, Pending} ->
             erlang:cancel_timer(TRef),
             gen_server:reply(From, {error, disconnected}),
-            State#state{pending = Pending, chr_cache = NewCache};
+            State#state{pending = Pending, conn_addrs = NewAddrs};
         error ->
-            State#state{chr_cache = NewCache}
+            State#state{conn_addrs = NewAddrs}
     end,
     myhome_event_bus:publish(Event),
     {noreply, NewState};
@@ -407,17 +419,24 @@ port_call(Port, Request) ->
             Err
     end.
 
-%% Look up cached ValHandle for a characteristic UUID on a connection
+%% Look up cached ValHandle for a characteristic UUID on a connection.
+%% Uses conn_addrs to resolve ConnHandle → Addr, then looks up addr-based cache.
 -spec get_val_handle(non_neg_integer(), binary(), #state{}) ->
     {ok, non_neg_integer()} | {error, no_cache}.
-get_val_handle(ConnHandle, ChrUUID, #state{chr_cache = Cache}) ->
-    case maps:find(ConnHandle, Cache) of
-        {ok, ConnCache} ->
-            case maps:find(ChrUUID, ConnCache) of
-                {ok, ValHandle} -> {ok, ValHandle};
-                error -> {error, no_cache}
+get_val_handle(ConnHandle, ChrUUID, #state{conn_addrs = Addrs, chr_cache = Cache}) ->
+    case maps:find(ConnHandle, Addrs) of
+        {ok, Addr} ->
+            case maps:find(Addr, Cache) of
+                {ok, AddrCache} ->
+                    case maps:find(ChrUUID, AddrCache) of
+                        {ok, ValHandle} -> {ok, ValHandle};
+                        error -> {error, no_cache}
+                    end;
+                error ->
+                    {error, no_cache}
             end;
         error ->
+            %% No addr registered for this handle — can't use cache
             {error, no_cache}
     end.
 
@@ -426,6 +445,13 @@ maps_take(Key, Map) ->
     case maps:find(Key, Map) of
         {ok, Value} -> {Value, maps:remove(Key, Map)};
         error -> error
+    end.
+
+%% Store discovery results in chr_cache keyed by Addr (looked up via conn_addrs)
+cache_put(ConnHandle, CacheMap, #state{conn_addrs = Addrs, chr_cache = Cache}) ->
+    case maps:find(ConnHandle, Addrs) of
+        {ok, Addr} -> maps:put(Addr, CacheMap, Cache);
+        error      -> Cache  %% no addr registered, can't cache
     end.
 
 %% Parse discovery result binary into a map of ChrUUID -> ValHandle

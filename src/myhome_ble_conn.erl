@@ -172,6 +172,11 @@ handle_info({ble_connected, ConnHandle, 0 = _Status}, #state{conns = Conns, conn
         (_K, _V, {Acc, Found}) ->
             {Acc, Found}
     end, {Conns, undefined}, Conns),
+    %% Register handle→addr mapping for address-based GATT cache
+    case Addr of
+        undefined -> ok;
+        _ -> ble:register_conn(ConnHandle, Addr)
+    end,
     %% Reply to any sync waiter for this address
     NewWaiters = case Addr of
         undefined -> Waiters;
