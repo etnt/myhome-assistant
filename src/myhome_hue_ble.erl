@@ -55,13 +55,8 @@
     color_temp :: integer() | undefined,
     %% Connect-on-demand: pending command waiting for encryption
     pending_cmd :: term() | undefined,
-    pending_from :: term() | undefined,
-    %% Idle disconnect timer
-    idle_timer :: reference() | undefined
+    pending_from :: term() | undefined
 }).
-
-%% Disconnect after 5s idle to free radio for WiFi
--define(IDLE_DISCONNECT_MS, 5000).
 
 %%====================================================================
 %% Public API
@@ -172,10 +167,10 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
         0 ->
             myhome_log:log(info, "[~p] encrypted, executing: ~s", [State#state.name, cmd_name(Cmd)]),
             {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
+            myhome_ble_conn:disconnect(ConnHandle),
             gen_server:reply(From, Reply),
-            TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
             {noreply, NewState#state{pending_cmd = undefined, pending_from = undefined,
-                                     idle_timer = TRef}};
+                                     conn_handle = undefined, connected = false}};
         _ ->
             myhome_log:log(error, "[~p] security failed (status=~p)", [State#state.name, Status]),
             gen_server:reply(From, {error, {security_failed, Status}}),
@@ -189,9 +184,9 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
             #state{conn_handle = ConnHandle} = State) ->
     case Status of
         0 ->
-            myhome_log:log(info, "[~p] encrypted (no pending cmd)", [State#state.name]),
-            TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
-            {noreply, State#state{connected = true, idle_timer = TRef}};
+            myhome_log:log(info, "[~p] encrypted (no pending cmd), disconnecting", [State#state.name]),
+            myhome_ble_conn:disconnect(ConnHandle),
+            {noreply, State#state{conn_handle = undefined, connected = false}};
         _ ->
             myhome_ble_conn:disconnect(ConnHandle),
             {noreply, State#state{conn_handle = undefined, connected = false}}
@@ -207,17 +202,7 @@ handle_info({ble_event, {ble_disconnected, ConnHandle, Reason}},
             gen_server:reply(From, {error, disconnected}),
             State#state{pending_cmd = undefined, pending_from = undefined}
     end,
-    cancel_idle_timer(NewState#state.idle_timer),
-    {noreply, NewState#state{conn_handle = undefined, connected = false, idle_timer = undefined}};
-
-%% Idle timeout — disconnect to free radio for WiFi
-handle_info(idle_disconnect, #state{conn_handle = Handle, connected = true} = State)
-  when Handle =/= undefined ->
-    myhome_log:log(info, "[~p] idle disconnect", [State#state.name]),
-    myhome_ble_conn:disconnect(Handle),
-    {noreply, State#state{conn_handle = undefined, connected = false, idle_timer = undefined}};
-handle_info(idle_disconnect, State) ->
-    {noreply, State#state{idle_timer = undefined}};
+    {noreply, NewState#state{conn_handle = undefined, connected = false}};
 
 handle_info(_Msg, State) ->
     {noreply, State}.
@@ -236,10 +221,9 @@ terminate(_Reason, #state{conn_handle = Handle}) ->
 do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
   when Handle =/= undefined ->
     %% Already connected and encrypted — execute immediately
-    cancel_idle_timer(State#state.idle_timer),
     {Reply, NewState} = execute_cmd(Cmd, State),
-    TRef = erlang:send_after(?IDLE_DISCONNECT_MS, self(), idle_disconnect),
-    {reply, Reply, NewState#state{idle_timer = TRef}};
+    myhome_ble_conn:disconnect(Handle),
+    {reply, Reply, NewState#state{conn_handle = undefined, connected = false}};
 do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
     %% Not connected — initiate connection, store pending command
     case myhome_ble_conn:connect_sync(State#state.addr, State#state.addr_type) of
@@ -323,9 +307,6 @@ update_cached_from_write(ChrUUID, Value, State) ->
         _ ->
             State
     end.
-
-cancel_idle_timer(undefined) -> ok;
-cancel_idle_timer(TRef) -> erlang:cancel_timer(TRef).
 
 update_cached_state(State, Props) ->
     S1 = case maps:find(power, Props) of
