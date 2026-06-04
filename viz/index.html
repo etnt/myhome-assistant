@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MyHome Assistant</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --surface: #16213e;
+  --card: #0f3460;
+  --accent: #e94560;
+  --accent2: #f5a623;
+  --text: #eaeaea;
+  --text-dim: #8892a4;
+  --success: #4ecdc4;
+  --radius: 12px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 1rem;
+}
+
+h1 { font-size: 1.5rem; font-weight: 600; }
+h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom: 0.75rem; }
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.5rem;
+  background: var(--surface);
+  border-radius: var(--radius);
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.header .logo {
+  font-size: 1.5rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.connection input {
+  background: var(--bg);
+  border: 1px solid #2a2a4a;
+  color: var(--text);
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  width: 180px;
+}
+
+.connection .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #555;
+  transition: background 0.3s;
+}
+
+.connection .dot.connected { background: var(--success); }
+
+/* Buttons */
+.btn {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
+.btn:active { transform: translateY(0); }
+
+.btn-primary { background: var(--accent); color: white; }
+.btn-secondary { background: var(--card); color: var(--text); }
+.btn-success { background: var(--success); color: #1a1a2e; }
+
+/* Grid layout */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.5rem;
+}
+
+/* Cards */
+.card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  border: 1px solid #2a2a4a;
+  display: flex;
+  flex-direction: column;
+}
+
+/* System panel */
+.system-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+/* Log area */
+.log-area {
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 0.75rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.75rem;
+  min-height: 100px;
+  flex: 1;
+  overflow-y: auto;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.log-area .log-line { white-space: pre-wrap; word-break: break-all; }
+.log-area .log-info { color: var(--success); }
+.log-area .log-warning { color: var(--accent2); }
+.log-area .log-error { color: var(--accent); }
+
+/* Bulb card */
+.bulb-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.bulb-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.bulb-name {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.bulb-status {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  padding: 0.2rem 0.6rem;
+  background: var(--bg);
+  border-radius: 20px;
+}
+
+.bulb-status.on { color: var(--success); }
+
+/* Toggle switch */
+.toggle {
+  position: relative;
+  width: 52px;
+  height: 28px;
+  cursor: pointer;
+}
+
+.toggle input { display: none; }
+
+.toggle .slider {
+  position: absolute;
+  inset: 0;
+  background: #333;
+  border-radius: 28px;
+  transition: background 0.3s;
+}
+
+.toggle .slider::before {
+  content: '';
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  left: 3px;
+  bottom: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.3s;
+}
+
+.toggle input:checked + .slider { background: var(--success); }
+.toggle input:checked + .slider::before { transform: translateX(24px); }
+
+/* Sliders */
+.control-group {
+  margin-top: 1rem;
+}
+
+.control-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-bottom: 0.4rem;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--accent2);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+/* Color temp gradient track */
+.color-temp-slider::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, #a8d8ff, #fff5e6, #ffcc66, #ff9933);
+  height: 6px;
+  border-radius: 3px;
+}
+
+/* Scan results */
+.scan-results {
+  margin-top: 0.75rem;
+}
+
+.scan-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #2a2a4a;
+  font-size: 0.8rem;
+}
+
+.scan-item:last-child { border-bottom: none; }
+
+/* Toast notifications */
+.toast-container {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.toast {
+  padding: 0.75rem 1.25rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  animation: slideIn 0.3s ease;
+  max-width: 300px;
+}
+
+.toast-success { background: var(--success); color: #1a1a2e; }
+.toast-error { background: var(--accent); color: white; }
+
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .header { flex-direction: column; align-items: flex-start; }
+  .connection { margin-left: 0; width: 100%; }
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <span class="logo">MyHome Assistant</span>
+  <div class="connection">
+    <input type="text" id="hostInput" placeholder="IP:Port" value="192.168.1.115:8080">
+    <div class="dot" id="connDot"></div>
+    <button class="btn btn-secondary" onclick="checkStatus()">Connect</button>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- System Panel -->
+  <div class="card">
+    <h2>System</h2>
+    <div class="system-actions">
+      <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
+      <button class="btn btn-secondary" onclick="doScan()">Scan</button>
+      <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
+      <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+    </div>
+    <div class="log-area" id="logArea">
+      <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
+    </div>
+  </div>
+
+  <!-- Bulb cards injected here -->
+  <div id="bulbContainer"></div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function baseUrl() {
+  const host = $('hostInput').value.trim();
+  return `http://${host}`;
+}
+
+// --- Toast notifications ---
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// --- API helper ---
+async function api(method, path, body) {
+  const url = `${baseUrl()}${path}`;
+  const opts = { method };
+  if (body) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return text; }
+  } catch (e) {
+    toast(`Request failed: ${e.message}`, 'error');
+    return null;
+  }
+}
+
+// --- System commands ---
+async function checkStatus() {
+  const data = await api('GET', '/api/status');
+  if (data) {
+    $('connDot').classList.add('connected');
+    if (data.bulbs && data.bulbs.length) {
+      data.bulbs.forEach(b => {
+        const pwr = b.power ? 'ON' : 'OFF';
+        appendLog('info', `${b.name}: ${pwr}  bri=${b.brightness}  ct=${b.color_temp}`);
+      });
+    } else {
+      appendLog('info', 'No bulbs registered');
+    }
+    // Refresh bulb states
+    refreshBulbs();
+  } else {
+    $('connDot').classList.remove('connected');
+  }
+}
+
+async function doScan() {
+  appendLog('info', 'Scanning...');
+  const data = await api('POST', '/api/scan', { duration: 10 });
+  if (data) {
+    appendLog('info', `Scan complete`);
+    const results = await api('GET', '/api/scan');
+    if (results && results.scan && results.scan.results) {
+      const named = results.scan.results.filter(r => r.name);
+      named.forEach(r => appendLog('info', `  ${r.addr} rssi=${r.rssi} ${r.name}`));
+    }
+  }
+}
+
+async function doDiscover() {
+  appendLog('info', 'Discovering Hue bulbs...');
+  const data = await api('POST', '/api/discover');
+  if (data) {
+    appendLog('info', `Discover: ${JSON.stringify(data)}`);
+    toast('Discovery started');
+    setTimeout(refreshBulbs, 5000);
+  }
+}
+
+async function fetchLogs() {
+  const data = await api('GET', '/api/logs?limit=30');
+  if (data && data.logs) {
+    $('logArea').innerHTML = '';
+    data.logs.reverse().forEach(l => appendLog(l.level, `[${l.ts}] ${l.msg}`));
+  }
+}
+
+// --- Bulb management ---
+const bulbs = {};
+const NUM_BULBS = 4; // Check up to 4 bulbs
+
+async function refreshBulbs() {
+  for (let i = 1; i <= NUM_BULBS; i++) {
+    const data = await api('GET', `/api/bulb/${i}/state`);
+    if (data && data.status === 'ok') {
+      bulbs[i] = data;
+      renderBulb(i, data);
+    } else if (data && data.status === 'error') {
+      // Bulb unreachable — keep card but show as offline
+      if (bulbs[i]) {
+        bulbs[i] = { ...bulbs[i], power: undefined };
+        renderBulb(i, bulbs[i]);
+      }
+    }
+  }
+}
+
+function renderBulb(id, state) {
+  let card = document.getElementById(`bulb-${id}`);
+  if (!card) {
+    card = document.createElement('div');
+    card.id = `bulb-${id}`;
+    card.className = 'card bulb-card';
+    $('bulbContainer').appendChild(card);
+  }
+
+  const isOn = state.power === true;
+  const bri = state.brightness != null ? state.brightness : 128;
+  const ct = state.color_temp != null ? state.color_temp : 370;
+
+  card.innerHTML = `
+    <div class="bulb-header">
+      <span class="bulb-name">Bulb ${id}</span>
+      <span class="bulb-status ${isOn ? 'on' : ''}">${isOn ? 'ON' : 'OFF'}</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:1rem;">
+      <label class="toggle">
+        <input type="checkbox" ${isOn ? 'checked' : ''} onchange="togglePower(${id}, this.checked)">
+        <span class="slider"></span>
+      </label>
+      <span style="font-size:0.8rem;color:var(--text-dim)">Power</span>
+    </div>
+    <div class="control-group">
+      <div class="control-label">
+        <span>Brightness</span>
+        <span id="bri-val-${id}">${bri}</span>
+      </div>
+      <input type="range" min="1" max="254" value="${bri}"
+        oninput="$('bri-val-${id}').textContent=this.value"
+        onchange="setBrightness(${id}, +this.value)">
+    </div>
+    <div class="control-group">
+      <div class="control-label">
+        <span>Color Temp</span>
+        <span id="ct-val-${id}">${ct} mirek</span>
+      </div>
+      <input type="range" class="color-temp-slider" min="153" max="500" value="${ct}"
+        oninput="$('ct-val-${id}').textContent=this.value+' mirek'"
+        onchange="setColorTemp(${id}, +this.value)">
+    </div>
+  `;
+}
+
+// --- Bulb commands ---
+async function togglePower(id, on) {
+  const data = await api('POST', `/api/bulb/${id}/power`, { on });
+  if (data && data.status === 'ok') {
+    toast(`Bulb ${id} ${on ? 'on' : 'off'}`);
+    bulbs[id] = { ...bulbs[id], power: on };
+    renderBulb(id, bulbs[id]);
+  } else {
+    toast(`Power failed: ${JSON.stringify(data)}`, 'error');
+    // Revert toggle
+    setTimeout(() => refreshBulbs(), 500);
+  }
+}
+
+async function setBrightness(id, value) {
+  value = parseInt(value, 10);
+  const data = await api('POST', `/api/bulb/${id}/brightness`, { value });
+  if (data && data.status === 'ok') {
+    bulbs[id] = { ...bulbs[id], brightness: value };
+  } else {
+    toast(`Brightness failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+async function setColorTemp(id, value) {
+  value = parseInt(value, 10);
+  const data = await api('POST', `/api/bulb/${id}/color_temp`, { value });
+  if (data && data.status === 'ok') {
+    bulbs[id] = { ...bulbs[id], color_temp: value };
+  } else {
+    toast(`Color temp failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+// --- Log area ---
+function appendLog(level, msg) {
+  const area = $('logArea');
+  const line = document.createElement('div');
+  line.className = `log-line log-${level}`;
+  line.textContent = msg;
+  area.appendChild(line);
+  area.scrollTop = area.scrollHeight;
+}
+
+// --- Init ---
+$('hostInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') checkStatus();
+});
+
+// Auto-connect on load
+setTimeout(checkStatus, 500);
+</script>
+</body>
+</html>
