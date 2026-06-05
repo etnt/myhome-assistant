@@ -286,6 +286,75 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
 .scan-item:last-child { border-bottom: none; }
 
+/* Clickable sensor rows */
+.sensor-row.clickable {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  transition: background 0.15s;
+}
+.sensor-row.clickable:hover {
+  background: var(--card);
+}
+
+/* Chart modal */
+.chart-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+.chart-modal {
+  background: var(--surface);
+  border: 1px solid #2a2a4a;
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  width: min(90vw, 560px);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.chart-modal h3 {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.chart-modal canvas {
+  width: 100%;
+  height: 220px;
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.chart-modal .chart-stats {
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.chart-modal .chart-stats span { font-weight: 600; color: var(--text); }
+
+.chart-close {
+  align-self: flex-end;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+.chart-close:hover { color: var(--text); background: var(--card); }
+
 /* Toast notifications */
 .toast-container {
   position: fixed;
@@ -570,22 +639,127 @@ function appendLog(level, msg) {
 
 // --- Sensors ---
 const sensorMinMax = {};
+const sensorHistory = {};  // key -> [{ts, value}]
+const HISTORY_MAX = 360;   // 30 min at 5s intervals
 
 function trackMinMax(key, value) {
   const v = parseFloat(value);
   if (!sensorMinMax[key]) sensorMinMax[key] = { min: v, max: v };
   if (v < sensorMinMax[key].min) sensorMinMax[key].min = v;
   if (v > sensorMinMax[key].max) sensorMinMax[key].max = v;
+  // Record history
+  if (!sensorHistory[key]) sensorHistory[key] = [];
+  sensorHistory[key].push({ ts: Date.now(), value: v });
+  if (sensorHistory[key].length > HISTORY_MAX) sensorHistory[key].shift();
   return sensorMinMax[key];
 }
 
 function sensorRow(label, value, unit, key) {
   const mm = trackMinMax(key, value);
-  return `<div class="sensor-row">
+  return `<div class="sensor-row clickable" onclick="showChart('${key}', '${label}', '${unit}')">
     <span>${label}</span>
     <span class="sensor-val">${value} ${unit}</span>
     <span class="sensor-minmax">↓${mm.min} ↑${mm.max}</span>
   </div>`;
+}
+
+// --- Chart popup ---
+function showChart(key, label, unit) {
+  const hist = sensorHistory[key];
+  if (!hist || hist.length < 2) { toast('Not enough data yet — wait a few readings', 'error'); return; }
+
+  // Create overlay
+  const overlay = document.createElement('div');
+  overlay.className = 'chart-overlay';
+  overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+
+  const mm = sensorMinMax[key] || { min: 0, max: 1 };
+  const latest = hist[hist.length - 1].value;
+  const elapsed = ((hist[hist.length - 1].ts - hist[0].ts) / 60000).toFixed(1);
+
+  overlay.innerHTML = `
+    <div class="chart-modal">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3>${label} (${unit})</h3>
+        <button class="chart-close" onclick="this.closest('.chart-overlay').remove()">&times;</button>
+      </div>
+      <canvas id="chartCanvas" width="520" height="220"></canvas>
+      <div class="chart-stats">
+        <div>Current: <span>${latest.toFixed(2)} ${unit}</span></div>
+        <div>Min: <span>${mm.min.toFixed(2)}</span></div>
+        <div>Max: <span>${mm.max.toFixed(2)}</span></div>
+        <div>Span: <span>${elapsed} min</span></div>
+        <div>Points: <span>${hist.length}</span></div>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  drawChart(document.getElementById('chartCanvas'), hist, unit);
+}
+
+function drawChart(canvas, data, unit) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const pad = { top: 20, right: 12, bottom: 28, left: 50 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const values = data.map(d => d.value);
+  let vMin = Math.min(...values);
+  let vMax = Math.max(...values);
+  if (vMax === vMin) { vMin -= 1; vMax += 1; }
+  const margin = (vMax - vMin) * 0.1;
+  vMin -= margin; vMax += margin;
+
+  const tMin = data[0].ts;
+  const tMax = data[data.length - 1].ts;
+
+  function xOf(ts) { return pad.left + ((ts - tMin) / (tMax - tMin)) * cw; }
+  function yOf(v) { return pad.top + ch - ((v - vMin) / (vMax - vMin)) * ch; }
+
+  // Grid lines
+  ctx.strokeStyle = '#2a2a4a';
+  ctx.lineWidth = 1;
+  const gridLines = 5;
+  for (let i = 0; i <= gridLines; i++) {
+    const y = pad.top + (ch / gridLines) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    const lbl = (vMax - ((vMax - vMin) / gridLines) * i).toFixed(1);
+    ctx.fillStyle = '#8892a4';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(lbl, pad.left - 6, y + 3);
+  }
+
+  // Time labels
+  ctx.textAlign = 'center';
+  const ticks = Math.min(5, data.length);
+  for (let i = 0; i < ticks; i++) {
+    const idx = Math.floor((data.length - 1) * i / (ticks - 1));
+    const t = new Date(data[idx].ts);
+    const lbl = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    ctx.fillText(lbl, xOf(data[idx].ts), H - 6);
+  }
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = '#4ecdc4';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  data.forEach((d, i) => {
+    const x = xOf(d.ts), y = yOf(d.value);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // Fill area under line
+  ctx.lineTo(xOf(data[data.length - 1].ts), pad.top + ch);
+  ctx.lineTo(xOf(data[0].ts), pad.top + ch);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(78, 205, 196, 0.1)';
+  ctx.fill();
 }
 
 async function refreshSensors() {
