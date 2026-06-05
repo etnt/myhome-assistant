@@ -97,10 +97,11 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
 .btn-secondary { background: var(--card); color: var(--text); }
 .btn-success { background: var(--success); color: #1a1a2e; }
 
-/* Grid layout */
+/* Grid layout — 2x2 on desktop */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto;
   gap: 1.5rem;
 }
 
@@ -383,7 +384,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 /* Responsive */
-@media (max-width: 600px) {
+@media (max-width: 768px) {
   .header { flex-direction: column; align-items: flex-start; }
   .connection { margin-left: 0; width: 100%; }
   .grid { grid-template-columns: 1fr; }
@@ -447,9 +448,14 @@ input[type="range"]::-webkit-slider-thumb:hover {
 </div>
 
 <div class="grid">
-  <!-- System Panel -->
+  <!-- Row 1: Bulbs + Sensors -->
+  <div id="bulbContainer"></div>
+
+  <div id="sensorContainer"></div>
+
+  <!-- Row 2: System + Policies -->
   <div class="card">
-    <h2>System</h2>
+    <h2>🖥 System</h2>
     <div class="system-actions">
       <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
       <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
@@ -462,13 +468,6 @@ input[type="range"]::-webkit-slider-thumb:hover {
     </div>
   </div>
 
-  <!-- Bulb cards injected here -->
-  <div id="bulbContainer"></div>
-
-  <!-- Sensor cards injected here -->
-  <div id="sensorContainer"></div>
-
-  <!-- Policies panel -->
   <div class="card" id="policiesCard">
     <h2>⚡ Automation Policies</h2>
     <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">

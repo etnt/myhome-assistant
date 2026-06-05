@@ -316,6 +316,50 @@ curl -X POST http://<esp-ip>:8080/api/bulb/1/color_xy -d '{"x":20971,"y":9830}'
 > chromaticity mode. Reading state only returns a meaningful value for the
 > currently active mode.
 
+## MCP Server
+
+A Python-based [Model Context Protocol](https://modelcontextprotocol.io/)
+server (`mcp_server/`) exposes the device's REST API as MCP tools, allowing
+AI assistants (GitHub Copilot, Claude, etc.) to control lights, read sensors,
+and manage automation policies directly.
+
+### Setup
+
+```bash
+cd mcp_server
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### VS Code Integration
+
+The workspace includes `.vscode/mcp.json` which configures the server
+automatically. The device URL is set via the `MYHOME_DEVICE_URL` environment
+variable (defaults to `http://192.168.1.115:8080`).
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_status` | Device status and bulb list |
+| `get_sensors` | Current sensor readings |
+| `get_logs` | System log entries |
+| `get_scan_results` | Last BLE scan results |
+| `trigger_scan` | Start a new BLE scan |
+| `discover_bulbs` | Run bulb discovery/pairing |
+| `get_connections` | Active BLE connections |
+| `get_bulb_state` | Cached bulb state |
+| `refresh_bulb_state` | Live BLE GATT read |
+| `set_bulb_power` | Turn bulb on/off |
+| `set_bulb_brightness` | Set brightness (1–254) |
+| `set_bulb_color_temp` | Set color temperature (153–500 mirek) |
+| `set_bulb_color_xy` | Set CIE xy color |
+| `set_bulb_state` | Set multiple properties at once |
+| `list_policies` | List automation policies |
+| `enable_policy` | Enable a policy |
+| `disable_policy` | Disable a policy |
+
 
 ## Troubleshooting
 
@@ -424,6 +468,7 @@ access point or reduce the idle disconnect timeout.
 | Package | Source | Purpose |
 |---------|--------|---------|
 | `tiny_httpd` | [github.com/etnt/tiny-httpd](https://github.com/etnt/tiny-httpd) | Minimal HTTP/1.1 server + JSON encoder/decoder |
+| `atomvm_sensors` | [github.com/etnt/atomvm_sensors](https://github.com/etnt/atomvm_sensors) | I2C sensor drivers (BME680, VEML6030) for AtomVM |
 
 Fetched automatically by rebar3 from `rebar.config`.
 
