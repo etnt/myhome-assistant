@@ -33,7 +33,14 @@ handle_request(Method, [<<"api">> | Path], Request) ->
         do_handle(Method, Path, Request)
     catch
         exit:{noproc, _} ->
-            json_reply(#{status => error, reason => <<"process not running">>});
+            io:format("[http] target process not running~n"),
+            json_reply(#{status => error, reason => <<"bulb process not running — try again">>});
+        exit:noproc ->
+            io:format("[http] target process not running~n"),
+            json_reply(#{status => error, reason => <<"bulb process not running — try again">>});
+        exit:{timeout, _} ->
+            io:format("[http] call timeout (BLE busy)~n"),
+            json_reply(#{status => error, reason => <<"timeout — BLE radio busy, try again">>});
         Class:Reason ->
             io:format("[http] handler crash: ~p:~p~n", [Class, Reason]),
             Msg = iolist_to_binary(io_lib:format("~p:~p", [Class, Reason])),

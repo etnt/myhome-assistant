@@ -716,12 +716,13 @@ static term handle_connect_cancel(Context *ctx)
     int rc = ble_gap_conn_cancel();
     if (rc == 0) {
         ESP_LOGI(TAG, "connect cancelled");
-        return make_ok(ctx);
+    } else if (rc == BLE_HS_EALREADY) {
+        // No connect in progress — harmless race with timeout
+        ESP_LOGD(TAG, "connect cancel: no procedure in progress (rc=%d)", rc);
     } else {
-        // BLE_HS_EALREADY means no connect in progress — treat as ok
         ESP_LOGW(TAG, "connect cancel: rc=%d", rc);
-        return make_ok(ctx);
     }
+    return make_ok(ctx);
 }
 
 /**

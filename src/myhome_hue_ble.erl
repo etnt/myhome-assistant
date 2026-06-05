@@ -225,8 +225,8 @@ do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
     myhome_ble_conn:disconnect(Handle),
     {reply, Reply, NewState#state{conn_handle = undefined, connected = false}};
 do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
-    %% Not connected — initiate connection, store pending command
-    case myhome_ble_conn:connect_sync(State#state.addr, State#state.addr_type) of
+    %% Not connected — initiate connection with retry
+    case connect_with_retry(State#state.addr, State#state.addr_type, 3) of
         {ok, ConnHandle} ->
             myhome_log:log(info, "[~p] connected, securing...", [State#state.name]),
             ble:security(ConnHandle),
@@ -234,7 +234,7 @@ do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
             {noreply, State#state{conn_handle = ConnHandle, connected = false,
                                   pending_cmd = Cmd, pending_from = From}};
         {error, Reason} ->
-            myhome_log:log(warning, "[~p] connect failed: ~p", [State#state.name, Reason]),
+            myhome_log:log(warning, "[~p] connect failed after retries: ~p", [State#state.name, Reason]),
             {reply, {error, {connect_failed, Reason}}, State}
     end;
 do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
@@ -329,3 +329,21 @@ cmd_name({write, ?CHR_COLOR_XY, _}) -> "set_color_xy";
 cmd_name({write_multi, _}) -> "set_state";
 cmd_name(read_all) -> "read_state";
 cmd_name(Other) -> io_lib:format("~p", [Other]).
+
+%% Connect with exponential backoff retry.
+%% Retries on timeout (status=9) with increasing delay: 2s, 4s, 8s...
+connect_with_retry(Addr, AddrType, MaxRetries) ->
+    connect_with_retry(Addr, AddrType, MaxRetries, 0, 2000).
+
+connect_with_retry(Addr, AddrType, MaxRetries, Attempt, Delay) ->
+    case myhome_ble_conn:connect_sync(Addr, AddrType) of
+        {ok, ConnHandle} ->
+            {ok, ConnHandle};
+        {error, Reason} when Attempt < MaxRetries ->
+            myhome_log:log(info, "[ble] connect attempt ~p failed (~p), retry in ~pms",
+                           [Attempt + 1, Reason, Delay]),
+            timer:sleep(Delay),
+            connect_with_retry(Addr, AddrType, MaxRetries, Attempt + 1, Delay * 2);
+        {error, Reason} ->
+            {error, Reason}
+    end.
