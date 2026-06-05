@@ -5,6 +5,8 @@ Control Philips Hue Bluetooth light bulbs directly from an ESP32-S3 running
 AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 
 <a href="myhome-assistant.jpg"><img src="myhome-assistant.jpg" width="600"></a>
+<a href="myhome-assistant-graph.jpg"><img src="myhome-assistant-graph.jpg" width="300"></a>
+
 
 Goto: [https://etnt.github.io/myhome-assistant/](https://etnt.github.io/myhome-assistant/)
 
@@ -132,7 +134,7 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | POST   | `/api/bulb/{n}/state`      | `{"power":true,...}`    | Set multiple properties at once |
 | DELETE | `/api/bulb/{n}`            | —                       | Remove bulb from NVS and stop process |
 | GET    | `/api/nvs/dump`            | —                       | Dump all bulb NVS config (addr + name) |
-| POST   | `/api/nvs/restore`         | `{"bulb_1_addr":"AA:BB:..","bulb_1_name":"Lamp"}` | Restore bulb config to NVS |
+| POST   | `/api/nvs/restore`         | `{"bulb_1_addr":"AA:B...` | Restore bulb config to NVS |
 
 ### Examples
 
@@ -205,6 +207,34 @@ curl -X POST http://192.168.1.115:8080/api/nvs/restore -d @nvs_backup.json
 # 2. Then clear ESP32 bonds + config and reboot:
 curl -X POST http://192.168.1.115:8080/api/reset
 ```
+
+## Web UI
+
+A single-page dashboard served from `viz/index.html` provides a visual
+interface to the system. Serve it locally or access via GitHub Pages:
+
+```bash
+cd viz && python3 -m http.server 3000
+# open http://localhost:3000
+```
+
+Enter the ESP32's IP:Port (e.g. `192.168.1.115:8080`) and click **Connect**.
+
+### Features
+
+- **Bulb controls** — power toggle, brightness slider, and color temperature
+  slider for each discovered bulb
+- **BLE scanner** — trigger scans and view nearby devices
+- **System logs** — live view of the on-device log ring buffer
+- **Sensor cards** — real-time readings from BME680 (temperature, humidity,
+  pressure, VOC), SGP30 (eCO₂, TVOC), and VEML6030 (ambient/white lux)
+  with min/max tracking
+- **Metric history graphs** — click any sensor metric to open a chart popup
+  showing the last ~30 minutes of readings (stored in a 360-point ring
+  buffer, updated every 5 seconds)
+
+The UI is self-contained (no build step, no external dependencies) and
+communicates with the ESP32 purely via the REST API described above.
 
 ## Color Control
 
