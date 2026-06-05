@@ -680,13 +680,14 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
     peer_addr.type = addr_type;
     memcpy(peer_addr.val, addr, 6);
 
-    // Use fast connection parameters initially.
-    // Pairing (LESC) requires multiple SM round-trips, so we need
-    // a short interval here. After bonding succeeds, Erlang calls
-    // OP_UPDATE_PARAMS to switch to slow params for WiFi coexistence.
+    // Use aggressive scan parameters for the connection attempt.
+    // After overnight idle, Hue bulbs advertise at ~1-2.5s intervals.
+    // Combined with WiFi coex stealing radio time, we need a wide window.
+    // After bonding succeeds, Erlang calls OP_UPDATE_PARAMS to switch to
+    // slow params for WiFi coexistence.
     struct ble_gap_conn_params conn_params = {
-        .scan_itvl = 16,              // 10ms scan interval during connect
-        .scan_window = 16,            // 10ms scan window
+        .scan_itvl = 48,              // 30ms scan interval during connect
+        .scan_window = 48,            // 30ms scan window (100% duty)
         .itvl_min = 24,               // 30ms min — fast for SM handshake
         .itvl_max = 40,               // 50ms max
         .latency = 0,                 // no latency during pairing
@@ -695,7 +696,7 @@ static term handle_connect(Context *ctx, const uint8_t *data, size_t len)
         .max_ce_len = 0,
     };
 
-    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 10000,
+    int rc = ble_gap_connect(g_own_addr_type, &peer_addr, 15000,
                              &conn_params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: rc=%d", rc);

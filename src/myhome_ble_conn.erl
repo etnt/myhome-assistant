@@ -46,7 +46,7 @@ connect(Addr, AddrType) when byte_size(Addr) =:= 6 ->
 %% @doc Connect and wait for the connection event. Returns handle on success.
 -spec connect_sync(binary(), 0..3) -> {ok, non_neg_integer()} | {error, term()}.
 connect_sync(Addr, AddrType) ->
-    connect_sync(Addr, AddrType, 10000).
+    connect_sync(Addr, AddrType, 18000).
 
 -spec connect_sync(binary(), 0..3, pos_integer()) -> {ok, non_neg_integer()} | {error, term()}.
 connect_sync(Addr, AddrType, Timeout) when byte_size(Addr) =:= 6 ->
