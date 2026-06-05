@@ -50,6 +50,15 @@ BLE strategy: **connect-on-demand** — bulb gen_servers only establish a BLE
 connection when a command is sent, then disconnect after 5s idle. This keeps
 the radio free for WiFi when no light commands are active.
 
+## Automation Rules
+
+The system includes a rules engine that automatically controls lights based on
+sensor readings (lux, temperature) and time-of-day. Rules are timezone-aware
+and designed for Nordic latitudes where sunset varies dramatically by season.
+
+See [AUTOMATION_RULES.md](AUTOMATION_RULES.md) for how to write and configure
+rule policies.
+
 ## Prerequisites
 
 - [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) (v5.x)

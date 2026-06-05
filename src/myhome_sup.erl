@@ -55,10 +55,18 @@ init([]) ->
         type => worker
     },
 
+    RulesSpec = #{
+        id => myhome_rules,
+        start => {myhome_rules, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec, SensorsSpec]}}.
+    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec]}}.

@@ -76,6 +76,10 @@ flash: flash-firmware flash-app
 monitor:
 	minicom -D $(PORT) -b 115200
 
+.PHONY: test
+test:
+	rebar3 eunit
+
 ## Build and flash everything
 all: flash
 
