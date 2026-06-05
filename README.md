@@ -19,6 +19,9 @@ cd viz && python3 -m http.server 3000
 
 - ESP32-S3 development board
 - Philips Hue Bluetooth bulbs (2019+ models with built-in BLE)
+- Sensors: VEML6039, BME680
+
+<a href="myhome-assistant-hw.jpg"><img src="myhome-assistant-hw.jpg" height="300"></a>
 
 ## Architecture
 
