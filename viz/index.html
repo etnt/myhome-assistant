@@ -388,6 +388,51 @@ input[type="range"]::-webkit-slider-thumb:hover {
   .connection { margin-left: 0; width: 100%; }
   .grid { grid-template-columns: 1fr; }
 }
+
+/* Policy rows */
+.policy-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg);
+  border-radius: 8px;
+}
+
+.policy-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  flex: 1;
+}
+
+.policy-meta {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.policy-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  text-transform: uppercase;
+}
+
+.policy-badge.active {
+  background: var(--success);
+  color: #1a1a2e;
+  animation: pulse 1.5s infinite;
+}
+
+.policy-badge.idle {
+  background: var(--card);
+  color: var(--text-dim);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 </style>
 </head>
 <body>
@@ -422,6 +467,14 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
   <!-- Sensor cards injected here -->
   <div id="sensorContainer"></div>
+
+  <!-- Policies panel -->
+  <div class="card" id="policiesCard">
+    <h2>⚡ Automation Policies</h2>
+    <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
+      <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+    </div>
+  </div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
@@ -842,6 +895,55 @@ function renderSensors(sensors) {
   }
 }
 
+// --- Policies ---
+async function refreshPolicies() {
+  const data = await api('GET', '/api/policies');
+  if (data && data.status === 'ok' && data.policies) {
+    renderPolicies(data.policies);
+  }
+}
+
+function renderPolicies(policies) {
+  const container = $('policiesContainer');
+  container.innerHTML = policies.map(p => {
+    const activeLabel = p.active
+      ? `<span class="policy-badge active">active</span>`
+      : `<span class="policy-badge idle">idle</span>`;
+    const agoText = p.last_fired_ago_s != null
+      ? `fired ${formatAgo(p.last_fired_ago_s)} ago`
+      : 'never fired';
+    return `
+      <div class="policy-row">
+        <label class="toggle" style="transform:scale(0.75);">
+          <input type="checkbox" ${p.enabled ? 'checked' : ''}
+            onchange="togglePolicy('${p.id}', this.checked)">
+          <span class="slider"></span>
+        </label>
+        <span class="policy-name">${p.id.replace(/_/g, ' ')}</span>
+        ${activeLabel}
+        <span class="policy-meta">${p.rule_count} rule${p.rule_count > 1 ? 's' : ''} · ${agoText}</span>
+      </div>`;
+  }).join('');
+}
+
+function formatAgo(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
+async function togglePolicy(id, enabled) {
+  const action = enabled ? 'enable' : 'disable';
+  const data = await api('POST', `/api/policies/${id}/${action}`);
+  if (data && data.status === 'ok') {
+    toast(`${id.replace(/_/g, ' ')} ${action}d`);
+    refreshPolicies();
+  } else {
+    toast(`Failed to ${action} policy`, 'error');
+    refreshPolicies();
+  }
+}
+
 // --- Init ---
 $('hostInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') checkStatus();
@@ -849,9 +951,11 @@ $('hostInput').addEventListener('keydown', e => {
 
 // Auto-connect on load
 setTimeout(checkStatus, 500);
+setTimeout(refreshPolicies, 1000);
 
-// Auto-refresh sensors every 5 seconds
+// Auto-refresh sensors every 5 seconds, policies every 10s
 setInterval(refreshSensors, 5000);
+setInterval(refreshPolicies, 10000);
 </script>
 </body>
 </html>

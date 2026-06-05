@@ -67,8 +67,25 @@ handle_call({set_policy_enabled, PolicyId, Enabled}, _From, #state{policies = Po
     end;
 
 handle_call(list_policies, _From, #state{policies = Policies} = State) ->
+    Now = erlang:system_time(millisecond),
     Summary = lists:map(fun(#{id := Id, enabled := En, rules := Rules}) ->
-        #{id => Id, enabled => En, rule_count => length(Rules)}
+        %% Find most recent firing across all rules in this policy
+        LastFired = lists:foldl(fun(#{last_fired := LF}, Acc) ->
+            case LF of
+                undefined -> Acc;
+                T when Acc =:= undefined -> T;
+                T when T > Acc -> T;
+                _ -> Acc
+            end
+        end, undefined, Rules),
+        %% "active" if fired within the last cooldown period (use max cooldown)
+        MaxCD = lists:max([maps:get(cooldown, R, 0) || R <- Rules]),
+        Active = LastFired =/= undefined andalso (Now - LastFired) < MaxCD,
+        Base = #{id => Id, enabled => En, rule_count => length(Rules), active => Active},
+        case LastFired of
+            undefined -> Base;
+            _ -> Base#{last_fired_ago_s => (Now - LastFired) div 1000}
+        end
     end, Policies),
     {reply, Summary, State};
 

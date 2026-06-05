@@ -118,6 +118,20 @@ off: off1 off2
 off%:
 	@curl -s -X POST http://$(IP):8080/api/bulb/$*/power -d '{"on":false}'
 
+refresh%:
+	@curl -s -X POST http://$(IP):8080/api/bulb/$*/refresh
+
+.PHONY: dump restore
+dump:
+	@curl -s http://$(IP):8080/api/nvs/dump > myhome_assistant_dump.json
+
+restore:
+	@curl -s -X POST http://$(IP):8080/api/nvs/restore --data-binary @myhome_assistant_dump.json
+
+.PHONY: policies
+policies:
+	@curl -s http://$(IP):8080/api/policies | jq -r '.policies[] | "\(.id)|\(if .enabled then "enabled" else "disabled" end)|\(if .active then "ACTIVE" else "-" end)|\(.rule_count) rules|\(if .last_fired_ago_s then "\(.last_fired_ago_s)s ago" else "never" end)"' | column -t -s'|'
+
 ## Show available targets
 help:
 	@echo "make atomvm         - Build AtomVM firmware with BLE"

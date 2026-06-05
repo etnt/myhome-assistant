@@ -109,6 +109,22 @@ do_handle(post, [<<"reset">>], _HttpRequest) ->
     spawn(fun() -> timer:sleep(1000), esp:restart() end),
     json_reply(#{status => ok, message => <<"Resetting. Device will reboot in 1 sec.">>});
 
+do_handle(get, [<<"policies">>], _HttpRequest) ->
+    Policies = myhome_rules:list_policies(),
+    json_reply(#{status => ok, policies => Policies});
+
+do_handle(post, [<<"policies">>, PolicyId, <<"enable">>], _HttpRequest) ->
+    case myhome_rules:enable_policy(binary_to_atom(PolicyId)) of
+        ok -> json_reply(#{status => ok});
+        {error, not_found} -> json_reply(#{status => error, reason => <<"policy not found">>})
+    end;
+
+do_handle(post, [<<"policies">>, PolicyId, <<"disable">>], _HttpRequest) ->
+    case myhome_rules:disable_policy(binary_to_atom(PolicyId)) of
+        ok -> json_reply(#{status => ok});
+        {error, not_found} -> json_reply(#{status => error, reason => <<"policy not found">>})
+    end;
+
 do_handle(post, [<<"bulb">>, BulbNum, <<"power">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
     #{body := Body} = HttpRequest,

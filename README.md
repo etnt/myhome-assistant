@@ -144,6 +144,9 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | DELETE | `/api/bulb/{n}`            | —                       | Remove bulb from NVS and stop process |
 | GET    | `/api/nvs/dump`            | —                       | Dump all bulb NVS config (addr + name) |
 | POST   | `/api/nvs/restore`         | `{"bulb_1_addr":"AA:B...` | Restore bulb config to NVS |
+| GET    | `/api/policies`            | —                       | List automation policies and status |
+| POST   | `/api/policies/{id}/enable` | —                      | Enable an automation policy |
+| POST   | `/api/policies/{id}/disable` | —                     | Disable an automation policy |
 
 ### Examples
 

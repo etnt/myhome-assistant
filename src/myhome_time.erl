@@ -9,6 +9,7 @@
 
 -ifdef(TEST).
 -export([parse_posix_tz/1, utc_to_local/2, in_dst/2, transition_to_datetime/3]).
+-export([gregorian_seconds_to_datetime/1]).
 -endif.
 
 -record(tz, {
@@ -66,7 +67,7 @@ utc_to_local({{Y, Mo, D}, {H, Mi, S}}, #tz{} = Tz) ->
         false -> Tz#tz.std_offset
     end,
     LocalSecs = UtcSecs + Offset,
-    {{_, _, _}, Time} = calendar:gregorian_seconds_to_datetime(LocalSecs),
+    {{_, _, _}, Time} = gregorian_seconds_to_datetime(LocalSecs),
     Time.
 
 in_dst(DateTime, #tz{dst_start = Start, dst_end = End, std_offset = StdOff}) ->
@@ -125,7 +126,7 @@ transition_to_datetime(Year, {Month, Week, DayOfWeek, Hour}, _StdOff) ->
     Day = case Week of
         5 ->
             %% "last" occurrence
-            LastDay = calendar:last_day_of_the_month(Year, Month),
+            LastDay = last_day_of_month(Year, Month),
             find_last_occurrence(FirstOccurrence, LastDay);
         _ ->
             FirstOccurrence + (Week - 1) * 7
@@ -138,3 +139,46 @@ find_last_occurrence(First, LastDay) ->
         true  -> Candidate - 7;
         false -> Candidate
     end.
+
+%% calendar:last_day_of_the_month/2 is not available in AtomVM
+last_day_of_month(Y, 2) ->
+    case is_leap_year(Y) of true -> 29; false -> 28 end;
+last_day_of_month(_, M) when M =:= 4; M =:= 6; M =:= 9; M =:= 11 -> 30;
+last_day_of_month(_, _) -> 31.
+
+is_leap_year(Y) ->
+    (Y rem 4 =:= 0) andalso ((Y rem 100 =/= 0) orelse (Y rem 400 =:= 0)).
+
+%% calendar:gregorian_seconds_to_datetime/1 is not available in AtomVM.
+%% This is the inverse of AtomVM's date_to_gregorian_days (Hinnant algorithm).
+gregorian_seconds_to_datetime(Secs) ->
+    Days = Secs div 86400,
+    RemSecs = Secs rem 86400,
+    Date = gregorian_days_to_date(Days),
+    Hour = RemSecs div 3600,
+    Min = (RemSecs rem 3600) div 60,
+    Sec = RemSecs rem 60,
+    {Date, {Hour, Min, Sec}}.
+
+gregorian_days_to_date(Days) ->
+    %% Inverse of AtomVM's date_to_gregorian_days which uses:
+    %%   Era * 146097 + DoE + 60
+    Z = Days - 60,
+    Era = case Z >= 0 of
+        true  -> Z div 146097;
+        false -> (Z - 146096) div 146097
+    end,
+    DoE = Z - Era * 146097,
+    YoE = (DoE - DoE div 1460 + DoE div 36524 - DoE div 146096) div 365,
+    DoY = DoE - (365 * YoE + YoE div 4 - YoE div 100),
+    Mp = (5 * DoY + 2) div 153,
+    D = DoY - (153 * Mp + 2) div 5 + 1,
+    M = case Mp < 10 of
+        true  -> Mp + 3;
+        false -> Mp - 9
+    end,
+    Y = case M =< 2 of
+        true  -> YoE + Era * 400 + 1;
+        false -> YoE + Era * 400
+    end,
+    {Y, M, D}.

@@ -32,26 +32,40 @@ init([]) ->
     PSK = myhome_config:wifi_psk(),
     myhome_log:log(info, "Connecting to WiFi (~s)...", [SSID]),
     Self = self(),
-    Creds = [{ssid, SSID}, {psk, PSK},
-             {beacon_timeout, fun() -> Self ! wifi_beacon_timeout end}],
-    case network:wait_for_sta(Creds, 30000) of
-        {ok, {Address, _Netmask, _Gateway}} ->
-            io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
-            Port = myhome_config:http_port(),
-            Opts = #{cors => #{allow_origin => <<"*">>,
-                               allow_methods => <<"GET, POST, OPTIONS">>,
-                               allow_headers => <<"Content-Type">>}},
-            case tiny_httpd:start_link(any, Port, myhome_http_handler, Opts) of
-                {ok, _} ->
-                    io:format("HTTP API listening on port ~p~n", [Port]),
-                    myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
-                    myhome_log:log(info, "Try: curl http://~s:~p/api/status",
-                              [format_ip(Address), Port]),
-                    {ok, #state{}};
-                {error, Reason} ->
-                    io:format("HTTP server FAILED: ~p~n", [Reason]),
-                    myhome_log:log(error, "HTTP server failed: ~p", [Reason]),
-                    {stop, {http_start_failed, Reason}}
+    StaConfig = [{ssid, SSID}, {psk, PSK},
+                 {connected, fun() -> Self ! connected end},
+                 {got_ip, fun(IpInfo) -> Self ! {ok, IpInfo} end},
+                 {disconnected, fun() -> Self ! disconnected end},
+                 {beacon_timeout, fun() -> Self ! wifi_beacon_timeout end}],
+    SntpConfig = [{host, "pool.ntp.org"},
+                  {synchronized, fun(_TimeVal) ->
+                      io:format("SNTP synchronized~n")
+                  end}],
+    Config = [{sta, StaConfig}, {sntp, SntpConfig}],
+    case network:start(Config) of
+        {ok, _Pid} ->
+            case wait_for_ip(30000) of
+                {ok, {Address, _Netmask, _Gateway}} ->
+                    io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
+                    Port = myhome_config:http_port(),
+                    Opts = #{cors => #{allow_origin => <<"*">>,
+                                       allow_methods => <<"GET, POST, OPTIONS">>,
+                                       allow_headers => <<"Content-Type">>}},
+                    case tiny_httpd:start_link(any, Port, myhome_http_handler, Opts) of
+                        {ok, _} ->
+                            io:format("HTTP API listening on port ~p~n", [Port]),
+                            myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
+                            myhome_log:log(info, "Try: curl http://~s:~p/api/status",
+                                      [format_ip(Address), Port]),
+                            {ok, #state{}};
+                        {error, Reason} ->
+                            io:format("HTTP server FAILED: ~p~n", [Reason]),
+                            myhome_log:log(error, "HTTP server failed: ~p", [Reason]),
+                            {stop, {http_start_failed, Reason}}
+                    end;
+                {error, timeout} ->
+                    myhome_log:log(error, "WiFi timeout"),
+                    {stop, {wifi_failed, timeout}}
             end;
         {error, Reason} ->
             myhome_log:log(error, "WiFi failed: ~p", [Reason]),
@@ -103,6 +117,13 @@ terminate(_Reason, _State) ->
 %%====================================================================
 %% Internal
 %%====================================================================
+
+wait_for_ip(Timeout) ->
+    receive
+        {ok, IpInfo} -> {ok, IpInfo}
+    after Timeout ->
+        {error, timeout}
+    end.
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TRef) -> erlang:cancel_timer(TRef).
