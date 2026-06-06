@@ -61,6 +61,7 @@ handle_call({set_policy_enabled, PolicyId, Enabled}, _From, #state{policies = Po
         {ok, NewPolicies} ->
             io:format("[rules] Policy ~p ~s~n",
                       [PolicyId, case Enabled of true -> "enabled"; false -> "disabled" end]),
+            myhome_event_bus:publish({policy_changed, PolicyId, Enabled}),
             {reply, ok, State#state{policies = NewPolicies}};
         error ->
             {reply, {error, not_found}, State}

@@ -33,19 +33,14 @@ handle_request(Method, [<<"api">> | Path], Request) ->
         do_handle(Method, Path, Request)
     catch
         exit:{noproc, _} ->
-            io:format("[http] target process not running~n"),
-            json_reply(#{status => error, reason => <<"bulb process not running — try again">>});
+            static_error(<<"process not running">>);
         exit:noproc ->
-            io:format("[http] target process not running~n"),
-            json_reply(#{status => error, reason => <<"bulb process not running — try again">>});
+            static_error(<<"process not running">>);
         exit:{timeout, _} ->
-            io:format("[http] call timeout (BLE busy)~n"),
-            json_reply(#{status => error, reason => <<"timeout — BLE radio busy, try again">>});
+            static_error(<<"timeout - BLE busy">>);
         Class:Reason ->
-            io:format("[http] handler crash: ~p:~p~n", [Class, Reason]),
-            Msg = iolist_to_binary(io_lib:format("~p:~p", [Class, Reason])),
-            myhome_log:log(error, "[http] handler crash: ~s", [Msg]),
-            json_reply(#{status => error, reason => Msg})
+            io:format("[http] crash: ~p:~p~n", [Class, Reason]),
+            static_error(<<"internal error">>)
     end;
 handle_request(_Method, _Path, _Request) ->
     {404, #{}, <<"Not Found">>}.
@@ -53,6 +48,30 @@ handle_request(_Method, _Path, _Request) ->
 do_handle(get, [<<"status">>], _HttpRequest) ->
     Bulbs = get_bulb_status(),
     json_reply(#{status => ok, bulbs => Bulbs});
+
+do_handle(get, [<<"events">>], _HttpRequest) ->
+    %% Long-poll: subscribe to event_bus, wait up to 30s for an event
+    myhome_event_bus:subscribe(self(), fun
+        ({sensor_update, _}) -> true;
+        ({policy_changed, _, _}) -> true;
+        ({bulb_state, _, _}) -> true;
+        (_) -> false
+    end),
+    Event = receive
+        {ble_event, {sensor_update, Readings}} ->
+            #{type => sensor_update, data => format_sensor_readings(Readings)};
+        {ble_event, {policy_changed, Id, Enabled}} ->
+            #{type => policy_changed, data => #{id => Id, enabled => Enabled}};
+        {ble_event, {bulb_state, Name, BulbState}} ->
+            #{type => bulb_state, data => BulbState#{name => Name}}
+    after 30000 ->
+        none
+    end,
+    myhome_event_bus:unsubscribe(self()),
+    case Event of
+        none -> json_reply(#{status => ok, event => null});
+        _    -> json_reply(#{status => ok, event => Event})
+    end;
 
 do_handle(get, [<<"logs">>], HttpRequest) ->
     try
@@ -212,6 +231,26 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"refresh">>], _HttpRequest) ->
         {error, Reason} ->
             json_reply(#{status => error, reason => to_bin(Reason)})
     end;
+
+do_handle(post, [<<"bulb">>, BulbNum, <<"reconnect">>], _HttpRequest) ->
+    %% Clear connect cooldown and attempt a fresh connection
+    Name = bulb_name(BulbNum),
+    myhome_hue_ble:clear_cooldown(Name),
+    myhome_log:log(info, "[~p] cooldown cleared, ready to reconnect", [Name]),
+    json_reply(#{status => ok, msg => <<"cooldown cleared">>});
+
+do_handle(post, [<<"reconnect">>], _HttpRequest) ->
+    %% Clear cooldown on all bulbs
+    lists:foreach(fun({_, Child, _, _}) ->
+        case is_pid(Child) of
+            true ->
+                Name = element(2, erlang:process_info(Child, registered_name)),
+                myhome_hue_ble:clear_cooldown(Name);
+            false -> ok
+        end
+    end, supervisor:which_children(myhome_sup)),
+    myhome_log:log(info, "All bulb cooldowns cleared"),
+    json_reply(#{status => ok, msg => <<"all cooldowns cleared">>});
 
 do_handle(post, [<<"bulb">>, BulbNum, <<"state">>], HttpRequest) ->
     Name = bulb_name(BulbNum),
@@ -630,3 +669,11 @@ parse_log_opts(HttpRequest) ->
 json_reply(Map) ->
     Body = tiny_json:encode(Map),
     {200, #{<<"Content-Type">> => <<"application/json">>}, Body}.
+
+%% Sensor readings are already a map of maps — pass through directly
+format_sensor_readings(Readings) when is_map(Readings) -> Readings.
+
+%% Pre-built error response — minimal allocation in the hot error path
+static_error(Reason) ->
+    {200, #{<<"Content-Type">> => <<"application/json">>},
+     <<"{\"status\":\"error\",\"reason\":\"", Reason/binary, "\"}">>}.

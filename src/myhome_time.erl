@@ -6,10 +6,11 @@
 -module(myhome_time).
 
 -export([local_time/0, local_hour/0, local_minute/0, is_dst/0]).
+-export([local_datetime/0, format_local_datetime/1]).
+-export([gregorian_seconds_to_datetime/1]).
 
 -ifdef(TEST).
 -export([parse_posix_tz/1, utc_to_local/2, in_dst/2, transition_to_datetime/3]).
--export([gregorian_seconds_to_datetime/1]).
 -endif.
 
 -record(tz, {
@@ -43,6 +44,23 @@ is_dst() ->
     Tz = parse_posix_tz(myhome_config:timezone()),
     in_dst(UtcNow, Tz).
 
+%% @doc Return full local datetime as {{Y,M,D},{H,Mi,S}}.
+local_datetime() ->
+    UtcNow = erlang:universaltime(),
+    Tz = parse_posix_tz(myhome_config:timezone()),
+    utc_to_local_datetime(UtcNow, Tz).
+
+%% @doc Format a UTC datetime tuple to a local time binary string.
+%% Returns <<"2026-06-06 21:34:03">> or <<"Xs">> if pre-SNTP.
+-spec format_local_datetime(calendar:datetime()) -> binary().
+format_local_datetime({{Y, _, _}, _} = Utc) when Y > 2024 ->
+    Tz = parse_posix_tz(myhome_config:timezone()),
+    {{LY, LMo, LD}, {LH, LMi, LS}} = utc_to_local_datetime(Utc, Tz),
+    iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B ~2..0B:~2..0B:~2..0B",
+                                    [LY, LMo, LD, LH, LMi, LS]));
+format_local_datetime(_) ->
+    undefined.
+
 %%====================================================================
 %% Internal: POSIX TZ parsing and conversion
 %%====================================================================
@@ -69,6 +87,15 @@ utc_to_local({{Y, Mo, D}, {H, Mi, S}}, #tz{} = Tz) ->
     LocalSecs = UtcSecs + Offset,
     {{_, _, _}, Time} = gregorian_seconds_to_datetime(LocalSecs),
     Time.
+
+utc_to_local_datetime({{Y, Mo, D}, {H, Mi, S}}, #tz{} = Tz) ->
+    UtcSecs = calendar:datetime_to_gregorian_seconds({{Y, Mo, D}, {H, Mi, S}}),
+    Offset = case in_dst({{Y, Mo, D}, {H, Mi, S}}, Tz) of
+        true  -> Tz#tz.dst_offset;
+        false -> Tz#tz.std_offset
+    end,
+    LocalSecs = UtcSecs + Offset,
+    gregorian_seconds_to_datetime(LocalSecs).
 
 in_dst(DateTime, #tz{dst_start = Start, dst_end = End, std_offset = StdOff}) ->
     {{Y, _, _}, _} = DateTime,

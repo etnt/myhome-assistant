@@ -39,7 +39,8 @@ init([]) ->
                  {beacon_timeout, fun() -> Self ! wifi_beacon_timeout end}],
     SntpConfig = [{host, "pool.ntp.org"},
                   {synchronized, fun(_TimeVal) ->
-                      io:format("SNTP synchronized~n")
+                      io:format("SNTP synchronized~n"),
+                      myhome_log:log(info, "SNTP synchronized")
                   end}],
     Config = [{sta, StaConfig}, {sntp, SntpConfig}],
     case network:start(Config) of

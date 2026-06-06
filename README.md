@@ -147,6 +147,9 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | GET    | `/api/policies`            | —                       | List automation policies and status |
 | POST   | `/api/policies/{id}/enable` | —                      | Enable an automation policy |
 | POST   | `/api/policies/{id}/disable` | —                     | Disable an automation policy |
+| GET    | `/api/events`              | —                       | Long-poll for real-time events (30s timeout) |
+| POST   | `/api/reconnect`           | —                       | Clear connect cooldown on all bulbs |
+| POST   | `/api/bulb/{n}/reconnect`  | —                       | Clear connect cooldown on a single bulb |
 
 ### Examples
 
@@ -246,7 +249,32 @@ Enter the ESP32's IP:Port (e.g. `192.168.1.115:8080`) and click **Connect**.
   buffer, updated every 5 seconds)
 
 The UI is self-contained (no build step, no external dependencies) and
-communicates with the ESP32 purely via the REST API described above.
+communicates with the ESP32 via the REST API described above.
+
+### Event-Driven Updates (Long-Polling)
+
+The UI uses **long-polling** via `GET /api/events` instead of periodic
+polling. The ESP32 holds the HTTP connection open (up to 30s) and returns
+immediately when a relevant event occurs:
+
+- `sensor_update` — new sensor readings available
+- `policy_changed` — an automation policy was enabled/disabled
+- `bulb_state` — a bulb's power/brightness/color changed (detected by the
+  built-in heartbeat poller every ~5 minutes)
+
+This reduces WiFi traffic and gives near-instant UI feedback without
+continuous polling. The `tiny_httpd` server spawns one process per
+connection, so the long-poll blocks only its own handler process.
+
+### Heartbeat & Reconnect
+
+Each bulb gen_server runs a **heartbeat timer** (every 5 minutes + random
+jitter) that reads the bulb's BLE state to detect external changes (e.g.
+wall switch toggled). If the bulb is unreachable, a 60-second **connect
+cooldown** prevents retry storms that could exhaust ESP32 RAM.
+
+Use `POST /api/reconnect` (all bulbs) or `POST /api/bulb/{n}/reconnect`
+(single bulb) to clear the cooldown and retry immediately.
 
 ## Color Control
 

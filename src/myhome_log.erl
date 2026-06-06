@@ -12,7 +12,7 @@
 -export([log/3, log/2, get_logs/0, get_logs/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--define(MAX_ENTRIES, 100).
+-define(MAX_ENTRIES, 50).
 
 -record(state, {
     queue :: queue:queue(),
@@ -75,7 +75,8 @@ handle_cast({log, Level, Message}, State) ->
     #state{queue = Q, count = Count, seq = Seq} = State,
     Entry = #{
         seq => Seq + 1,
-        ts => erlang:system_time(millisecond),
+        ts => erlang:universaltime(),
+        uptime => erlang:system_time(millisecond),
         level => Level,
         msg => Message
     },
@@ -110,4 +111,14 @@ format_logs(#state{queue = Q}, Opts) ->
     Limit = maps:get(limit, Opts, ?MAX_ENTRIES),
     %% Return newest first: reverse, then take limit
     Limited = lists:sublist(lists:reverse(Filtered), Limit),
-    Limited.
+    %% Format timestamps as readable strings
+    [format_entry(E) || E <- Limited].
+
+format_entry(#{ts := Utc, uptime := Ms} = E) ->
+    TsBin = case myhome_time:format_local_datetime(Utc) of
+        undefined ->
+            iolist_to_binary(io_lib:format("boot+~Bs", [Ms div 1000]));
+        Formatted ->
+            Formatted
+    end,
+    maps:remove(uptime, E#{ts := TsBin}).

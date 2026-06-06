@@ -128,9 +128,21 @@ dump:
 restore:
 	@curl -s -X POST http://$(IP):8080/api/nvs/restore --data-binary @myhome_assistant_dump.json
 
-.PHONY: policies
+.PHONY: policies enable-policy disable-policy 
 policies:
 	@curl -s http://$(IP):8080/api/policies | jq -r '.policies[] | "\(.id)|\(if .enabled then "enabled" else "disabled" end)|\(if .active then "ACTIVE" else "-" end)|\(.rule_count) rules|\(if .last_fired_ago_s then "\(.last_fired_ago_s)s ago" else "never" end)"' | column -t -s'|'
+
+enable-policy:
+ifndef POLICY
+	$(error Usage: make enable-policy POLICY=<policy-id>)
+endif
+	@curl -s -X POST http://$(IP):8080/api/policies/$(POLICY)/enable
+
+disable-policy:
+ifndef POLICY
+	$(error Usage: make disable-policy POLICY=<policy-id>)
+endif
+	@curl -s -X POST http://$(IP):8080/api/policies/$(POLICY)/disable
 
 ## Show available targets
 help:

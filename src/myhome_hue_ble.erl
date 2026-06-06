@@ -11,6 +11,7 @@
 -export([start_link/3]).
 -export([set_power/2, set_brightness/2, set_color_temp/2]).
 -export([set_color_xy/3, set_state/2, get_state/1, read_state/1]).
+-export([clear_cooldown/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -55,7 +56,9 @@
     color_temp :: integer() | undefined,
     %% Connect-on-demand: pending command waiting for encryption
     pending_cmd :: term() | undefined,
-    pending_from :: term() | undefined
+    pending_from :: term() | undefined,
+    %% Cooldown: avoid repeated failed connects
+    last_connect_fail :: integer() | undefined  %% system_time(millisecond)
 }).
 
 %%====================================================================
@@ -70,6 +73,9 @@ start_link(Addr, AddrType, Name) ->
     gen_server:start_link({local, Name}, ?MODULE, {Addr, AddrType, Name}, []).
 
 -define(CALL_TIMEOUT, 35000).
+
+%% Heartbeat: periodic state read to detect external changes (e.g., physical switch)
+-define(HEARTBEAT_INTERVAL_MS, 300000). %% 5 minutes
 
 -spec set_power(atom(), boolean()) -> ok | {error, term()}.
 set_power(Name, On) ->
@@ -97,6 +103,11 @@ set_state(Name, State) when is_map(State) ->
 get_state(Name) ->
     gen_server:call(Name, get_state, ?CALL_TIMEOUT).
 
+%% @doc Clear the connect cooldown so next command will attempt BLE immediately.
+-spec clear_cooldown(atom()) -> ok.
+clear_cooldown(Name) ->
+    gen_server:call(Name, clear_cooldown).
+
 %% @doc Read the actual bulb state via BLE GATT (connects on-demand).
 -spec read_state(atom()) -> {ok, map()} | {error, term()}.
 read_state(Name) ->
@@ -123,6 +134,9 @@ init({Addr, AddrType, Name}) ->
     %% Connect-on-demand: no connection at startup.
     %% WiFi stays healthy until a command actually needs BLE.
     myhome_log:log(info, "[~p] ready (connect-on-demand)", [Name]),
+    %% Schedule first heartbeat (stagger based on atomvm:random to avoid all bulbs reading at once)
+    Jitter = (atomvm:random() rem ?HEARTBEAT_INTERVAL_MS) + 60000,
+    erlang:send_after(Jitter, self(), heartbeat),
     {ok, State}.
 
 handle_call({set_power, On}, From, State) ->
@@ -150,6 +164,9 @@ handle_call(get_state, _From, State) ->
     Reply = {ok, #{power => Power, brightness => Bri, color_temp => Temp, connected => Conn}},
     {reply, Reply, State};
 
+handle_call(clear_cooldown, _From, State) ->
+    {reply, ok, State#state{last_connect_fail = undefined}};
+
 handle_call(read_state, From, State) ->
     do_cmd(read_all, From, State);
 
@@ -168,12 +185,19 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
             myhome_log:log(info, "[~p] encrypted, executing: ~s", [State#state.name, cmd_name(Cmd)]),
             {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
             myhome_ble_conn:disconnect(ConnHandle),
-            gen_server:reply(From, Reply),
+            case From of
+                undefined -> ok;  %% heartbeat — no caller to reply to
+                _ -> gen_server:reply(From, Reply)
+            end,
+            publish_state(NewState),
             {noreply, NewState#state{pending_cmd = undefined, pending_from = undefined,
                                      conn_handle = undefined, connected = false}};
         _ ->
             myhome_log:log(error, "[~p] security failed (status=~p)", [State#state.name, Status]),
-            gen_server:reply(From, {error, {security_failed, Status}}),
+            case From of
+                undefined -> ok;
+                _ -> gen_server:reply(From, {error, {security_failed, Status}})
+            end,
             myhome_ble_conn:disconnect(ConnHandle),
             {noreply, State#state{conn_handle = undefined, connected = false,
                                   pending_cmd = undefined, pending_from = undefined}}
@@ -204,6 +228,29 @@ handle_info({ble_event, {ble_disconnected, ConnHandle, Reason}},
     end,
     {noreply, NewState#state{conn_handle = undefined, connected = false}};
 
+%% Heartbeat: periodic state read to detect external changes
+handle_info(heartbeat, #state{pending_cmd = undefined} = State) ->
+    erlang:send_after(?HEARTBEAT_INTERVAL_MS, self(), heartbeat),
+    case in_connect_cooldown(State) of
+        true ->
+            %% Bulb unreachable — skip this cycle
+            {noreply, State};
+        false ->
+            %% Initiate a read_state as an internal command (no external caller)
+            case connect_with_retry(State#state.addr, State#state.addr_type, 0) of
+                {ok, ConnHandle} ->
+                    ble:security(ConnHandle),
+                    {noreply, State#state{conn_handle = ConnHandle, connected = false,
+                                          pending_cmd = read_all, pending_from = undefined}};
+                {error, _} ->
+                    {noreply, State#state{last_connect_fail = erlang:system_time(millisecond)}}
+            end
+    end;
+handle_info(heartbeat, State) ->
+    %% A command is already pending — skip this heartbeat
+    erlang:send_after(?HEARTBEAT_INTERVAL_MS, self(), heartbeat),
+    {noreply, State};
+
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -225,21 +272,31 @@ do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
     myhome_ble_conn:disconnect(Handle),
     {reply, Reply, NewState#state{conn_handle = undefined, connected = false}};
 do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
-    %% Not connected — initiate connection with retry
-    case connect_with_retry(State#state.addr, State#state.addr_type, 3) of
+    %% Not connected — check cooldown then connect on-demand
+    case in_connect_cooldown(State) of
+        true ->
+            {reply, {error, connect_cooldown}, State};
+        false ->
+            do_cmd_connect(Cmd, From, State)
+    end;
+do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
+    %% Already have a pending command (connection in progress)
+    {reply, {error, busy}, State}.
+
+do_cmd_connect(Cmd, From, State) ->
+    case connect_with_retry(State#state.addr, State#state.addr_type, 1) of
         {ok, ConnHandle} ->
             myhome_log:log(info, "[~p] connected, securing...", [State#state.name]),
             ble:security(ConnHandle),
             %% Wait for enc_change in handle_info before executing
             {noreply, State#state{conn_handle = ConnHandle, connected = false,
-                                  pending_cmd = Cmd, pending_from = From}};
+                                  pending_cmd = Cmd, pending_from = From,
+                                  last_connect_fail = undefined}};
         {error, Reason} ->
-            myhome_log:log(warning, "[~p] connect failed after retries: ~p", [State#state.name, Reason]),
-            {reply, {error, {connect_failed, Reason}}, State}
-    end;
-do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
-    %% Already have a pending command (connection in progress)
-    {reply, {error, busy}, State}.
+            myhome_log:log(warning, "[~p] connect failed: ~p", [State#state.name, Reason]),
+            {reply, {error, {connect_failed, Reason}},
+             State#state{last_connect_fail = erlang:system_time(millisecond)}}
+    end.
 
 %% Execute a GATT write command on an encrypted connection
 execute_cmd({write, ChrUUID, Value}, #state{conn_handle = Handle} = State) ->
@@ -331,7 +388,7 @@ cmd_name(read_all) -> "read_state";
 cmd_name(Other) -> io_lib:format("~p", [Other]).
 
 %% Connect with exponential backoff retry.
-%% Retries on timeout (status=9) with increasing delay: 2s, 4s, 8s...
+%% Single retry to limit memory pressure and radio time on ESP32.
 connect_with_retry(Addr, AddrType, MaxRetries) ->
     connect_with_retry(Addr, AddrType, MaxRetries, 0, 2000).
 
@@ -347,3 +404,15 @@ connect_with_retry(Addr, AddrType, MaxRetries, Attempt, Delay) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% 60s cooldown after a failed connect to avoid memory exhaustion from retries
+-define(CONNECT_COOLDOWN_MS, 60000).
+
+in_connect_cooldown(#state{last_connect_fail = undefined}) -> false;
+in_connect_cooldown(#state{last_connect_fail = LastFail}) ->
+    (erlang:system_time(millisecond) - LastFail) < ?CONNECT_COOLDOWN_MS.
+
+%% Publish bulb state to event_bus so long-poll clients get updates
+publish_state(#state{name = Name, power = Power, brightness = Bri, color_temp = CT}) ->
+    myhome_event_bus:publish({bulb_state, Name,
+        #{power => Power, brightness => Bri, color_temp => CT}}).

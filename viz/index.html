@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <title>MyHome Assistant</title>
 <style>
 :root {
@@ -529,8 +530,12 @@ async function checkStatus() {
     }
     // Refresh bulb states
     refreshBulbs();
+    // Fetch initial sensor + policy data, then start event loop
+    refreshSensors();
+    startEventLoop();
   } else {
     $('connDot').classList.remove('connected');
+    stopEventLoop();
   }
 }
 
@@ -952,9 +957,63 @@ $('hostInput').addEventListener('keydown', e => {
 setTimeout(checkStatus, 500);
 setTimeout(refreshPolicies, 1000);
 
-// Auto-refresh sensors every 5 seconds, policies every 10s
-setInterval(refreshSensors, 5000);
-setInterval(refreshPolicies, 10000);
+// --- Long-poll event loop ---
+// Replaces constant polling. The ESP32 holds the connection open until
+// an event occurs (sensor update, policy change, bulb state change) or
+// 30s timeout. UI reconnects immediately after each response.
+let eventLoopActive = false;
+
+async function startEventLoop() {
+  if (eventLoopActive) return;
+  eventLoopActive = true;
+  while (eventLoopActive) {
+    try {
+      const resp = await fetch(`http://${$('hostInput').value}/api/events`);
+      if (!resp.ok) { await sleep(5000); continue; }
+      const data = await resp.json();
+      if (data.event) {
+        handleEvent(data.event);
+      }
+    } catch (e) {
+      // Connection lost — retry after delay
+      await sleep(5000);
+    }
+  }
+}
+
+function stopEventLoop() {
+  eventLoopActive = false;
+}
+
+function handleEvent(event) {
+  switch (event.type) {
+    case 'sensor_update':
+      updateSensorsUI(event.data);
+      break;
+    case 'policy_changed':
+      refreshPolicies(); // re-fetch full policy list for consistency
+      break;
+    case 'bulb_state':
+      const d = event.data;
+      const match = d.name && d.name.match(/bulb_(\d+)/);
+      if (match) {
+        const id = parseInt(match[1]);
+        bulbs[id] = { ...bulbs[id], ...d, status: 'ok' };
+        renderBulb(id, bulbs[id]);
+      }
+      break;
+  }
+}
+
+function updateSensorsUI(sensors) {
+  // Reuse existing rendering logic by calling refreshSensors with cached data
+  if (sensors) {
+    cachedSensors = sensors;
+    renderSensors(sensors);
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 </script>
 </body>
 </html>
