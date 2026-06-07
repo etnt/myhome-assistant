@@ -88,10 +88,16 @@ do_handle(get, [<<"logs">>], HttpRequest) ->
         json_reply(#{status => error, reason => iolist_to_binary(io_lib:format("~p:~p", [C, R]))})
     end;
 
-do_handle(get, [<<"scan">>], _HttpRequest) ->
+do_handle(get, [<<"scan">>], HttpRequest) ->
     case myhome_scanner:get_results() of
         {ok, Results} ->
-            json_reply(#{status => ok, scan => Results});
+            Params = maps:get(params, HttpRequest, #{}),
+            Filtered = case maps:get(<<"named">>, Params, undefined) of
+                undefined -> Results;
+                _ -> Results#{results => [R || R = #{name := N} <- maps:get(results, Results, []),
+                                                N =/= <<>>]}
+            end,
+            json_reply(#{status => ok, scan => Filtered});
         {error, Reason} ->
             json_reply(#{status => error, reason => to_bin(Reason)})
     end;

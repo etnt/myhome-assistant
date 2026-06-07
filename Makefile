@@ -21,7 +21,7 @@ PORT ?= /dev/cu.usbmodem5B414826621
 ATOMVM_DIR := AtomVM
 ESP32_DIR := $(ATOMVM_DIR)/src/platforms/esp32
 APP_OFFSET ?= 0x250000
-IP ?= 192.168.1.115
+IP ?= 192.168.68.64
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 
@@ -92,7 +92,7 @@ status:
 	@curl -s http://$(IP):8080/api/status | jq
 
 scan:
-	@curl -s http://$(IP):8080/api/scan 
+	@curl -s http://$(IP):8080/api/scan?named=true
 
 doscan:
 	@curl -s -X POST http://$(IP):8080/api/scan 

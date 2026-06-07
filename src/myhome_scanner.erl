@@ -81,14 +81,15 @@ handle_call(get_results, _From, State) ->
             scanning => State#state.scanning,
             last_scan => State#state.last_scan
         }},
-        {reply, Reply, State}
+        %% Clear results after retrieval to free memory
+        {reply, Reply, State#state{results = []}}
     catch
         C:R ->
             io:format("[scanner] get_results crash: ~p:~p~n", [C, R]),
             {reply, {error, {C, R}}, State}
     end;
 handle_call(get_raw_results, _From, State) ->
-    {reply, {ok, State#state.results}, State};
+    {reply, {ok, State#state.results}, State#state{results = []}};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
 

@@ -9,7 +9,7 @@ import os
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-DEVICE_URL = os.environ.get("MYHOME_DEVICE_URL", "http://192.168.1.115:8080")
+DEVICE_URL = os.environ.get("MYHOME_DEVICE_URL", "http://192.168.68.64:8080")
 
 mcp = FastMCP("MyHome Assistant")
 
