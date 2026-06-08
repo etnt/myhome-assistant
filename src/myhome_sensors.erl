@@ -36,11 +36,10 @@ get_readings() ->
 %%====================================================================
 
 init([]) ->
-    #{i2c := I2CConf, devices := DevConfs, poll_interval_ms := Interval} =
+    #{devices := DevConfs, poll_interval_ms := Interval} =
         myhome_config:sensors(),
-    #{sda := SDA, scl := SCL, speed_hz := Speed} = I2CConf,
-    io:format("[sensors] Opening I2C (SDA=~p, SCL=~p, speed=~p)~n", [SDA, SCL, Speed]),
-    I2C = i2c:open([{sda, SDA}, {scl, SCL}, {clock_speed_hz, Speed}]),
+    io:format("[sensors] Getting shared I2C bus from myhome_ble_i2c~n"),
+    I2C = myhome_ble_i2c:get_i2c(),
     io:format("[sensors] I2C bus opened, initing ~p device(s)~n", [length(DevConfs)]),
     Devices = init_devices(I2C, DevConfs),
     io:format("[sensors] ~p device(s) ready~n", [length(Devices)]),

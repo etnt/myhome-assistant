@@ -78,6 +78,11 @@ make flash-app       # Build and flash the Erlang application
 make monitor         # Open serial console
 ```
 
+## Build the XIAO nRF52840 firmware
+
+The [BUILD_SETUP](firmware/xiao_ble/BUILD_SETUP.md) describe how to build the
+`zephyr.uf2`.
+
 ## Configuration
 
 Override defaults (Mac) via environment or command line:

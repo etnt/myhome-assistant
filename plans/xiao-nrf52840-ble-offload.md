@@ -101,7 +101,7 @@ since I2C targets cannot initiate transfers.
 | SDA    | GPIO 1       | ↔   | D4 (SDA)          | Shared I2C data                    |
 | SCL    | GPIO 2       | →   | D5 (SCL)          | Shared I2C clock                   |
 | IRQ    | GPIO 4       | ←   | D3 (output)       | XIAO pulls LOW when events pending |
-| RST    | GPIO 5       | →   | RST               | Hardware reset (active LOW)        |
+| RST    | GPIO 5       | →   | D2 (input)        | Software reset trigger (active LOW)|
 
 The SparkFun sensors connect to the same SDA/SCL lines via a Qwiic-to-
 breadboard adapter cable:
@@ -495,9 +495,9 @@ on hardware. The sdkconfig patch can re-enable NimBLE if needed.
 4. **Notifications** — Keep the heartbeat poll approach. Hue BLE bulbs
    don't advertise state changes, so polling remains necessary.
 
-5. **Error recovery** — Add a dedicated reset line (ESP32 GPIO → XIAO
-   RST pin). If no PONG after 30s, the ESP32 toggles the reset GPIO
-   to hardware-reboot the XIAO.
+5. **Error recovery** — ESP32 GPIO 5 → XIAO D2. Firmware monitors D2
+   for a falling edge and calls `sys_reboot()`. If no PONG after 30s,
+   the ESP32 pulls GPIO 5 LOW to trigger a software reset on the XIAO.
 
 6. **I2C bus contention** — Keep individual transactions ≤ 64B. The ESP32
    event loop naturally interleaves sensor reads between event drains.

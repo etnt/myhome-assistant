@@ -47,10 +47,18 @@ init([]) ->
         type => supervisor
     },
 
+    BleI2CSpec = #{
+        id => myhome_ble_i2c,
+        start => {myhome_ble_i2c, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     SupFlags = #{
         strategy => rest_for_one,
         intensity => 5,
         period => 60
     },
 
-    {ok, {SupFlags, [LogSpec, BleSpec, EventBusSpec, SubSupSpec]}}.
+    {ok, {SupFlags, [LogSpec, BleSpec, EventBusSpec, BleI2CSpec, SubSupSpec]}}.

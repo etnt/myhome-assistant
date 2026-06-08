@@ -21,7 +21,7 @@ PORT ?= /dev/cu.usbmodem5B414826621
 ATOMVM_DIR := AtomVM
 ESP32_DIR := $(ATOMVM_DIR)/src/platforms/esp32
 APP_OFFSET ?= 0x250000
-IP ?= 192.168.68.64
+IP ?= 192.168.68.56
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 
@@ -154,8 +154,15 @@ help:
 	@echo "make monitor         - Open serial monitor (screen)"
 	@echo "make clean           - Remove build artifacts"
 	@echo ""
+	@echo "XIAO nRF52840:"
+	@echo "  make xiao          - Build XIAO firmware (incremental)"
+	@echo "  make xiao-clean    - Clean rebuild XIAO firmware"
+	@echo "  make xiao-pkg      - Build + create DFU package"
+	@echo "  make xiao-flash    - Build + package + flash via serial DFU"
+	@echo ""
 	@echo "Configuration:"
 	@echo "  PORT=$(PORT)"
+	@echo "  XIAO_PORT=$(XIAO_PORT)"
 	@echo "  IDF_PATH=$(IDF_PATH)"
 	@echo "  APP_OFFSET=$(APP_OFFSET)"
 
@@ -165,3 +172,45 @@ clean:
 	cd $(ESP32_DIR) 2>/dev/null && \
 		source $(IDF_PATH)/export.sh && \
 		idf.py fullclean || true
+
+##############################################################################
+# XIAO nRF52840 (Zephyr firmware)
+##############################################################################
+
+XIAO_DIR := firmware/xiao_ble
+XIAO_PORT ?= /dev/cu.usbmodem11101
+ZEPHYR_BASE ?= $(HOME)/zephyrproject/zephyr
+ZEPHYR_SDK_INSTALL_DIR ?= $(HOME)/zephyr-sdk-1.0.1
+VENV := source .venv/bin/activate
+
+.PHONY: xiao xiao-clean xiao-flash xiao-pkg
+
+## Build XIAO nRF52840 firmware
+xiao:
+	$(VENV) && \
+	export ZEPHYR_BASE=$(ZEPHYR_BASE) && \
+	export ZEPHYR_SDK_INSTALL_DIR=$(ZEPHYR_SDK_INSTALL_DIR) && \
+	cd $(XIAO_DIR) && west build -b xiao_ble .
+
+## Clean rebuild XIAO firmware
+xiao-clean:
+	rm -rf $(XIAO_DIR)/build
+	$(VENV) && \
+	export ZEPHYR_BASE=$(ZEPHYR_BASE) && \
+	export ZEPHYR_SDK_INSTALL_DIR=$(ZEPHYR_SDK_INSTALL_DIR) && \
+	cd $(XIAO_DIR) && west build -b xiao_ble .
+
+## Create DFU package for serial flashing
+xiao-pkg: xiao
+	$(VENV) && \
+	adafruit-nrfutil dfu genpkg --dev-type 0x0052 \
+		--application $(XIAO_DIR)/build/zephyr/zephyr.hex \
+		$(XIAO_DIR)/build/zephyr/dfu_package.zip
+
+## Flash XIAO via serial DFU (double-tap reset first!)
+xiao-flash: xiao-pkg
+	@echo "Make sure to double-tap the reset button on the XIAO to enter DFU mode before running this command!"
+	$(VENV) && \
+	adafruit-nrfutil dfu serial \
+		--package $(XIAO_DIR)/build/zephyr/dfu_package.zip \
+		-p $(XIAO_PORT) -b 115200
