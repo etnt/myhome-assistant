@@ -31,8 +31,10 @@
 -define(REG_EVENT_LEN,  16#11).
 
 %% Command IDs
--define(CMD_PING,  16#01).
--define(CMD_RESET, 16#FF).
+-define(CMD_PING,       16#01).
+-define(CMD_SCAN_START, 16#02).
+-define(CMD_SCAN_STOP,  16#03).
+-define(CMD_RESET,      16#FF).
 
 %% Event IDs
 -define(EVT_PONG,         16#81).
@@ -56,9 +58,11 @@
 -define(PING_INTERVAL_MS, 10000).
 
 -record(state, {
-    i2c        :: term(),
-    ready = false :: boolean(),
-    ping_timer :: reference() | undefined
+    i2c            :: term(),
+    ready = false  :: boolean(),
+    ping_timer     :: reference() | undefined,
+    scan_from      :: {pid(), term()} | undefined,
+    scan_results = [] :: list()
 }).
 
 %%====================================================================
@@ -78,8 +82,9 @@ reset() ->
 get_i2c() ->
     gen_server:call(?MODULE, get_i2c).
 
-%% Phase 2+ stubs
-scan(_Duration) -> {error, not_implemented}.
+%% Phase 2: BLE scanning
+scan(Duration) ->
+    gen_server:call(?MODULE, {scan, Duration}, 30000).
 connect(_Addr) -> {error, not_implemented}.
 disconnect(_Handle) -> {error, not_implemented}.
 bond(_Handle) -> {error, not_implemented}.
@@ -120,6 +125,15 @@ handle_call(get_i2c, _From, #state{i2c = I2C} = State) ->
 handle_call(ping, _From, State) ->
     Result = send_ping(State),
     {reply, Result, State};
+handle_call({scan, Duration}, From, #state{i2c = I2C} = State) ->
+    myhome_log:log(info, "BLE scan starting (duration=~ps)", [Duration]),
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, <<?REG_CMD, ?CMD_SCAN_START, Duration>>) of
+        ok ->
+            {noreply, State#state{scan_from = From, scan_results = []}};
+        {error, _} = Err ->
+            myhome_log:log(error, "BLE scan failed to start: ~p", [Err]),
+            {reply, Err, State}
+    end;
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -138,22 +152,15 @@ handle_info(check_ready, State) ->
     State1 = drain_events(State),
     case State1#state.ready of
         true ->
-            io:format("[ble_i2c] XIAO is ready, starting ping timer~n"),
             Timer = erlang:send_after(?PING_INTERVAL_MS, self(), do_ping),
             {noreply, State1#state{ping_timer = Timer}};
         false ->
-            io:format("[ble_i2c] XIAO not ready yet, retrying...~n"),
             erlang:send_after(1000, self(), check_ready),
             {noreply, State1}
     end;
 
 handle_info(do_ping, State) ->
-    case send_ping(State) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            io:format("[ble_i2c] PING failed: ~p~n", [Reason])
-    end,
+    send_ping(State),
     Timer = erlang:send_after(?PING_INTERVAL_MS, self(), do_ping),
     {noreply, State#state{ping_timer = Timer}};
 
@@ -177,7 +184,6 @@ send_ping(#state{i2c = I2C}) ->
     end.
 
 do_reset(#state{}) ->
-    io:format("[ble_i2c] Resetting XIAO via GPIO ~p~n", [?RST_PIN]),
     gpio:digital_write(?RST_PIN, 0),
     timer:sleep(50),
     gpio:digital_write(?RST_PIN, 1),
@@ -227,18 +233,39 @@ read_event(#state{i2c = I2C} = State, EventType, PayloadLen) ->
     end.
 
 handle_event(?EVT_READY, _Payload, State) ->
-    io:format("[ble_i2c] XIAO reports READY~n"),
     State#state{ready = true};
 
-handle_event(?EVT_PONG, <<Version, Connections>>, State) ->
-    io:format("[ble_i2c] PONG: firmware=v~p, connections=~p~n",
-              [Version, Connections]),
-    State;
-
 handle_event(?EVT_PONG, _Payload, State) ->
-    io:format("[ble_i2c] PONG received~n"),
     State;
 
-handle_event(EventType, Payload, State) ->
-    io:format("[ble_i2c] Event 0x~.16B, payload=~p~n", [EventType, Payload]),
+handle_event(?EVT_SCAN_RESULT,
+             <<Addr:6/binary, AddrType, Rssi, NameLen, Name:NameLen/binary, _/binary>>,
+             #state{scan_results = Results} = State) ->
+    Result = #{addr => Addr, addr_type => AddrType,
+               rssi => Rssi - 256,  %% unsigned to signed
+               name => trim_nulls(Name)},
+    State#state{scan_results = [Result | Results]};
+
+handle_event(?EVT_SCAN_RESULT, _Payload, State) ->
+    %% Malformed scan result, ignore
+    State;
+
+handle_event(?EVT_SCAN_DONE, _Payload,
+             #state{scan_from = From, scan_results = Results} = State) ->
+    myhome_log:log(info, "BLE scan done, ~p device(s) found", [length(Results)]),
+    case From of
+        undefined -> ok;
+        _ -> gen_server:reply(From, {ok, lists:reverse(Results)})
+    end,
+    State#state{scan_from = undefined, scan_results = []};
+
+handle_event(_EventType, _Payload, State) ->
     State.
+
+%% Strip trailing null bytes from BLE device names
+trim_nulls(<<>>) -> <<>>;
+trim_nulls(Bin) ->
+    case binary:last(Bin) of
+        0 -> trim_nulls(binary:part(Bin, 0, byte_size(Bin) - 1));
+        _ -> Bin
+    end.

@@ -66,13 +66,22 @@ init([]) ->
 
 handle_call({scan, _Duration}, _From, #state{scanning = true} = State) ->
     {reply, {error, scan_in_progress}, State};
-handle_call({scan, Duration}, From, State) ->
-    case ble:scan_start(Duration) of
-        ok ->
-            %% Don't reply yet — we'll reply when ble_scan_complete arrives
-            {noreply, State#state{scanning = true, scan_from = From, scan_map = #{}}};
+handle_call({scan, Duration}, _From, State) ->
+    State1 = State#state{scanning = true, scan_map = #{}},
+    case myhome_ble_i2c:scan(Duration) of
+        {ok, Results} ->
+            %% Convert results from myhome_ble_i2c format to scanner format
+            Deduped = dedup_scan_results(Results),
+            Timestamp = format_timestamp(),
+            State2 = State1#state{
+                results = Deduped,
+                scanning = false,
+                scan_map = #{},
+                last_scan = Timestamp
+            },
+            {reply, {ok, length(Deduped)}, State2};
         {error, Reason} ->
-            {reply, {error, Reason}, State}
+            {reply, {error, Reason}, State#state{scanning = false}}
     end;
 handle_call(get_results, _From, State) ->
     try
@@ -140,6 +149,22 @@ terminate(_Reason, _State) ->
 %%====================================================================
 %% Internal
 %%====================================================================
+
+%% Deduplicate scan results by address, keeping best RSSI and non-empty name
+dedup_scan_results(Results) ->
+    Map = lists:foldl(fun(#{addr := Addr} = Entry, Acc) ->
+        case maps:get(Addr, Acc, undefined) of
+            undefined ->
+                maps:put(Addr, Entry, Acc);
+            Existing ->
+                Name = case maps:get(name, Entry, <<>>) of
+                    <<>> -> maps:get(name, Existing, <<>>);
+                    N -> N
+                end,
+                maps:put(Addr, Existing#{rssi => maps:get(rssi, Entry), name => Name}, Acc)
+        end
+    end, #{}, Results),
+    maps:values(Map).
 
 format_results(Results) ->
     lists:map(fun(#{addr := Addr, addr_type := AddrType, rssi := RSSI, name := Name}) ->

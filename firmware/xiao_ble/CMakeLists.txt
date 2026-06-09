@@ -6,4 +6,5 @@ target_sources(app PRIVATE
     src/main.c
     src/i2c_target.c
     src/event_queue.c
+    src/ble_central.c
 )

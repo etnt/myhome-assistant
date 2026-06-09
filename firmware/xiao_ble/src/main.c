@@ -17,6 +17,7 @@
 
 #include "i2c_target.h"
 #include "event_queue.h"
+#include "ble_central.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -98,6 +99,13 @@ int main(void)
     ret = i2c_target_init();
     if (ret < 0) {
         LOG_ERR("I2C target init failed: %d", ret);
+        return ret;
+    }
+
+    /* Initialize BLE stack */
+    ret = ble_central_init();
+    if (ret < 0) {
+        LOG_ERR("BLE init failed: %d", ret);
         return ret;
     }
 

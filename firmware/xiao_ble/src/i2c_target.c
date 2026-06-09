@@ -22,6 +22,7 @@
 
 #include "i2c_target.h"
 #include "event_queue.h"
+#include "ble_central.h"
 
 LOG_MODULE_REGISTER(i2c_target, LOG_LEVEL_INF);
 
@@ -35,8 +36,17 @@ static volatile bool ping_received;    /* flag for watchdog feed */
 static uint8_t resp_buf[MAX_PAYLOAD_SIZE + 4];
 static uint32_t resp_len;
 
-/* Forward declarations */
-static void handle_command(const uint8_t *data, uint8_t len);
+/*
+ * Deferred command processing — BLE APIs require thread context,
+ * but I2C target callbacks run in ISR context (nRF TWIS DMA).
+ * We copy the command into a buffer and submit a work item.
+ */
+static uint8_t cmd_buf[MAX_PAYLOAD_SIZE];
+static uint8_t cmd_buf_len;
+static struct k_work cmd_work;
+
+static void handle_command_isr(const uint8_t *data, uint8_t len);
+static void cmd_work_handler(struct k_work *work);
 
 /*
  * Buffer-mode I2C target callbacks (required by nRF TWIS DMA driver).
@@ -58,7 +68,7 @@ static void target_buf_write_received(struct i2c_target_config *config,
 
     /* If writing to REG_CMD with payload, process command */
     if (current_reg == REG_CMD && len > 1) {
-        handle_command(&buf[1], len - 1);
+        handle_command_isr(&buf[1], len - 1);
     }
 }
 
@@ -138,9 +148,12 @@ static struct i2c_target_config target_config = {
 };
 
 /*
- * Command handler
+ * Command handling — split into ISR-safe part and deferred (thread) part.
+ *
+ * ISR-safe commands (PING, RESET): handled immediately in callback context.
+ * BLE commands (SCAN_START, etc.): deferred to system work queue (thread context).
  */
-static void handle_command(const uint8_t *data, uint8_t len)
+static void handle_command_isr(const uint8_t *data, uint8_t len)
 {
     if (len == 0) {
         return;
@@ -153,8 +166,8 @@ static void handle_command(const uint8_t *data, uint8_t len)
 
     switch (cmd_id) {
     case CMD_PING: {
-        /* Reply with PONG event: [version, active_connections] */
-        uint8_t pong_payload[2] = {FIRMWARE_VERSION, 0};  /* 0 connections in Phase 1 */
+        /* ISR-safe: just pushes to event queue */
+        uint8_t pong_payload[2] = {FIRMWARE_VERSION, 0};
         event_queue_push(EVT_PONG, pong_payload, sizeof(pong_payload));
         last_cmd_result = CMD_RESULT_OK;
         ping_received = true;
@@ -163,14 +176,60 @@ static void handle_command(const uint8_t *data, uint8_t len)
 
     case CMD_RESET:
         last_cmd_result = CMD_RESULT_OK;
-        /* Delay briefly to allow I2C transaction to complete */
         k_msleep(10);
         sys_reboot(SYS_REBOOT_COLD);
         break;
 
     default:
-        /* Phase 1: only PING and RESET are implemented */
-        LOG_WRN("Unknown command 0x%02x", cmd_id);
+        /* All other commands (BLE etc.) must run in thread context */
+        if (len <= sizeof(cmd_buf)) {
+            memcpy(cmd_buf, data, len);
+            cmd_buf_len = len;
+            k_work_submit(&cmd_work);
+            last_cmd_result = CMD_RESULT_OK;
+        } else {
+            LOG_ERR("Command too large: %u", len);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+}
+
+/**
+ * Deferred command handler — runs in system work queue (thread context).
+ * Safe to call BLE APIs here.
+ */
+static void cmd_work_handler(struct k_work *work)
+{
+    if (cmd_buf_len == 0) {
+        return;
+    }
+
+    uint8_t cmd_id = cmd_buf[0];
+
+    LOG_INF("Deferred CMD 0x%02x (len=%u)", cmd_id, cmd_buf_len);
+
+    switch (cmd_id) {
+    case CMD_SCAN_START: {
+        uint8_t duration = (cmd_buf_len > 1) ? cmd_buf[1] : 10;
+        int err = ble_central_scan_start(duration);
+        if (err != 0) {
+            LOG_ERR("Scan start failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_SCAN_STOP: {
+        int err = ble_central_scan_stop();
+        if (err != 0) {
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    default:
+        LOG_WRN("Unknown deferred command 0x%02x", cmd_id);
         last_cmd_result = CMD_RESULT_UNKNOWN;
         break;
     }
@@ -188,6 +247,9 @@ int i2c_target_init(void)
         LOG_ERR("I2C device not ready");
         return -ENODEV;
     }
+
+    /* Initialize deferred command work item */
+    k_work_init(&cmd_work, cmd_work_handler);
 
     int ret = i2c_target_register(i2c_dev, &target_config);
     if (ret < 0) {

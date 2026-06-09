@@ -18,10 +18,11 @@
 SHELL := /bin/bash
 IDF_PATH ?= $(HOME)/esp/esp-idf
 PORT ?= /dev/cu.usbmodem5B414826621
+XIAO_PORT ?= /dev/cu.usbmodem1101
 ATOMVM_DIR := AtomVM
 ESP32_DIR := $(ATOMVM_DIR)/src/platforms/esp32
 APP_OFFSET ?= 0x250000
-IP ?= 192.168.68.56
+IP ?= 192.168.68.65
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 
@@ -75,6 +76,10 @@ flash-app: app
 flash: flash-firmware flash-app
 monitor:
 	minicom -D $(PORT) -b 115200
+
+.PHONY: monitor-xiao
+monitor-xiao:
+	minicom -D $(XIAO_PORT) -b 115200
 
 .PHONY: test
 test:

@@ -33,6 +33,7 @@ init([]) ->
     myhome_log:log(info, "Connecting to WiFi (~s)...", [SSID]),
     Self = self(),
     StaConfig = [{ssid, SSID}, {psk, PSK},
+                 {dhcp_hostname, "myhome-esp32"},
                  {connected, fun() -> Self ! connected end},
                  {got_ip, fun(IpInfo) -> Self ! {ok, IpInfo} end},
                  {disconnected, fun() -> Self ! disconnected end},
