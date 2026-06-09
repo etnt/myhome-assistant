@@ -14,7 +14,7 @@
 -export([start_link/0, get_i2c/0]).
 -export([ping/0, reset/0]).
 %% Future API (Phase 2+):
--export([scan/1, connect/1, disconnect/1, bond/1]).
+-export([scan/1, connect/1, connect/2, disconnect/1, bond/1]).
 -export([gatt_read/2, gatt_write/3, gatt_write_nr/3]).
 -export([subscribe/2, get_bonds/0, delete_bonds/0]).
 
@@ -34,16 +34,21 @@
 -define(CMD_PING,       16#01).
 -define(CMD_SCAN_START, 16#02).
 -define(CMD_SCAN_STOP,  16#03).
+-define(CMD_CONNECT,    16#10).
+-define(CMD_DISCONNECT, 16#11).
+-define(CMD_BOND,       16#12).
 -define(CMD_RESET,      16#FF).
 
 %% Event IDs
--define(EVT_PONG,         16#81).
--define(EVT_READY,        16#82).
--define(EVT_SCAN_RESULT,  16#83).
--define(EVT_SCAN_DONE,    16#84).
--define(EVT_CONNECTED,    16#85).
--define(EVT_DISCONNECTED, 16#86).
--define(EVT_CMD_ERROR,    16#FE).
+-define(EVT_PONG,          16#81).
+-define(EVT_READY,         16#82).
+-define(EVT_SCAN_RESULT,   16#83).
+-define(EVT_SCAN_DONE,     16#84).
+-define(EVT_CONNECTED,     16#85).
+-define(EVT_DISCONNECTED,  16#86).
+-define(EVT_BOND_COMPLETE, 16#87).
+-define(EVT_ENC_CHANGE,    16#8C).
+-define(EVT_CMD_ERROR,     16#FE).
 
 %% GPIO pins
 -define(IRQ_PIN, 4).
@@ -62,7 +67,10 @@
     ready = false  :: boolean(),
     ping_timer     :: reference() | undefined,
     scan_from      :: {pid(), term()} | undefined,
-    scan_results = [] :: list()
+    scan_results = [] :: list(),
+    conn_waiters = #{} :: #{binary() => {pid(), term()}},  %% addr => From
+    bond_waiters = #{} :: #{non_neg_integer() => {pid(), term()}},  %% handle => From
+    connections = #{} :: #{non_neg_integer() => binary()}   %% handle => addr
 }).
 
 %%====================================================================
@@ -85,9 +93,21 @@ get_i2c() ->
 %% Phase 2: BLE scanning
 scan(Duration) ->
     gen_server:call(?MODULE, {scan, Duration}, 30000).
-connect(_Addr) -> {error, not_implemented}.
-disconnect(_Handle) -> {error, not_implemented}.
-bond(_Handle) -> {error, not_implemented}.
+
+%% Phase 3: Connection management
+connect(Addr) when byte_size(Addr) =:= 6 ->
+    connect(Addr, 1);  %% default: random address type
+connect(_) -> {error, invalid_addr}.
+
+connect(Addr, AddrType) ->
+    gen_server:call(?MODULE, {connect, Addr, AddrType}, 15000).
+
+disconnect(Handle) ->
+    gen_server:call(?MODULE, {disconnect, Handle}, 5000).
+
+bond(Handle) ->
+    gen_server:call(?MODULE, {bond, Handle}, 15000).
+
 gatt_read(_ConnH, _CharH) -> {error, not_implemented}.
 gatt_write(_ConnH, _CharH, _Data) -> {error, not_implemented}.
 gatt_write_nr(_ConnH, _CharH, _Data) -> {error, not_implemented}.
@@ -132,6 +152,34 @@ handle_call({scan, Duration}, From, #state{i2c = I2C} = State) ->
             {noreply, State#state{scan_from = From, scan_results = []}};
         {error, _} = Err ->
             myhome_log:log(error, "BLE scan failed to start: ~p", [Err]),
+            {reply, Err, State}
+    end;
+handle_call({connect, Addr, AddrType}, From, #state{i2c = I2C} = State) ->
+    myhome_log:log(info, "BLE connecting to ~s", [format_addr(Addr)]),
+    Cmd = <<?REG_CMD, ?CMD_CONNECT, Addr:6/binary, AddrType>>,
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
+        ok ->
+            Waiters = maps:put(Addr, From, State#state.conn_waiters),
+            {noreply, State#state{conn_waiters = Waiters}};
+        {error, _} = Err ->
+            {reply, Err, State}
+    end;
+handle_call({disconnect, Handle}, _From, #state{i2c = I2C} = State) ->
+    Cmd = <<?REG_CMD, ?CMD_DISCONNECT, Handle:16/little>>,
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
+        ok ->
+            {reply, ok, State};
+        {error, _} = Err ->
+            {reply, Err, State}
+    end;
+handle_call({bond, Handle}, From, #state{i2c = I2C} = State) ->
+    myhome_log:log(info, "BLE bonding handle ~p", [Handle]),
+    Cmd = <<?REG_CMD, ?CMD_BOND, Handle:16/little>>,
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
+        ok ->
+            Waiters = maps:put(Handle, From, State#state.bond_waiters),
+            {noreply, State#state{bond_waiters = Waiters}};
+        {error, _} = Err ->
             {reply, Err, State}
     end;
 handle_call(_Req, _From, State) ->
@@ -259,6 +307,59 @@ handle_event(?EVT_SCAN_DONE, _Payload,
     end,
     State#state{scan_from = undefined, scan_results = []};
 
+handle_event(?EVT_CONNECTED, <<Handle:16/little, Addr:6/binary>>,
+             #state{conn_waiters = Waiters, connections = Conns} = State) ->
+    myhome_log:log(info, "BLE connected [~p] to ~s", [Handle, format_addr(Addr)]),
+    State1 = State#state{
+        connections = maps:put(Handle, Addr, Conns)
+    },
+    case maps:get(Addr, Waiters, undefined) of
+        undefined -> State1;
+        From ->
+            gen_server:reply(From, {ok, Handle}),
+            State1#state{conn_waiters = maps:remove(Addr, Waiters)}
+    end;
+
+handle_event(?EVT_DISCONNECTED, <<Handle:16/little, Reason>>,
+             #state{connections = Conns} = State) ->
+    Addr = maps:get(Handle, Conns, <<>>),
+    myhome_log:log(info, "BLE disconnected [~p] (~s): reason=0x~.16B",
+                   [Handle, format_addr(Addr), Reason]),
+    myhome_event_bus:publish({ble_disconnected, Handle, Reason}),
+    State#state{connections = maps:remove(Handle, Conns)};
+
+handle_event(?EVT_BOND_COMPLETE, <<Handle:16/little, Status>>,
+             #state{bond_waiters = Waiters} = State) ->
+    case Status of
+        0 -> myhome_log:log(info, "BLE bonding complete [~p]", [Handle]);
+        _ -> myhome_log:log(error, "BLE bonding failed [~p]: status=~p", [Handle, Status])
+    end,
+    case maps:get(Handle, Waiters, undefined) of
+        undefined -> State;
+        From ->
+            Reply = case Status of
+                0 -> ok;
+                _ -> {error, {bond_failed, Status}}
+            end,
+            gen_server:reply(From, Reply),
+            State#state{bond_waiters = maps:remove(Handle, Waiters)}
+    end;
+
+handle_event(?EVT_ENC_CHANGE, <<Handle:16/little, Status>>, State) ->
+    case Status of
+        0 -> myhome_log:log(info, "BLE encryption established [~p]", [Handle]);
+        _ -> myhome_log:log(warning, "BLE encryption failed [~p]: status=~p", [Handle, Status])
+    end,
+    State;
+
+handle_event(?EVT_CMD_ERROR, <<_Seq, ErrorCode>>, #state{conn_waiters = CW} = State) ->
+    myhome_log:log(error, "XIAO command error: code=~p", [ErrorCode]),
+    %% Fail any pending connect waiters
+    maps:foreach(fun(_Addr, From) ->
+        gen_server:reply(From, {error, {cmd_error, ErrorCode}})
+    end, CW),
+    State#state{conn_waiters = #{}};
+
 handle_event(_EventType, _Payload, State) ->
     State.
 
@@ -269,3 +370,14 @@ trim_nulls(Bin) ->
         0 -> trim_nulls(binary:part(Bin, 0, byte_size(Bin) - 1));
         _ -> Bin
     end.
+
+%% Format 6-byte BLE address as "XX:XX:XX:XX:XX:XX"
+format_addr(<<A, B, C, D, E, F>>) ->
+    iolist_to_binary(lists:join(":", [byte_to_hex(X) || X <- [F, E, D, C, B, A]]));
+format_addr(_) -> <<"??:??:??:??:??:??">>.
+
+byte_to_hex(B) ->
+    [hex_char(B bsr 4), hex_char(B band 16#0F)].
+
+hex_char(N) when N < 10 -> N + $0;
+hex_char(N) -> N - 10 + $A.

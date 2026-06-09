@@ -167,7 +167,7 @@ static void handle_command_isr(const uint8_t *data, uint8_t len)
     switch (cmd_id) {
     case CMD_PING: {
         /* ISR-safe: just pushes to event queue */
-        uint8_t pong_payload[2] = {FIRMWARE_VERSION, 0};
+        uint8_t pong_payload[2] = {FIRMWARE_VERSION, ble_central_connection_count()};
         event_queue_push(EVT_PONG, pong_payload, sizeof(pong_payload));
         last_cmd_result = CMD_RESULT_OK;
         ping_received = true;
@@ -223,6 +223,53 @@ static void cmd_work_handler(struct k_work *work)
     case CMD_SCAN_STOP: {
         int err = ble_central_scan_stop();
         if (err != 0) {
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_CONNECT: {
+        /* Payload: [addr 6B, addr_type 1B] */
+        if (cmd_buf_len < 8) {
+            LOG_ERR("CONNECT: payload too short (%u)", cmd_buf_len);
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        int err = ble_central_connect(&cmd_buf[1], cmd_buf[7]);
+        if (err != 0) {
+            LOG_ERR("Connect failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_DISCONNECT: {
+        /* Payload: [handle_lo, handle_hi] */
+        if (cmd_buf_len < 3) {
+            LOG_ERR("DISCONNECT: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t handle = cmd_buf[1] | (cmd_buf[2] << 8);
+        int err = ble_central_disconnect(handle);
+        if (err != 0) {
+            LOG_ERR("Disconnect failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_BOND: {
+        /* Payload: [handle_lo, handle_hi] */
+        if (cmd_buf_len < 3) {
+            LOG_ERR("BOND: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t handle = cmd_buf[1] | (cmd_buf[2] << 8);
+        int err = ble_central_bond(handle);
+        if (err != 0) {
+            LOG_ERR("Bond failed: %d", err);
             last_cmd_result = CMD_RESULT_ERROR;
         }
         break;

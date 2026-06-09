@@ -442,9 +442,9 @@ do_handle(post, [<<"connect">>], HttpRequest) ->
                         {ok, T} when T >= 0, T =< 3 -> T;
                         _ -> 1  %% default: random static
                     end,
-                    case myhome_ble_conn:connect(Addr, AddrType) of
-                        ok ->
-                            json_reply(#{status => ok, message => <<"connecting">>});
+                    case myhome_ble_i2c:connect(Addr, AddrType) of
+                        {ok, Handle} ->
+                            json_reply(#{status => ok, handle => Handle});
                         {error, Reason} ->
                             json_reply(#{status => error, reason => to_bin(Reason)})
                     end;
@@ -459,7 +459,7 @@ do_handle(post, [<<"disconnect">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"handle">>) of
         {ok, Handle} ->
-            case myhome_ble_conn:disconnect(Handle) of
+            case myhome_ble_i2c:disconnect(Handle) of
                 ok ->
                     json_reply(#{status => ok});
                 {error, Reason} ->
@@ -469,13 +469,13 @@ do_handle(post, [<<"disconnect">>], HttpRequest) ->
             {400, #{}, <<"Bad Request">>}
     end;
 
-do_handle(post, [<<"security">>], HttpRequest) ->
+do_handle(post, [<<"bond">>], HttpRequest) ->
     #{body := Body} = HttpRequest,
     case parse_json_int(Body, <<"handle">>) of
         {ok, Handle} ->
-            case myhome_ble_conn:security(Handle) of
+            case myhome_ble_i2c:bond(Handle) of
                 ok ->
-                    json_reply(#{status => ok, message => <<"security initiated">>});
+                    json_reply(#{status => ok, message => <<"bonded">>});
                 {error, Reason} ->
                     json_reply(#{status => error, reason => to_bin(Reason)})
             end;
@@ -610,19 +610,19 @@ parse_json_string(Body, Key) ->
 
 %% Convert "AA:BB:CC:DD:EE:FF" or "AABBCCDDEEFF" to 6-byte binary
 hex_to_addr(Hex) when byte_size(Hex) =:= 17 ->
-    %% AA:BB:CC:DD:EE:FF format
+    %% AA:BB:CC:DD:EE:FF format → BLE little-endian byte order
     try
         Bytes = [binary_to_integer(binary:part(Hex, I, 2), 16)
                  || I <- [0, 3, 6, 9, 12, 15]],
-        {ok, list_to_binary(Bytes)}
+        {ok, list_to_binary(lists:reverse(Bytes))}
     catch _:_ -> error
     end;
 hex_to_addr(Hex) when byte_size(Hex) =:= 12 ->
-    %% AABBCCDDEEFF format
+    %% AABBCCDDEEFF format → BLE little-endian byte order
     try
         Bytes = [binary_to_integer(binary:part(Hex, I, 2), 16)
                  || I <- [0, 2, 4, 6, 8, 10]],
-        {ok, list_to_binary(Bytes)}
+        {ok, list_to_binary(lists:reverse(Bytes))}
     catch _:_ -> error
     end;
 hex_to_addr(_) -> error.
