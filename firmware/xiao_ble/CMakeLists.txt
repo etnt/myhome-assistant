@@ -7,4 +7,5 @@ target_sources(app PRIVATE
     src/i2c_target.c
     src/event_queue.c
     src/ble_central.c
+    src/gatt_client.c
 )

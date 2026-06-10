@@ -23,14 +23,6 @@ init([]) ->
         type => worker
     },
 
-    BleSpec = #{
-        id => ble,
-        start => {ble, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker
-    },
-
     EventBusSpec = #{
         id => myhome_event_bus,
         start => {myhome_event_bus, start_link, []},
@@ -61,4 +53,4 @@ init([]) ->
         period => 60
     },
 
-    {ok, {SupFlags, [LogSpec, BleSpec, EventBusSpec, BleI2CSpec, SubSupSpec]}}.
+    {ok, {SupFlags, [LogSpec, EventBusSpec, BleI2CSpec, SubSupSpec]}}.

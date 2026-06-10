@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 /* Maximum events in the FIFO queue */
-#define EVENT_QUEUE_SIZE 16
+#define EVENT_QUEUE_SIZE 32
 
 /* Maximum event payload size */
 #define EVENT_MAX_PAYLOAD 60

@@ -416,44 +416,44 @@ longer needed — nRF52840 manages connections internally).
 
 **Goal:** Verify bidirectional I2C communication with IRQ signalling.
 
-- [ ] Set up Zephyr dev environment (`west init`)
-- [ ] Create `nifs/xiao_ble/` project with I2C target echo
-- [ ] Implement register-based protocol (XIAO as target at 0x08)
-- [ ] Implement IRQ pin toggling (XIAO D3 → ESP32 GPIO 4)
-- [ ] ESP32-S3: `myhome_ble_i2c.erl` with PING/PONG
-- [ ] Flash XIAO, verify register reads on logic analyzer
-- [ ] Confirm sensors still respond on shared bus (0x76, 0x10)
-- [ ] Watchdog: nRF52840 reboots if no PING in 30s
+- [x] Set up Zephyr dev environment (`west init`)
+- [x] Create `firmware/xiao_ble/` project with I2C target echo
+- [x] Implement register-based protocol (XIAO as target at 0x08)
+- [x] Implement IRQ pin toggling (XIAO D3 → ESP32 GPIO 4)
+- [x] ESP32-S3: `myhome_ble_i2c.erl` with PING/PONG
+- [x] Flash XIAO, verify register reads on logic analyzer
+- [x] Confirm sensors still respond on shared bus (0x76, 0x10)
+- [x] Watchdog: nRF52840 reboots if no PING in 30s
 
 ### Phase 2: BLE Scan (1 day)
 
 **Goal:** Trigger scan from ESP32-S3, receive results via I2C events.
 
-- [ ] nRF52840: implement SCAN_START/SCAN_STOP + queue SCAN_RESULT events
-- [ ] ESP32-S3: `myhome_ble_i2c:scan(Duration)` → drain event queue on IRQ
-- [ ] Wire into `myhome_scanner.erl` (replace `ble:start_scan`)
-- [ ] Verify via HTTP: `POST /api/scan` returns results from nRF52840
+- [x] nRF52840: implement SCAN_START/SCAN_STOP + queue SCAN_RESULT events
+- [x] ESP32-S3: `myhome_ble_i2c:scan(Duration)` → drain event queue on IRQ
+- [x] Wire into `myhome_scanner.erl` (replace `ble:start_scan`)
+- [x] Verify via HTTP: `POST /api/scan` returns results from nRF52840
 
 ### Phase 3: Connect + Bond (2-3 days)
 
 **Goal:** Connect to Hue bulbs and establish encrypted link.
 
-- [ ] nRF52840: CONNECT command → `bt_conn_le_create()`
-- [ ] nRF52840: BOND command → `bt_conn_set_security(BT_SECURITY_L3)`
-- [ ] nRF52840: queue CONNECTED, BOND_COMPLETE, ENC_CHANGE events + IRQ
-- [ ] nRF52840: store bonds in flash (Zephyr settings subsystem)
-- [ ] ESP32-S3: `myhome_ble_i2c:connect/1`, `bond/1` APIs
-- [ ] Test: connect + bond with a Hue bulb, verify enc_change success
+- [x] nRF52840: CONNECT command → `bt_conn_le_create()`
+- [x] nRF52840: BOND command → `bt_conn_set_security(BT_SECURITY_L3)`
+- [x] nRF52840: queue CONNECTED, BOND_COMPLETE, ENC_CHANGE events + IRQ
+- [x] nRF52840: store bonds in flash (Zephyr settings subsystem)
+- [x] ESP32-S3: `myhome_ble_i2c:connect/1`, `bond/1` APIs
+- [x] Test: connect + bond with a Hue bulb, verify enc_change success
 
 ### Phase 4: GATT Operations (2 days)
 
 **Goal:** Read/write Hue characteristics through the I2C bridge.
 
-- [ ] nRF52840: GATT_DISCOVER → enumerate services/chars, queue results
-- [ ] nRF52840: GATT_READ/GATT_WRITE → proxy to connected device
-- [ ] ESP32-S3: `gatt_read/2`, `gatt_write/3` via REG_CMD + event drain
-- [ ] Wire into `myhome_hue_ble.erl` — replace direct BLE calls
-- [ ] Test: power on/off, brightness, color_temp via nRF52840 bridge
+- [x] nRF52840: GATT_DISCOVER → enumerate services/chars, queue results
+- [x] nRF52840: GATT_READ/GATT_WRITE → proxy to connected device
+- [x] ESP32-S3: `gatt_read/2`, `gatt_write/3` via REG_CMD + event drain
+- [x] Wire into `myhome_hue_ble.erl` — replace direct BLE calls
+- [x] Test: power on/off, brightness, color_temp via nRF52840 bridge
 
 ### Phase 5: Persistent Connections + Cleanup (1-2 days)
 
@@ -461,8 +461,8 @@ longer needed — nRF52840 manages connections internally).
 
 - [ ] nRF52840: auto-reconnect bonded devices on boot
 - [ ] Remove connect-on-demand logic from `myhome_hue_ble.erl`
-- [ ] Remove `ble.erl`, `myhome_ble_conn.erl`, `nifs/ble/`
-- [ ] Remove NimBLE from ESP32-S3 sdkconfig patch
+- [ ] Remove `ble.erl`, `nifs/ble/` (kept for rollback); `myhome_ble_conn.erl` removed
+- [x] Remove NimBLE from ESP32-S3 sdkconfig patch
 - [ ] Remove cooldown/retry logic (no longer needed)
 - [ ] Verify: WiFi never drops, heartbeat always succeeds
 

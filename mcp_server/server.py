@@ -9,7 +9,7 @@ import os
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-DEVICE_URL = os.environ.get("MYHOME_DEVICE_URL", "http://192.168.68.64:8080")
+DEVICE_URL = os.environ.get("MYHOME_DEVICE_URL", "http://192.168.68.65:8080")
 
 mcp = FastMCP("MyHome Assistant")
 
@@ -54,7 +54,7 @@ def get_logs(level: str = "info", limit: int = 50) -> dict:
     return r.json()
 
 
-# --- BLE Scanning & Connections ---
+# --- BLE Scanning ---
 
 
 @mcp.tool()
@@ -77,12 +77,6 @@ def trigger_scan(duration: int = 10) -> dict:
 def discover_bulbs() -> dict:
     """Run bulb discovery and pairing. Finds new Hue bulbs via BLE."""
     return _api("POST", "discover")
-
-
-@mcp.tool()
-def get_connections() -> dict:
-    """List active BLE connections to bulbs."""
-    return _api("GET", "connections")
 
 
 # --- Bulb Control ---

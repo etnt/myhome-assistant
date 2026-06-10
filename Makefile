@@ -38,12 +38,16 @@ install-esptool: .venv
 $(ATOMVM_DIR):
 	git clone --depth 1 git@github.com:etnt/AtomVM.git
 
-$(ESP32_DIR)/build/atomvm-esp32s3.img: $(ATOMVM_DIR) nifs/ble/ble_port.c patches/sdkconfig.defaults.in.patch
-	@if [ ! -L $(ESP32_DIR)/components/ble_port ]; then \
-		ln -s $$(pwd)/nifs/ble $(ESP32_DIR)/components/ble_port; \
+$(ESP32_DIR)/build/atomvm-esp32s3.img: $(ATOMVM_DIR) patches/sdkconfig.defaults.in.patch
+	@if [ -L $(ESP32_DIR)/components/ble_port ]; then \
+		rm $(ESP32_DIR)/components/ble_port; \
 	fi
-	@if ! grep -q "BT_NIMBLE_ENABLED" $(ESP32_DIR)/sdkconfig.defaults.in 2>/dev/null; then \
-		cd $(ATOMVM_DIR) && git apply ../patches/sdkconfig.defaults.in.patch; \
+	@if ! grep -q "CONFIG_SPIRAM=y" $(ESP32_DIR)/sdkconfig.defaults.in 2>/dev/null; then \
+		cd $(ATOMVM_DIR) && git checkout -- src/platforms/esp32/sdkconfig.defaults.in && \
+		git apply ../patches/sdkconfig.defaults.in.patch; \
+	fi
+	@if [ ! -f $(ESP32_DIR)/build/CMakeCache.txt ]; then \
+		rm -rf $(ESP32_DIR)/build; \
 	fi
 	cd $(ESP32_DIR) && \
 		source $(IDF_PATH)/export.sh && \
@@ -71,6 +75,7 @@ app:
 flash-app: app
 	source $(IDF_PATH)/export.sh && \
 	rebar3 atomvm esp32_flash --port $(PORT) --offset $(APP_OFFSET)
+	@echo ">>> Press RESET on the ESP32 to start the new app <<<"
 
 ## Build and flash everything (firmware + app)
 flash: flash-firmware flash-app
@@ -96,6 +101,10 @@ logs:
 status:
 	@curl -s http://$(IP):8080/api/status | jq
 
+.PHONY: ppstatus
+ppstatus:
+	@curl -s http://$(IP):8080/api/status | jq -r '.bulbs[] | "\(.name) (\(.display_name)): power=\(.power) brightness=\(.brightness) color_temp=\(.color_temp) connected=\(.connected)"'
+
 scan:
 	@curl -s http://$(IP):8080/api/scan?named=true
 
@@ -108,17 +117,17 @@ ppscan:
 discover:
 	@curl -s -X POST http://$(IP):8080/api/discover
 
-state: state1 state2
+state: state1 state2 state3
 
 state%:
 	@curl -s http://$(IP):8080/api/bulb/$*/state | jq -r '"Bulb $*: power=\(.power) brightness=\(.brightness) color_temp=\(.color_temp) status=\(.status)"'
 
-on: on1 on2
+on: on1 on2 on3
 
 on%:
 	@curl -s -X POST http://$(IP):8080/api/bulb/$*/power -d '{"on":true}'
 
-off: off1 off2
+off: off1 off2 off3
 
 off%:
 	@curl -s -X POST http://$(IP):8080/api/bulb/$*/power -d '{"on":false}'

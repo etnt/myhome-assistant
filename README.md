@@ -17,6 +17,11 @@ cd viz && python3 -m http.server 3000
 # open http://localhost:3000
 ```
 
+> **Note:** This project started with just an ESP32-S3 but then expanded to
+> an architectore which also make use of the XIAO-nRF52849 Bluetooth module.
+> The first approach can be found in the branch: **esp32-s3-only** and the
+> latter (current) approach exists in the **main** branch.
+
 ## Hardware
 
 - ESP32-S3 development board
@@ -35,7 +40,6 @@ ESP32-S3 (AtomVM/Erlang)
   │     ├── myhome_event_bus (pub/sub for BLE events)
   │     └── myhome_sup (one_for_one)
   │           ├── myhome_scanner (subscribes to scan events)
-  │           ├── myhome_ble_conn (connection state machine)
   │           ├── myhome_http (WiFi + tiny_httpd)
   │           ├── myhome_http_handler (request routing + tiny_json)
   │           ├── myhome_discovery (pairing + bulb startup)
@@ -138,14 +142,16 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | POST   | `/api/discover`            | —                       | Scan, pair, and register new Hue bulbs |
 | POST   | `/api/reset`               | —                       | Factory reset (clear NVS + reboot) |
 | GET    | `/api/logs`                | —                       | System logs (params: `level`, `limit`) |
-| GET    | `/api/connections`         | —                       | List active BLE connections |
+| GET    | `/api/sensors`             | —                       | Current readings from all sensors |
+| GET    | `/api/sensors/{type}`      | —                       | Readings for a single sensor type |
 | GET    | `/api/bulb/{n}/state`      | —                       | Cached bulb state (no BLE, instant) |
-| POST   | `/api/bulb/{n}/refresh`.   | —                       | Live BLE GATT read (connects on-demand) |
+| POST   | `/api/bulb/{n}/refresh`    | —                       | Live BLE GATT read (connects on-demand) |
 | POST   | `/api/bulb/{n}/power`      | `{"on":true}`           | Turn bulb on/off |
 | POST   | `/api/bulb/{n}/brightness` | `{"value":200}`         | Set brightness (1–254) |
 | POST   | `/api/bulb/{n}/color_temp` | `{"value":370}`         | Set color temp (153–500 mirek) |
 | POST   | `/api/bulb/{n}/color_xy`   | `{"x":30146,"y":26869}` | Set CIE 1931 XY color |
 | POST   | `/api/bulb/{n}/state`      | `{"power":true,...}`    | Set multiple properties at once |
+| POST   | `/api/bulb/{n}/name`       | `{"name":"Kitchen"}`    | Set a bulb's display name (stored in NVS) |
 | DELETE | `/api/bulb/{n}`            | —                       | Remove bulb from NVS and stop process |
 | GET    | `/api/nvs/dump`            | —                       | Dump all bulb NVS config (addr + name) |
 | POST   | `/api/nvs/restore`         | `{"bulb_1_addr":"AA:B...` | Restore bulb config to NVS |
@@ -155,6 +161,21 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | GET    | `/api/events`              | —                       | Long-poll for real-time events (30s timeout) |
 | POST   | `/api/reconnect`           | —                       | Clear connect cooldown on all bulbs |
 | POST   | `/api/bulb/{n}/reconnect`  | —                       | Clear connect cooldown on a single bulb |
+
+#### Low-level BLE debug endpoints
+
+These operate directly on the XIAO BLE bridge by address/handle and are
+intended for debugging the connection/GATT layer.
+
+| Method | Endpoint              | Body                                   | Description                   |
+|--------|-----------------------|----------------------------------------|-------------------------------|
+| POST   | `/api/connect`        | `{"addr":"AA:BB:...","addr_type":1}`   | Connect to a device by address (`addr_type` 0–3, default 1) |
+| POST   | `/api/disconnect`     | `{"handle":1}`                         | Disconnect a connection handle |
+| POST   | `/api/bond`           | `{"handle":1}`                         | Initiate bonding/encryption on a handle |
+| POST   | `/api/gatt/discover`  | `{"handle":1}`                         | Discover GATT characteristics |
+| POST   | `/api/gatt/read`      | `{"handle":1,"attr":12}`               | Read a GATT characteristic |
+| POST   | `/api/gatt/write`     | `{"handle":1,"attr":12,"data":"01a0"}` | Write a GATT characteristic, hex data (with response) |
+| POST   | `/api/gatt/write_nr`  | `{"handle":1,"attr":12,"data":"01a0"}` | Write a GATT characteristic, hex data (no response) |
 
 ### Examples
 
@@ -381,7 +402,6 @@ variable (defaults to `http://192.168.1.115:8080`).
 | `get_scan_results` | Last BLE scan results |
 | `trigger_scan` | Start a new BLE scan |
 | `discover_bulbs` | Run bulb discovery/pairing |
-| `get_connections` | Active BLE connections |
 | `get_bulb_state` | Cached bulb state |
 | `refresh_bulb_state` | Live BLE GATT read |
 | `set_bulb_power` | Turn bulb on/off |
@@ -483,7 +503,6 @@ access point or reduce the idle disconnect timeout.
 │   ├── myhome_event_bus.erl  Pub/sub event bus for BLE events
 │   ├── myhome_sup.erl        Secondary supervisor (one_for_one)
 │   ├── myhome_scanner.erl    On-demand BLE device scanner
-│   ├── myhome_ble_conn.erl   Connection state machine + sync connect
 │   ├── myhome_http.erl       WiFi connection + HTTP listener
 │   ├── myhome_http_handler.erl  HTTP API request routing
 │   ├── myhome_discovery.erl  BLE pairing + dynamic bulb startup

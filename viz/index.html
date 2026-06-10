@@ -98,12 +98,22 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
 .btn-secondary { background: var(--card); color: var(--text); }
 .btn-success { background: var(--success); color: #1a1a2e; }
 
-/* Grid layout — 2x2 on desktop */
+/* Grid layout — two independent columns on desktop */
 .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  grid-template-rows: auto auto;
+  align-items: start;
   gap: 1.5rem;
+}
+
+/* Each column packs its cards independently (so the right column's
+   Policies card sits directly under Sensors, not below the taller
+   left column's Lamps card). */
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  min-width: 0;
 }
 
 /* Cards */
@@ -159,6 +169,25 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
 .bulb-name {
   font-size: 1.1rem;
   font-weight: 600;
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+}
+
+.bulb-name:hover {
+  border-bottom-color: var(--text-dim);
+}
+
+.bulb-name-input {
+  font-size: 1.1rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  width: 10rem;
+  max-width: 100%;
 }
 
 .bulb-status {
@@ -442,37 +471,41 @@ input[type="range"]::-webkit-slider-thumb:hover {
 <div class="header">
   <span class="logo">MyHome Assistant</span>
   <div class="connection">
-    <input type="text" id="hostInput" placeholder="IP:Port" value="192.168.68.64:8080">
+    <input type="text" id="hostInput" placeholder="IP:Port" value="192.168.68.65:8080">
     <div class="dot" id="connDot"></div>
     <button class="btn btn-secondary" onclick="checkStatus()">Connect</button>
   </div>
 </div>
 
 <div class="grid">
-  <!-- Row 1: Bulbs + Sensors -->
-  <div id="bulbContainer"></div>
+  <!-- Left column: Lamps + System -->
+  <div class="col">
+    <div id="bulbContainer" class="col"></div>
 
-  <div id="sensorContainer"></div>
-
-  <!-- Row 2: System + Policies -->
-  <div class="card">
-    <h2>🖥 System</h2>
-    <div class="system-actions">
-      <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
-      <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
-      <button class="btn btn-secondary" onclick="doScan()">Scan</button>
-      <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
-      <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
-    </div>
-    <div class="log-area" id="logArea">
-      <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
+    <div class="card">
+      <h2>🖥 System</h2>
+      <div class="system-actions">
+        <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
+        <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
+        <button class="btn btn-secondary" onclick="doScan()">Scan</button>
+        <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
+        <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+      </div>
+      <div class="log-area" id="logArea">
+        <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
+      </div>
     </div>
   </div>
 
-  <div class="card" id="policiesCard">
-    <h2>⚡ Automation Policies</h2>
-    <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
-      <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+  <!-- Right column: Sensors + Policies -->
+  <div class="col">
+    <div id="sensorContainer" class="col"></div>
+
+    <div class="card" id="policiesCard">
+      <h2>⚡ Automation Policies</h2>
+      <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
+        <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -523,7 +556,8 @@ async function checkStatus() {
     if (data.bulbs && data.bulbs.length) {
       data.bulbs.forEach(b => {
         const pwr = b.power ? 'ON' : 'OFF';
-        appendLog('info', `${b.name}: ${pwr}  bri=${b.brightness}  ct=${b.color_temp}`);
+        const label = b.display_name || b.name;
+        appendLog('info', `${label}: ${pwr}  bri=${b.brightness}  ct=${b.color_temp}`);
       });
     } else {
       appendLog('info', 'No bulbs registered');
@@ -575,19 +609,21 @@ const bulbs = {};
 const NUM_BULBS = 4; // Check up to 4 bulbs
 
 async function refreshBulbs() {
-  for (let i = 1; i <= NUM_BULBS; i++) {
-    const data = await api('GET', `/api/bulb/${i}/state`);
-    if (data && data.status === 'ok') {
-      bulbs[i] = data;
-      renderBulb(i, data);
-    } else if (data && data.status === 'error') {
-      // Bulb unreachable — keep card but show as offline
-      if (bulbs[i]) {
-        bulbs[i] = { ...bulbs[i], power: undefined };
-        renderBulb(i, bulbs[i]);
-      }
-    }
+  const data = await api('GET', '/api/status');
+  if (data && data.bulbs) {
+    data.bulbs.forEach(b => {
+      const id = bulbIdFromName(b.name);
+      if (id == null) return;
+      bulbs[id] = { ...bulbs[id], ...b };
+      renderBulb(id, bulbs[id]);
+    });
   }
+}
+
+// Extract numeric id from a bulb name like "bulb_2" -> 2
+function bulbIdFromName(name) {
+  const m = /^bulb_(\d+)$/.exec(String(name || ''));
+  return m ? parseInt(m[1], 10) : null;
 }
 
 async function doRefresh() {
@@ -595,8 +631,8 @@ async function doRefresh() {
   for (let i = 1; i <= NUM_BULBS; i++) {
     const data = await api('POST', `/api/bulb/${i}/refresh`);
     if (data && data.status === 'ok') {
-      bulbs[i] = data;
-      renderBulb(i, data);
+      bulbs[i] = { ...bulbs[i], ...data };
+      renderBulb(i, bulbs[i]);
       appendLog('info', `Bulb ${i}: power=${data.power} bri=${data.brightness} ct=${data.color_temp}`);
     } else if (data && data.status === 'error') {
       if (data.reason === 'process not running') break; // no more bulbs
@@ -617,10 +653,12 @@ function renderBulb(id, state) {
   const isOn = state.power === true;
   const bri = state.brightness != null ? state.brightness : 128;
   const ct = state.color_temp != null ? state.color_temp : 370;
+  const label = state.display_name || `Bulb ${id}`;
 
   card.innerHTML = `
     <div class="bulb-header">
-      <span class="bulb-name">Bulb ${id}</span>
+      <span class="bulb-name" id="bulb-name-${id}" title="Click to rename"
+        onclick="startRename(${id})">${escapeHtml(label)}</span>
       <span class="bulb-status ${isOn ? 'on' : ''}">${isOn ? 'ON' : 'OFF'}</span>
     </div>
     <div style="display:flex;align-items:center;gap:1rem;">
@@ -701,6 +739,50 @@ async function setColorTemp(id, value) {
     bulbs[id] = { ...bulbs[id], color_temp: value };
   } else {
     toast(`Color temp failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+// --- Bulb rename ---
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function startRename(id) {
+  const span = document.getElementById(`bulb-name-${id}`);
+  if (!span || span.querySelector('input')) return;
+  const current = bulbs[id] && bulbs[id].display_name ? bulbs[id].display_name : `Bulb ${id}`;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = current;
+  input.className = 'bulb-name-input';
+  input.onclick = e => e.stopPropagation();
+  input.onkeydown = e => {
+    if (e.key === 'Enter') input.blur();
+    else if (e.key === 'Escape') { input.dataset.cancel = '1'; input.blur(); }
+  };
+  input.onblur = () => {
+    if (input.dataset.cancel) { renderBulb(id, bulbs[id] || {}); return; }
+    const name = input.value.trim();
+    if (name && name !== current) renameBulb(id, name);
+    else renderBulb(id, bulbs[id] || {});
+  };
+  span.textContent = '';
+  span.appendChild(input);
+  input.focus();
+  input.select();
+}
+
+async function renameBulb(id, name) {
+  const data = await api('POST', `/api/bulb/${id}/name`, { name });
+  if (data && data.status === 'ok') {
+    bulbs[id] = { ...bulbs[id], display_name: name };
+    renderBulb(id, bulbs[id]);
+    toast(`Renamed bulb ${id} to "${name}"`);
+  } else {
+    toast(`Rename failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+    renderBulb(id, bulbs[id] || {});
   }
 }
 

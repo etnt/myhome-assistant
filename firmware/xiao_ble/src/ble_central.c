@@ -434,3 +434,17 @@ uint8_t ble_central_connection_count(void)
 {
     return conn_count;
 }
+
+struct bt_conn *ble_central_get_conn(uint16_t conn_handle)
+{
+    if (conn_handle >= MAX_CONNECTIONS) {
+        return NULL;
+    }
+    return connections[conn_handle].conn;
+}
+
+uint16_t ble_central_conn_to_handle(struct bt_conn *conn)
+{
+    struct conn_entry *entry = find_conn_entry(conn);
+    return entry ? entry->handle : 0xFFFF;
+}

@@ -23,6 +23,7 @@
 #include "i2c_target.h"
 #include "event_queue.h"
 #include "ble_central.h"
+#include "gatt_client.h"
 
 LOG_MODULE_REGISTER(i2c_target, LOG_LEVEL_INF);
 
@@ -270,6 +271,93 @@ static void cmd_work_handler(struct k_work *work)
         int err = ble_central_bond(handle);
         if (err != 0) {
             LOG_ERR("Bond failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_GATT_DISCOVER: {
+        /* Payload: [handle_lo, handle_hi] */
+        if (cmd_buf_len < 3) {
+            LOG_ERR("GATT_DISCOVER: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t handle = cmd_buf[1] | (cmd_buf[2] << 8);
+        int err = gatt_client_discover(handle);
+        if (err != 0) {
+            LOG_ERR("GATT discover failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_GATT_READ: {
+        /* Payload: [conn_handle_lo, conn_handle_hi, attr_handle_lo, attr_handle_hi] */
+        if (cmd_buf_len < 5) {
+            LOG_ERR("GATT_READ: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t conn_h = cmd_buf[1] | (cmd_buf[2] << 8);
+        uint16_t attr_h = cmd_buf[3] | (cmd_buf[4] << 8);
+        int err = gatt_client_read(conn_h, attr_h);
+        if (err != 0) {
+            LOG_ERR("GATT read failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_GATT_WRITE: {
+        /* Payload: [conn_handle:2, attr_handle:2, data...] */
+        if (cmd_buf_len < 5) {
+            LOG_ERR("GATT_WRITE: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t conn_h = cmd_buf[1] | (cmd_buf[2] << 8);
+        uint16_t attr_h = cmd_buf[3] | (cmd_buf[4] << 8);
+        uint16_t data_len = cmd_buf_len - 5;
+        int err = gatt_client_write(conn_h, attr_h, &cmd_buf[5], data_len);
+        if (err != 0) {
+            LOG_ERR("GATT write failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_GATT_WRITE_NR: {
+        /* Payload: [conn_handle:2, attr_handle:2, data...] */
+        if (cmd_buf_len < 5) {
+            LOG_ERR("GATT_WRITE_NR: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t conn_h = cmd_buf[1] | (cmd_buf[2] << 8);
+        uint16_t attr_h = cmd_buf[3] | (cmd_buf[4] << 8);
+        uint16_t data_len = cmd_buf_len - 5;
+        int err = gatt_client_write_nr(conn_h, attr_h, &cmd_buf[5], data_len);
+        if (err != 0) {
+            LOG_ERR("GATT write NR failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_SUBSCRIBE: {
+        /* Payload: [conn_handle:2, attr_handle:2, type:1] */
+        if (cmd_buf_len < 6) {
+            LOG_ERR("SUBSCRIBE: payload too short");
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        uint16_t conn_h = cmd_buf[1] | (cmd_buf[2] << 8);
+        uint16_t attr_h = cmd_buf[3] | (cmd_buf[4] << 8);
+        uint8_t type = cmd_buf[5];
+        int err = gatt_client_subscribe(conn_h, attr_h, type);
+        if (err != 0) {
+            LOG_ERR("Subscribe failed: %d", err);
             last_cmd_result = CMD_RESULT_ERROR;
         }
         break;

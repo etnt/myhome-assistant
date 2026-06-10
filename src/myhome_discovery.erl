@@ -12,7 +12,7 @@
 -export([start_link/0, run_discovery/0, get_config/0, remove_bulb/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--define(SCAN_DURATION, 15).  %% seconds
+-define(SCAN_DURATION, 5).  %% seconds (keep short to leave time for pairing within 30s window)
 
 -record(state, {
     config = [] :: [{atom(), binary(), integer()}]
@@ -171,35 +171,39 @@ start_bulb_children(Config) ->
 %%====================================================================
 
 pair(Addr, AddrType) ->
-    myhome_log:log(info, "Connecting to ~s...", [format_addr(Addr)]),
-    case myhome_ble_conn:connect_sync(Addr, AddrType) of
+    pair(Addr, AddrType, 3).
+
+pair(_Addr, _AddrType, 0) ->
+    {error, max_retries};
+pair(Addr, AddrType, Retries) ->
+    myhome_log:log(info, "Connecting to ~s (attempt ~p)...", [format_addr(Addr), 4 - Retries]),
+    case myhome_ble_i2c:connect(Addr, AddrType) of
         {ok, ConnHandle} ->
-            myhome_log:log(info, "~s connected (handle=~p), initiating security...",
+            myhome_log:log(info, "~s connected (handle=~p), waiting for encryption...",
                            [format_addr(Addr), ConnHandle]),
-            %% Subscribe to enc_change events temporarily
-            Self = self(),
-            Filter = fun({ble_enc_change, H, _}) when H =:= ConnHandle -> true;
-                        (_) -> false end,
-            myhome_event_bus:subscribe(Self, Filter),
-            ble:security(ConnHandle),
-            %% Wait for enc_change result (up to 10s)
-            Result = receive
-                {ble_event, {ble_enc_change, ConnHandle, 0}} ->
-                    myhome_log:log(info, "~s pairing successful!", [format_addr(Addr)]),
+            %% Small delay to let the BLE link stabilize before bonding
+            timer:sleep(200),
+            Result = case myhome_ble_i2c:bond(ConnHandle) of
+                ok ->
+                    myhome_log:log(info, "~s pairing/encryption successful!", [format_addr(Addr)]),
                     ok;
-                {ble_event, {ble_enc_change, ConnHandle, Status}} ->
-                    myhome_log:log(error, "~s pairing FAILED (status=~p)", [format_addr(Addr), Status]),
-                    {error, {security_failed, Status}}
-            after 10000 ->
-                myhome_log:log(error, "~s pairing timeout (no enc_change received)", [format_addr(Addr)]),
-                {error, pairing_timeout}
+                {error, Reason} ->
+                    myhome_log:log(warning, "~s pairing failed: ~p, retrying...",
+                                   [format_addr(Addr), Reason]),
+                    {error, Reason}
             end,
-            myhome_event_bus:unsubscribe(Self),
-            ble:disconnect(ConnHandle),
-            Result;
+            myhome_ble_i2c:disconnect(ConnHandle),
+            case Result of
+                ok -> ok;
+                {error, _} ->
+                    timer:sleep(1000),
+                    pair(Addr, AddrType, Retries - 1)
+            end;
         {error, Reason} ->
-            myhome_log:log(error, "~s connect failed: ~p", [format_addr(Addr), Reason]),
-            {error, Reason}
+            myhome_log:log(warning, "~s connect failed: ~p, retrying...",
+                           [format_addr(Addr), Reason]),
+            timer:sleep(1000),
+            pair(Addr, AddrType, Retries - 1)
     end.
 
 pair_all(Bulbs) ->
@@ -274,11 +278,21 @@ save_config(Paired) ->
 %%====================================================================
 
 filter_hue_bulbs(Results) ->
-    lists:filter(fun(#{name := Name}) ->
+    Hue = lists:filter(fun(#{name := Name}) ->
         is_hue_name(Name);
     (_) ->
         false
-    end, Results).
+    end, Results),
+    %% Deduplicate by address (BLE scan returns multiple adverts per device)
+    dedup_by_addr(Hue, #{}, []).
+
+dedup_by_addr([], _Seen, Acc) ->
+    lists:reverse(Acc);
+dedup_by_addr([#{addr := Addr} = Entry | Rest], Seen, Acc) ->
+    case maps:is_key(Addr, Seen) of
+        true -> dedup_by_addr(Rest, Seen, Acc);
+        false -> dedup_by_addr(Rest, maps:put(Addr, true, Seen), [Entry | Acc])
+    end.
 
 is_hue_name(<<>>) -> false;
 is_hue_name(Name) when is_binary(Name) ->

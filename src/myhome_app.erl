@@ -9,6 +9,7 @@
 
 start() ->
     io:format("MyHome Assistant starting...~n"),
+    print_memory_info(),
 
     case myhome_top_sup:start_link() of
         {ok, _} ->
@@ -27,3 +28,10 @@ loop() ->
         io:format("."),
         loop()
     end.
+
+print_memory_info() ->
+    FreeHeap = erlang:system_info(esp32_free_heap_size),
+    MinFree = erlang:system_info(esp32_minimum_free_heap_size),
+    LargestBlock = erlang:system_info(esp32_largest_free_block),
+    io:format("MEMORY: Free=~p MinFree=~p LargestBlock=~p~n",
+              [FreeHeap, MinFree, LargestBlock]).

@@ -71,4 +71,17 @@ int ble_central_get_handle(const uint8_t *addr);
  */
 uint8_t ble_central_connection_count(void);
 
+/**
+ * Get the bt_conn pointer for a connection handle.
+ * Returns NULL if handle is invalid or not connected.
+ * Used by gatt_client to issue GATT operations.
+ */
+struct bt_conn *ble_central_get_conn(uint16_t conn_handle);
+
+/**
+ * Map a bt_conn pointer back to our connection handle index.
+ * Returns 0xFFFF if not found.
+ */
+uint16_t ble_central_conn_to_handle(struct bt_conn *conn);
+
 #endif /* BLE_CENTRAL_H */

@@ -5,12 +5,15 @@
 %%%   GET  /api/status          — list bulbs and connection state
 %%%   GET  /api/logs            — get system logs (params: level, limit)
 %%%   GET  /api/scan            — get last BLE scan results
-%%%   GET  /api/connections     — list active BLE connections
 %%%   POST /api/scan            — trigger new BLE scan (optional: {"duration":10})
 %%%   POST /api/connect         — body: {"addr":"AA:BB:CC:DD:EE:FF","addr_type":1}
 %%%   POST /api/disconnect      — body: {"handle":1}
 %%%   POST /api/security        — body: {"handle":1}
 %%%   POST /api/discover        — run bulb discovery and pairing
+%%%   POST /api/gatt/discover   — body: {"handle":0} → list characteristics
+%%%   POST /api/gatt/read       — body: {"handle":0,"attr":42} → read char value
+%%%   POST /api/gatt/write      — body: {"handle":0,"attr":42,"data":"01"} → write
+%%%   POST /api/gatt/write_nr   — body: {"handle":0,"attr":42,"data":"01"} → write NR
 %%%   POST /api/reset           — factory reset (clears config and reboots)
 %%%   POST /api/bulb/1/power    — body: {"on": true}
 %%%   POST /api/bulb/1/brightness — body: {"value": 200}
@@ -279,6 +282,18 @@ do_handle(delete, [<<"bulb">>, BulbNum], _HttpRequest) ->
         {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
+do_handle(post, [<<"bulb">>, BulbNum, <<"name">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    case parse_json_string(Body, <<"name">>) of
+        {ok, DisplayName} ->
+            NS = binary_to_list(BulbNum),
+            NameKey = list_to_atom("bulb_" ++ NS ++ "_name"),
+            esp:nvs_set_binary(myhome, NameKey, DisplayName),
+            json_reply(#{status => ok, name => DisplayName});
+        _ ->
+            {400, #{}, <<"Bad Request: missing 'name' field">>}
+    end;
+
 do_handle(get, [<<"sensors">>], _HttpRequest) ->
     Readings = myhome_sensors:get_readings(),
     json_reply(#{status => ok, sensors => Readings});
@@ -291,19 +306,6 @@ do_handle(get, [<<"sensors">>, TypeBin], _HttpRequest) ->
             json_reply(#{status => ok, sensor => Type, data => Data});
         error ->
             json_reply(#{status => error, reason => <<"sensor not found">>})
-    end;
-
-do_handle(get, [<<"connections">>], _HttpRequest) ->
-    case myhome_ble_conn:get_connections() of
-        {ok, Conns} ->
-            JsonConns = [#{addr => addr_to_hex(maps:get(addr, C)),
-                           handle => maps:get(handle, C),
-                           state => maps:get(state, C),
-                           since => maps:get(since, C)}
-                         || C <- Conns],
-            json_reply(#{status => ok, connections => JsonConns});
-        {error, Reason} ->
-            json_reply(#{status => error, reason => to_bin(Reason)})
     end;
 
 do_handle(get, [<<"nvs">>, <<"dump">>], _HttpRequest) ->
@@ -483,6 +485,70 @@ do_handle(post, [<<"bond">>], HttpRequest) ->
             {400, #{}, <<"Bad Request">>}
     end;
 
+do_handle(post, [<<"gatt">>, <<"discover">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    case parse_json_int(Body, <<"handle">>) of
+        {ok, ConnH} ->
+            case myhome_ble_i2c:gatt_discover(ConnH) of
+                {ok, Chars} ->
+                    JsonChars = [#{handle => maps:get(handle, C),
+                                   properties => maps:get(properties, C),
+                                   uuid => bin_to_hex(maps:get(uuid, C))}
+                                 || C <- Chars],
+                    json_reply(#{status => ok, characteristics => JsonChars});
+                {error, Reason} ->
+                    json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        _ ->
+            {400, #{}, <<"Bad Request: need handle">>}
+    end;
+
+do_handle(post, [<<"gatt">>, <<"read">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    case {parse_json_int(Body, <<"handle">>), parse_json_int(Body, <<"attr">>)} of
+        {{ok, ConnH}, {ok, AttrH}} ->
+            case myhome_ble_i2c:gatt_read(ConnH, AttrH) of
+                {ok, Data} ->
+                    json_reply(#{status => ok, data => bin_to_hex(Data)});
+                {error, Reason} ->
+                    json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        _ ->
+            {400, #{}, <<"Bad Request: need handle and attr">>}
+    end;
+
+do_handle(post, [<<"gatt">>, <<"write">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    case {parse_json_int(Body, <<"handle">>), parse_json_int(Body, <<"attr">>),
+          parse_json_string(Body, <<"data">>)} of
+        {{ok, ConnH}, {ok, AttrH}, {ok, DataHex}} ->
+            Data = hex_to_bin(DataHex),
+            case myhome_ble_i2c:gatt_write(ConnH, AttrH, Data) of
+                ok ->
+                    json_reply(#{status => ok});
+                {error, Reason} ->
+                    json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        _ ->
+            {400, #{}, <<"Bad Request: need handle, attr, data (hex)">>}
+    end;
+
+do_handle(post, [<<"gatt">>, <<"write_nr">>], HttpRequest) ->
+    #{body := Body} = HttpRequest,
+    case {parse_json_int(Body, <<"handle">>), parse_json_int(Body, <<"attr">>),
+          parse_json_string(Body, <<"data">>)} of
+        {{ok, ConnH}, {ok, AttrH}, {ok, DataHex}} ->
+            Data = hex_to_bin(DataHex),
+            case myhome_ble_i2c:gatt_write_nr(ConnH, AttrH, Data) of
+                ok ->
+                    json_reply(#{status => ok});
+                {error, Reason} ->
+                    json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        _ ->
+            {400, #{}, <<"Bad Request: need handle, attr, data (hex)">>}
+    end;
+
 do_handle(_Method, _Path, _HttpRequest) ->
     {404, #{}, <<"Not Found">>}.
 
@@ -502,17 +568,25 @@ get_bulb_status() ->
         case whereis(Name) of
             undefined -> false;
             _Pid ->
+                DisplayName = get_display_name(N),
                 Result = try myhome_hue_ble:get_state(Name)
                          catch C2:R2 ->
                              io:format("[http] get_state(~p) crash: ~p:~p~n", [Name, C2, R2]),
                              {error, crashed}
                          end,
                 case Result of
-                    {ok, State} -> {true, State#{name => Name}};
-                    _ -> {true, #{name => Name, connected => false}}
+                    {ok, State} -> {true, State#{name => Name, display_name => DisplayName}};
+                    _ -> {true, #{name => Name, display_name => DisplayName, connected => false}}
                 end
         end
     end, [1, 2, 3, 4]).
+
+get_display_name(N) ->
+    NameKey = list_to_atom("bulb_" ++ integer_to_list(N) ++ "_name"),
+    case try esp:nvs_get_binary(myhome, NameKey) catch _:_ -> undefined end of
+        Val when is_binary(Val), byte_size(Val) > 0 -> Val;
+        _ -> iolist_to_binary(["Bulb ", integer_to_list(N)])
+    end.
 
 %% Minimal JSON parsing — AtomVM doesn't have a JSON library built-in
 %% These parse simple single-key JSON bodies like {"on":true} or {"value":123}

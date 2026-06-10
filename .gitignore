@@ -5,3 +5,5 @@ src/myhome_config.erl
 AtomVM/
 rebar.lock
 sdkconfig.defaults
+firmware/xiao_ble/build/
+firmware/xiao_ble/dfu_pkg.zip

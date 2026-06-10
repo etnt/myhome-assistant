@@ -50,6 +50,8 @@
     addr_type :: integer(),
     conn_handle :: non_neg_integer() | undefined,
     connected :: boolean(),
+    %% GATT handle cache: UUID binary → ATT value handle
+    gatt_handles :: #{binary() => non_neg_integer()} | undefined,
     %% Cached light state
     power     :: boolean() | undefined,
     brightness :: integer() | undefined,
@@ -57,6 +59,7 @@
     %% Connect-on-demand: pending command waiting for encryption
     pending_cmd :: term() | undefined,
     pending_from :: term() | undefined,
+    pending_ref :: reference() | undefined,  %% watchdog ref for pending_cmd
     %% Cooldown: avoid repeated failed connects
     last_connect_fail :: integer() | undefined  %% system_time(millisecond)
 }).
@@ -76,6 +79,12 @@ start_link(Addr, AddrType, Name) ->
 
 %% Heartbeat: periodic state read to detect external changes (e.g., physical switch)
 -define(HEARTBEAT_INTERVAL_MS, 300000). %% 5 minutes
+
+%% Watchdog: if a pending command isn't resolved by an enc_change/disconnect
+%% event within this window, reset the connection state so the bulb doesn't
+%% get stuck replying {error, busy} forever. Must be < ?CALL_TIMEOUT so a
+%% waiting caller gets a clean {error, timeout} reply.
+-define(PENDING_TIMEOUT_MS, 30000).
 
 -spec set_power(atom(), boolean()) -> ok | {error, term()}.
 set_power(Name, On) ->
@@ -129,7 +138,8 @@ init({Addr, AddrType, Name}) ->
         addr = Addr,
         addr_type = AddrType,
         conn_handle = undefined,
-        connected = false
+        connected = false,
+        gatt_handles = undefined
     },
     %% Connect-on-demand: no connection at startup.
     %% WiFi stays healthy until a command actually needs BLE.
@@ -184,13 +194,14 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
         0 ->
             myhome_log:log(info, "[~p] encrypted, executing: ~s", [State#state.name, cmd_name(Cmd)]),
             {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
-            myhome_ble_conn:disconnect(ConnHandle),
+            myhome_ble_i2c:disconnect(ConnHandle),
             case From of
                 undefined -> ok;  %% heartbeat — no caller to reply to
                 _ -> gen_server:reply(From, Reply)
             end,
             publish_state(NewState),
             {noreply, NewState#state{pending_cmd = undefined, pending_from = undefined,
+                                     pending_ref = undefined,
                                      conn_handle = undefined, connected = false}};
         _ ->
             myhome_log:log(error, "[~p] security failed (status=~p)", [State#state.name, Status]),
@@ -198,9 +209,10 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
                 undefined -> ok;
                 _ -> gen_server:reply(From, {error, {security_failed, Status}})
             end,
-            myhome_ble_conn:disconnect(ConnHandle),
+            myhome_ble_i2c:disconnect(ConnHandle),
             {noreply, State#state{conn_handle = undefined, connected = false,
-                                  pending_cmd = undefined, pending_from = undefined}}
+                                  pending_cmd = undefined, pending_from = undefined,
+                                  pending_ref = undefined}}
     end;
 
 %% Encryption event but no pending command (e.g., reconnect without command)
@@ -209,24 +221,26 @@ handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
     case Status of
         0 ->
             myhome_log:log(info, "[~p] encrypted (no pending cmd), disconnecting", [State#state.name]),
-            myhome_ble_conn:disconnect(ConnHandle),
+            myhome_ble_i2c:disconnect(ConnHandle),
             {noreply, State#state{conn_handle = undefined, connected = false}};
         _ ->
-            myhome_ble_conn:disconnect(ConnHandle),
+            myhome_ble_i2c:disconnect(ConnHandle),
             {noreply, State#state{conn_handle = undefined, connected = false}}
     end;
 
 handle_info({ble_event, {ble_disconnected, ConnHandle, Reason}},
             #state{conn_handle = ConnHandle} = State) ->
     myhome_log:log(info, "[~p] disconnected (reason=~p)", [State#state.name, Reason]),
-    %% If there was a pending command, fail it
-    NewState = case State#state.pending_from of
-        undefined -> State;
-        From ->
-            gen_server:reply(From, {error, disconnected}),
-            State#state{pending_cmd = undefined, pending_from = undefined}
+    %% Fail any pending command — whether from an external caller or a
+    %% heartbeat (pending_from = undefined). Always clear pending state so
+    %% the bulb doesn't get stuck replying {error, busy}.
+    case State#state.pending_from of
+        undefined -> ok;
+        From -> gen_server:reply(From, {error, disconnected})
     end,
-    {noreply, NewState#state{conn_handle = undefined, connected = false}};
+    {noreply, State#state{conn_handle = undefined, connected = false,
+                          pending_cmd = undefined, pending_from = undefined,
+                          pending_ref = undefined}};
 
 %% Heartbeat: periodic state read to detect external changes
 handle_info(heartbeat, #state{pending_cmd = undefined} = State) ->
@@ -237,11 +251,14 @@ handle_info(heartbeat, #state{pending_cmd = undefined} = State) ->
             {noreply, State};
         false ->
             %% Initiate a read_state as an internal command (no external caller)
-            case connect_with_retry(State#state.addr, State#state.addr_type, 0) of
+            case myhome_ble_i2c:connect(State#state.addr, State#state.addr_type) of
                 {ok, ConnHandle} ->
-                    ble:security(ConnHandle),
+                    %% Must explicitly request bond/encryption
+                    spawn(fun() -> myhome_ble_i2c:bond(ConnHandle) end),
+                    Ref = schedule_pending_timeout(),
                     {noreply, State#state{conn_handle = ConnHandle, connected = false,
-                                          pending_cmd = read_all, pending_from = undefined}};
+                                          pending_cmd = read_all, pending_from = undefined,
+                                          pending_ref = Ref}};
                 {error, _} ->
                     {noreply, State#state{last_connect_fail = erlang:system_time(millisecond)}}
             end
@@ -251,25 +268,54 @@ handle_info(heartbeat, State) ->
     erlang:send_after(?HEARTBEAT_INTERVAL_MS, self(), heartbeat),
     {noreply, State};
 
+%% Watchdog fired for the current pending command — the expected enc_change /
+%% disconnect event never arrived. Reset connection state so we recover.
+handle_info({pending_timeout, Ref},
+            #state{pending_ref = Ref, pending_cmd = Cmd} = State)
+  when Cmd =/= undefined ->
+    myhome_log:log(warning, "[~p] pending command ~s timed out — resetting",
+                   [State#state.name, cmd_name(Cmd)]),
+    case State#state.pending_from of
+        undefined -> ok;
+        From -> gen_server:reply(From, {error, timeout})
+    end,
+    case State#state.conn_handle of
+        undefined -> ok;
+        H -> myhome_ble_i2c:disconnect(H)
+    end,
+    {noreply, State#state{pending_cmd = undefined, pending_from = undefined,
+                          pending_ref = undefined, conn_handle = undefined,
+                          connected = false}};
+%% Stale watchdog (command already resolved) — ignore.
+handle_info({pending_timeout, _Stale}, State) ->
+    {noreply, State};
+
 handle_info(_Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{conn_handle = undefined}) ->
     ok;
 terminate(_Reason, #state{conn_handle = Handle}) ->
-    myhome_ble_conn:disconnect(Handle),
+    myhome_ble_i2c:disconnect(Handle),
     ok.
 
 %%====================================================================
 %% Internal functions
 %%====================================================================
 
+%% Arm the pending-command watchdog. Returns a unique ref that is matched
+%% against the {pending_timeout, Ref} message so stale timers are ignored.
+schedule_pending_timeout() ->
+    Ref = make_ref(),
+    erlang:send_after(?PENDING_TIMEOUT_MS, self(), {pending_timeout, Ref}),
+    Ref.
+
 %% Execute a command — connect on-demand if needed
 do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
   when Handle =/= undefined ->
     %% Already connected and encrypted — execute immediately
     {Reply, NewState} = execute_cmd(Cmd, State),
-    myhome_ble_conn:disconnect(Handle),
+    myhome_ble_i2c:disconnect(Handle),
     {reply, Reply, NewState#state{conn_handle = undefined, connected = false}};
 do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
     %% Not connected — check cooldown then connect on-demand
@@ -284,13 +330,19 @@ do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
     {reply, {error, busy}, State}.
 
 do_cmd_connect(Cmd, From, State) ->
-    case connect_with_retry(State#state.addr, State#state.addr_type, 1) of
+    case myhome_ble_i2c:connect(State#state.addr, State#state.addr_type) of
         {ok, ConnHandle} ->
-            myhome_log:log(info, "[~p] connected, securing...", [State#state.name]),
-            ble:security(ConnHandle),
-            %% Wait for enc_change in handle_info before executing
+            myhome_log:log(info, "[~p] connected [~p], initiating bond/encryption...",
+                           [State#state.name, ConnHandle]),
+            %% Must explicitly request bond — XIAO doesn't auto-negotiate encryption.
+            %% For already-bonded devices this just re-encrypts the link.
+            %% bond() is async (waits via bond_waiters), but we also get enc_change
+            %% via the event bus which triggers execute_cmd in handle_info.
+            spawn(fun() -> myhome_ble_i2c:bond(ConnHandle) end),
+            Ref = schedule_pending_timeout(),
             {noreply, State#state{conn_handle = ConnHandle, connected = false,
                                   pending_cmd = Cmd, pending_from = From,
+                                  pending_ref = Ref,
                                   last_connect_fail = undefined}};
         {error, Reason} ->
             myhome_log:log(warning, "[~p] connect failed: ~p", [State#state.name, Reason]),
@@ -300,55 +352,114 @@ do_cmd_connect(Cmd, From, State) ->
 
 %% Execute a GATT write command on an encrypted connection
 execute_cmd({write, ChrUUID, Value}, #state{conn_handle = Handle} = State) ->
-    Result = ble:gatt_write(Handle, ?SVC_LIGHT, ChrUUID, Value),
-    NewState = case Result of
-        ok -> update_cached_from_write(ChrUUID, Value, State);
-        _  -> State
-    end,
-    {Result, NewState};
+    case resolve_handle(ChrUUID, State) of
+        {ok, AttrH, State1} ->
+            Result = myhome_ble_i2c:gatt_write(Handle, AttrH, Value),
+            NewState = case Result of
+                ok -> update_cached_from_write(ChrUUID, Value, State1);
+                _  -> State1
+            end,
+            {Result, NewState};
+        {error, _} = Err ->
+            {Err, State}
+    end;
 execute_cmd({write_multi, Props}, #state{conn_handle = Handle} = State) ->
-    Results = lists:map(fun
-        ({power, On}) ->
-            Val = case On of true -> <<16#01>>; false -> <<16#00>> end,
-            ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_POWER, Val);
-        ({brightness, B}) ->
-            ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_BRIGHTNESS, <<B:8>>);
-        ({color_temp, T}) ->
-            ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_COLOR_TEMP, <<T:16/little>>);
-        ({color_xy, {X, Y}}) ->
-            ble:gatt_write(Handle, ?SVC_LIGHT, ?CHR_COLOR_XY, <<X:16/big, Y:16/big>>);
-        (_) -> ok
-    end, maps:to_list(Props)),
-    Result = case lists:all(fun(R) -> R =:= ok end, Results) of
-        true -> ok;
-        false -> {error, partial_failure}
-    end,
-    NewState = case Result of
-        ok -> update_cached_state(State, Props);
-        _  -> State
-    end,
-    {Result, NewState};
+    case ensure_gatt_handles(State) of
+        {ok, State1} ->
+            Results = lists:map(fun
+                ({power, On}) ->
+                    Val = case On of true -> <<16#01>>; false -> <<16#00>> end,
+                    write_by_uuid(?CHR_POWER, Val, Handle, State1);
+                ({brightness, B}) ->
+                    write_by_uuid(?CHR_BRIGHTNESS, <<B:8>>, Handle, State1);
+                ({color_temp, T}) ->
+                    write_by_uuid(?CHR_COLOR_TEMP, <<T:16/little>>, Handle, State1);
+                ({color_xy, {X, Y}}) ->
+                    write_by_uuid(?CHR_COLOR_XY, <<X:16/big, Y:16/big>>, Handle, State1);
+                (_) -> ok
+            end, maps:to_list(Props)),
+            Result = case lists:all(fun(R) -> R =:= ok end, Results) of
+                true -> ok;
+                false -> {error, partial_failure}
+            end,
+            NewState = case Result of
+                ok -> update_cached_state(State1, Props);
+                _  -> State1
+            end,
+            {Result, NewState};
+        {error, _} = Err ->
+            {Err, State}
+    end;
 execute_cmd(read_all, #state{conn_handle = Handle} = State) ->
-    Power = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_POWER) of
-        {ok, <<P>>} -> P =:= 1;
-        _ -> undefined
-    end,
-    Bri = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_BRIGHTNESS) of
-        {ok, <<B>>} -> B;
-        _ -> undefined
-    end,
-    CT = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_COLOR_TEMP) of
-        {ok, <<T:16/little>>} -> T;
-        _ -> undefined
-    end,
-    XY = case ble:gatt_read(Handle, ?SVC_LIGHT, ?CHR_COLOR_XY) of
-        {ok, <<X:16/big, Y:16/big>>} -> {X, Y};
-        _ -> undefined
-    end,
-    Result = {ok, #{power => Power, brightness => Bri,
-                    color_temp => CT, color_xy => XY}},
-    NewState = State#state{power = Power, brightness = Bri, color_temp = CT},
-    {Result, NewState}.
+    case ensure_gatt_handles(State) of
+        {ok, State1} ->
+            Power = case read_by_uuid(?CHR_POWER, Handle, State1) of
+                {ok, <<P>>} -> P =:= 1;
+                _ -> undefined
+            end,
+            Bri = case read_by_uuid(?CHR_BRIGHTNESS, Handle, State1) of
+                {ok, <<B>>} -> B;
+                _ -> undefined
+            end,
+            CT = case read_by_uuid(?CHR_COLOR_TEMP, Handle, State1) of
+                {ok, <<T:16/little>>} -> T;
+                _ -> undefined
+            end,
+            XY = case read_by_uuid(?CHR_COLOR_XY, Handle, State1) of
+                {ok, <<X:16/big, Y:16/big>>} -> {X, Y};
+                _ -> undefined
+            end,
+            Result = {ok, #{power => Power, brightness => Bri,
+                            color_temp => CT, color_xy => XY}},
+            NewState = State1#state{power = Power, brightness = Bri, color_temp = CT},
+            {Result, NewState};
+        {error, _} = Err ->
+            {Err, State}
+    end.
+
+%% Resolve a characteristic UUID to its ATT handle, discovering if needed
+resolve_handle(ChrUUID, State) ->
+    case ensure_gatt_handles(State) of
+        {ok, #state{gatt_handles = Handles} = State1} ->
+            case maps:get(ChrUUID, Handles, undefined) of
+                undefined -> {error, {uuid_not_found, ChrUUID}};
+                AttrH -> {ok, AttrH, State1}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Ensure GATT handles are cached; discover if not
+ensure_gatt_handles(#state{gatt_handles = Handles} = State) when is_map(Handles) ->
+    {ok, State};
+ensure_gatt_handles(#state{conn_handle = ConnH} = State) ->
+    case myhome_ble_i2c:gatt_discover(ConnH) of
+        {ok, Chars} ->
+            Handles = lists:foldl(fun(#{uuid := Uuid, handle := H}, Acc) ->
+                maps:put(Uuid, H, Acc)
+            end, #{}, Chars),
+            myhome_log:log(info, "[~p] discovered ~p GATT characteristics",
+                           [State#state.name, map_size(Handles)]),
+            {ok, State#state{gatt_handles = Handles}};
+        {error, _} = Err ->
+            myhome_log:log(error, "[~p] GATT discovery failed: ~p",
+                           [State#state.name, Err]),
+            Err
+    end.
+
+%% Write a characteristic by UUID (resolves from cache)
+write_by_uuid(ChrUUID, Value, ConnH, #state{gatt_handles = Handles}) ->
+    case maps:get(ChrUUID, Handles, undefined) of
+        undefined -> {error, {uuid_not_found, ChrUUID}};
+        AttrH -> myhome_ble_i2c:gatt_write(ConnH, AttrH, Value)
+    end.
+
+%% Read a characteristic by UUID (resolves from cache)
+read_by_uuid(ChrUUID, ConnH, #state{gatt_handles = Handles}) ->
+    case maps:get(ChrUUID, Handles, undefined) of
+        undefined -> {error, {uuid_not_found, ChrUUID}};
+        AttrH -> myhome_ble_i2c:gatt_read(ConnH, AttrH)
+    end.
 
 update_cached_from_write(ChrUUID, Value, State) ->
     case ChrUUID of
@@ -386,24 +497,6 @@ cmd_name({write, ?CHR_COLOR_XY, _}) -> "set_color_xy";
 cmd_name({write_multi, _}) -> "set_state";
 cmd_name(read_all) -> "read_state";
 cmd_name(Other) -> io_lib:format("~p", [Other]).
-
-%% Connect with exponential backoff retry.
-%% Single retry to limit memory pressure and radio time on ESP32.
-connect_with_retry(Addr, AddrType, MaxRetries) ->
-    connect_with_retry(Addr, AddrType, MaxRetries, 0, 2000).
-
-connect_with_retry(Addr, AddrType, MaxRetries, Attempt, Delay) ->
-    case myhome_ble_conn:connect_sync(Addr, AddrType) of
-        {ok, ConnHandle} ->
-            {ok, ConnHandle};
-        {error, Reason} when Attempt < MaxRetries ->
-            myhome_log:log(info, "[ble] connect attempt ~p failed (~p), retry in ~pms",
-                           [Attempt + 1, Reason, Delay]),
-            timer:sleep(Delay),
-            connect_with_retry(Addr, AddrType, MaxRetries, Attempt + 1, Delay * 2);
-        {error, Reason} ->
-            {error, Reason}
-    end.
 
 %% 60s cooldown after a failed connect to avoid memory exhaustion from retries
 -define(CONNECT_COOLDOWN_MS, 60000).

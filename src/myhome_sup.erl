@@ -23,14 +23,6 @@ init([]) ->
         type => worker
     },
 
-    BleConnSpec = #{
-        id => myhome_ble_conn,
-        start => {myhome_ble_conn, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker
-    },
-
     HttpSpec = #{
         id => myhome_http,
         start => {myhome_http, start_link, []},
@@ -69,4 +61,4 @@ init([]) ->
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, BleConnSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec]}}.
+    {ok, {SupFlags, [ScannerSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec]}}.
