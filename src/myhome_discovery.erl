@@ -53,7 +53,8 @@ init([]) ->
     {ok, #state{}}.
 
 handle_call(run_discovery, _From, State) ->
-    case do_discovery() of
+    ExistingAddrs = [Addr || {_Name, Addr, _Type} <- State#state.config],
+    case do_discovery(ExistingAddrs) of
         {ok, [_|_] = Paired} ->
             NewConfig = [{Name, Addr, AddrType} || {Name, Addr, AddrType, _} <- Paired],
             start_bulb_children(NewConfig),
@@ -106,7 +107,7 @@ terminate(_Reason, _State) ->
 %% Discovery logic
 %%====================================================================
 
-do_discovery() ->
+do_discovery(ExistingAddrs) ->
     myhome_log:log(info, "=== Hue Bulb Discovery ==="),
     myhome_log:log(info, "Make sure your Hue bulbs are in pairing mode"),
     myhome_log:log(info, "(power-cycle the bulb -- it stays in pairing mode for 30s)"),
@@ -116,15 +117,24 @@ do_discovery() ->
         {ok, []} ->
             myhome_log:log(info, "No Hue bulbs found."),
             {ok, []};
-        {ok, Bulbs} ->
-            myhome_log:log(info, "Found ~p Hue bulb(s):", [length(Bulbs)]),
-            print_bulbs(Bulbs),
-            myhome_log:log(info, "Attempting to pair with each bulb..."),
-            Paired = pair_all(Bulbs),
-            myhome_log:log(info, "=== Pairing complete ==="),
-            print_paired(Paired),
-            save_config(Paired),
-            {ok, Paired};
+        {ok, AllBulbs} ->
+            %% Skip bulbs already registered (by address) so we never create
+            %% duplicate slots for a bulb that is already known.
+            Bulbs = skip_known(AllBulbs, ExistingAddrs),
+            case Bulbs of
+                [] ->
+                    myhome_log:log(info, "No new Hue bulbs (all discovered bulbs already registered)."),
+                    {ok, []};
+                _ ->
+                    myhome_log:log(info, "Found ~p new Hue bulb(s):", [length(Bulbs)]),
+                    print_bulbs(Bulbs),
+                    myhome_log:log(info, "Attempting to pair with each bulb..."),
+                    Paired = pair_all(Bulbs),
+                    myhome_log:log(info, "=== Pairing complete ==="),
+                    print_paired(Paired),
+                    save_config(Paired),
+                    {ok, Paired}
+            end;
         {error, Reason} ->
             myhome_log:log(error, "Scan failed: ~p", [Reason]),
             {error, Reason}
@@ -285,6 +295,24 @@ filter_hue_bulbs(Results) ->
     end, Results),
     %% Deduplicate by address (BLE scan returns multiple adverts per device)
     dedup_by_addr(Hue, #{}, []).
+
+%% Drop scanned bulbs whose address is already registered, so re-running
+%% discovery never produces duplicate bulb slots for a known device.
+skip_known(Bulbs, []) ->
+    Bulbs;
+skip_known(Bulbs, ExistingAddrs) ->
+    lists:filter(
+        fun(#{addr := Addr} = Entry) ->
+            case lists:member(Addr, ExistingAddrs) of
+                true ->
+                    Name = maps:get(name, Entry, <<>>),
+                    myhome_log:log(info, "Skipping already-registered ~s (~s)",
+                                   [Name, format_addr(Addr)]),
+                    false;
+                false ->
+                    true
+            end
+        end, Bulbs).
 
 dedup_by_addr([], _Seen, Acc) ->
     lists:reverse(Acc);

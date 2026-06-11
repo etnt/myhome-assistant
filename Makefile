@@ -22,7 +22,7 @@ XIAO_PORT ?= /dev/cu.usbmodem1101
 ATOMVM_DIR := AtomVM
 ESP32_DIR := $(ATOMVM_DIR)/src/platforms/esp32
 APP_OFFSET ?= 0x250000
-IP ?= 192.168.68.65
+IP ?= 192.168.68.52
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 

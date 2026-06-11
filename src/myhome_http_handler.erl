@@ -248,6 +248,17 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"reconnect">>], _HttpRequest) ->
     myhome_log:log(info, "[~p] cooldown cleared, ready to reconnect", [Name]),
     json_reply(#{status => ok, msg => <<"cooldown cleared">>});
 
+do_handle(delete, [<<"bulb">>, BulbNum, <<"bond">>], _HttpRequest) ->
+    %% Delete the BLE bond (stored LTK) for this bulb on the nRF.
+    %% Use after factory-resetting the bulb to recover from a bond mismatch.
+    Name = bulb_name(BulbNum),
+    case myhome_hue_ble:unpair(Name) of
+        ok ->
+            json_reply(#{status => ok, msg => <<"bond deleted">>});
+        {error, Reason} ->
+            json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
 do_handle(post, [<<"reconnect">>], _HttpRequest) ->
     %% Clear cooldown on all bulbs
     lists:foreach(fun({_, Child, _, _}) ->

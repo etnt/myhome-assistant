@@ -62,6 +62,21 @@ int ble_central_disconnect(uint16_t conn_handle);
 int ble_central_bond(uint16_t conn_handle);
 
 /**
+ * Delete the stored bond (LTK) for a peer address.
+ * addr: 6-byte BLE address (little-endian)
+ * addr_type: 0 = public, 1 = random
+ * No connection required; clears the key from settings/NVS.
+ * Returns 0 on success (or if no bond existed).
+ */
+int ble_central_unpair(const uint8_t *addr, uint8_t addr_type);
+
+/**
+ * Delete all stored bonds.
+ * Returns 0 on success.
+ */
+int ble_central_unpair_all(void);
+
+/**
  * Get connection handle for an address. Returns -1 if not connected.
  */
 int ble_central_get_handle(const uint8_t *addr);

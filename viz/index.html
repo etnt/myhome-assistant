@@ -98,6 +98,38 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
 .btn-secondary { background: var(--card); color: var(--text); }
 .btn-success { background: var(--success); color: #1a1a2e; }
 
+/* Tab navigation */
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid #2a2a4a;
+  flex-wrap: wrap;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 0.6rem 1.1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.tab-btn:hover { color: var(--text); }
+
+.tab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
 /* Grid layout — two independent columns on desktop */
 .grid {
   display: grid;
@@ -159,11 +191,51 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
   overflow: hidden;
 }
 
+.all-lamps-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.all-lamps-label {
+  font-weight: 600;
+}
+
+.all-lamps-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .bulb-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 1rem;
+}
+
+.bulb-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
+.bulb-unpair {
+  background: transparent;
+  color: #e0b020;
+  border: 1px solid #e0b020;
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.bulb-unpair:hover {
+  color: #1a1a2e;
+  border-color: #f0c030;
+  background: #f0c030;
 }
 
 .bulb-name {
@@ -269,8 +341,28 @@ input[type="range"]::-webkit-slider-thumb:hover {
   transform: scale(1.2);
 }
 
+input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: var(--accent2);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+
+input[type="range"]::-moz-range-thumb:hover {
+  transform: scale(1.2);
+}
+
 /* Color temp gradient track */
 .color-temp-slider::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, #a8d8ff, #fff5e6, #ffcc66, #ff9933);
+  height: 6px;
+  border-radius: 3px;
+}
+
+.color-temp-slider::-moz-range-track {
   background: linear-gradient(to right, #a8d8ff, #fff5e6, #ffcc66, #ff9933);
   height: 6px;
   border-radius: 3px;
@@ -471,44 +563,63 @@ input[type="range"]::-webkit-slider-thumb:hover {
 <div class="header">
   <span class="logo">MyHome Assistant</span>
   <div class="connection">
-    <input type="text" id="hostInput" placeholder="IP:Port" value="192.168.68.65:8080">
+    <input type="text" id="hostInput" placeholder="IP:Port" value="192.168.68.52:8080">
     <div class="dot" id="connDot"></div>
     <button class="btn btn-secondary" onclick="checkStatus()">Connect</button>
   </div>
 </div>
 
-<div class="grid">
-  <!-- Left column: Lamps + System -->
-  <div class="col">
-    <div id="bulbContainer" class="col"></div>
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="dashboard" onclick="showTab('dashboard')">📊 Dashboard</button>
+  <button class="tab-btn" data-tab="system" onclick="showTab('system')">🖥 System</button>
+  <button class="tab-btn" data-tab="admin" onclick="showTab('admin')">⚙ Admin</button>
+</nav>
 
-    <div class="card">
-      <h2>🖥 System</h2>
-      <div class="system-actions">
-        <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
-        <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
-        <button class="btn btn-secondary" onclick="doScan()">Scan</button>
-        <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
-        <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+<!-- Dashboard: Lamps + Sensors -->
+<section class="tab-panel active" id="tab-dashboard">
+  <div class="grid">
+    <div class="col">
+      <div class="card all-lamps-card">
+        <span class="all-lamps-label">💡 All Lamps</span>
+        <div class="all-lamps-actions">
+          <button class="btn btn-success" onclick="allPower(true)">All On</button>
+          <button class="btn btn-secondary" onclick="allPower(false)">All Off</button>
+        </div>
       </div>
-      <div class="log-area" id="logArea">
-        <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
-      </div>
+      <div id="bulbContainer" class="col"></div>
+    </div>
+    <div class="col">
+      <div id="sensorContainer" class="col"></div>
     </div>
   </div>
+</section>
 
-  <!-- Right column: Sensors + Policies -->
-  <div class="col">
-    <div id="sensorContainer" class="col"></div>
-
-    <div class="card" id="policiesCard">
-      <h2>⚡ Automation Policies</h2>
-      <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
-        <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
-      </div>
+<!-- System: status / actions / logs -->
+<section class="tab-panel" id="tab-system">
+  <div class="card">
+    <h2>🖥 System</h2>
+    <div class="system-actions">
+      <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
+      <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
+      <button class="btn btn-secondary" onclick="doScan()">Scan</button>
+      <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
+      <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+    </div>
+    <div class="log-area" id="logArea">
+      <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
     </div>
   </div>
-</div>
+</section>
+
+<!-- Admin: automation policies -->
+<section class="tab-panel" id="tab-admin">
+  <div class="card" id="policiesCard">
+    <h2>⚡ Automation Policies</h2>
+    <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
+      <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+    </div>
+  </div>
+</section>
 
 <div class="toast-container" id="toasts"></div>
 
@@ -550,6 +661,7 @@ async function api(method, path, body, timeout = 40000) {
 
 // --- System commands ---
 async function checkStatus() {
+  clearLog();
   const data = await api('GET', '/api/status');
   if (data) {
     $('connDot').classList.add('connected');
@@ -566,6 +678,7 @@ async function checkStatus() {
     refreshBulbs();
     // Fetch initial sensor + policy data, then start event loop
     refreshSensors();
+    refreshPolicies();
     startEventLoop();
   } else {
     $('connDot').classList.remove('connected');
@@ -574,6 +687,7 @@ async function checkStatus() {
 }
 
 async function doScan() {
+  clearLog();
   appendLog('info', 'Scanning...');
   const data = await api('POST', '/api/scan', { duration: 10 });
   if (data) {
@@ -587,6 +701,7 @@ async function doScan() {
 }
 
 async function doDiscover() {
+  clearLog();
   appendLog('info', 'Discovering Hue bulbs...');
   const data = await api('POST', '/api/discover');
   if (data) {
@@ -597,9 +712,9 @@ async function doDiscover() {
 }
 
 async function fetchLogs() {
+  clearLog();
   const data = await api('GET', '/api/logs?limit=30');
   if (data && data.logs) {
-    $('logArea').innerHTML = '';
     data.logs.reverse().forEach(l => appendLog(l.level, `[${l.ts}] ${l.msg}`));
   }
 }
@@ -627,6 +742,7 @@ function bulbIdFromName(name) {
 }
 
 async function doRefresh() {
+  clearLog();
   appendLog('info', 'Reading live state from bulbs (BLE)...');
   for (let i = 1; i <= NUM_BULBS; i++) {
     const data = await api('POST', `/api/bulb/${i}/refresh`);
@@ -686,6 +802,10 @@ function renderBulb(id, state) {
         oninput="$('ct-val-${id}').textContent=this.value+' mirek'"
         onchange="setColorTemp(${id}, +this.value)">
     </div>
+    <div class="bulb-footer">
+      <button class="bulb-unpair" title="Delete the BLE bond on the nRF. Use after factory-resetting the bulb to fix pairing problems."
+        onclick="unpairBulb(${id}, '${escapeHtml(label)}')">Unpair</button>
+    </div>
   `;
 }
 
@@ -713,6 +833,49 @@ async function togglePower(id, on) {
     toast(`Power failed: ${JSON.stringify(data)}`, 'error');
     // Revert toggle
     setTimeout(() => refreshBulbs(), 500);
+  }
+}
+
+async function allPower(on) {
+  if (bulbBusy) return;
+  setBulbsDisabled(true);
+  let ok = 0, failed = 0;
+  for (let i = 1; i <= NUM_BULBS; i++) {
+    const data = await api('POST', `/api/bulb/${i}/power`, { on });
+    if (data && data.status === 'ok') {
+      ok++;
+      bulbs[i] = { ...bulbs[i], power: on };
+      renderBulb(i, bulbs[i]);
+    } else if (data && data.status === 'error' && data.reason === 'process not running') {
+      break; // no more bulbs
+    } else {
+      failed++;
+    }
+  }
+  setBulbsDisabled(false);
+  if (failed > 0) {
+    toast(`All ${on ? 'on' : 'off'}: ${ok} ok, ${failed} failed`, 'error');
+  } else {
+    toast(`All lamps ${on ? 'on' : 'off'} (${ok})`);
+  }
+}
+
+async function unpairBulb(id, label) {
+  if (bulbBusy) return;
+  const ok = confirm(
+    `Unpair "${label}"?\n\n` +
+    `This deletes the BLE bond (stored key) for this bulb on the nRF.\n` +
+    `Use this to fix pairing problems. After unpairing, factory-reset ` +
+    `the bulb, then use Discover (or send a command) to pair again.`
+  );
+  if (!ok) return;
+  setBulbsDisabled(true);
+  const data = await api('DELETE', `/api/bulb/${id}/bond`);
+  setBulbsDisabled(false);
+  if (data && data.status === 'ok') {
+    toast(`Bond deleted for "${label}"`);
+  } else {
+    toast(`Unpair failed: ${data ? data.reason || '' : 'no response'}`, 'error');
   }
 }
 
@@ -787,6 +950,10 @@ async function renameBulb(id, name) {
 }
 
 // --- Log area ---
+function clearLog() {
+  $('logArea').innerHTML = '';
+}
+
 function appendLog(level, msg) {
   const area = $('logArea');
   const line = document.createElement('div');
@@ -1031,13 +1198,29 @@ async function togglePolicy(id, enabled) {
 }
 
 // --- Init ---
+// Restore last-used host (the controller's DHCP IP changes between sessions).
+const savedHost = localStorage.getItem('myhome_host');
+if (savedHost) $('hostInput').value = savedHost;
+
 $('hostInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') checkStatus();
 });
+$('hostInput').addEventListener('change', () => {
+  localStorage.setItem('myhome_host', $('hostInput').value.trim());
+});
+
+// --- Tab navigation ---
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  const panel = $(`tab-${name}`);
+  if (panel) panel.classList.add('active');
+  const btn = document.querySelector(`.tab-btn[data-tab="${name}"]`);
+  if (btn) btn.classList.add('active');
+}
 
 // Auto-connect on load
 setTimeout(checkStatus, 500);
-setTimeout(refreshPolicies, 1000);
 
 // --- Long-poll event loop ---
 // Replaces constant polling. The ESP32 holds the connection open until

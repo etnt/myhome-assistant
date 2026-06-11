@@ -18,13 +18,14 @@ cd viz && python3 -m http.server 3000
 ```
 
 > **Note:** This project started with just an ESP32-S3 but then expanded to
-> an architectore which also make use of the XIAO-nRF52849 Bluetooth module.
+> an architectore which also make use of the XIAO-nRF52840 Bluetooth module.
 > The first approach can be found in the branch: **esp32-s3-only** and the
 > latter (current) approach exists in the **main** branch.
 
 ## Hardware
 
 - ESP32-S3 development board
+- Seed XIAO nRF52840 Bluetooth module
 - Philips Hue Bluetooth bulbs (2019+ models with built-in BLE)
 - Sensors: VEML6039, BME680
 
@@ -161,6 +162,7 @@ you'll see the obtained IP address, of the ESP32, being printed.
 | GET    | `/api/events`              | —                       | Long-poll for real-time events (30s timeout) |
 | POST   | `/api/reconnect`           | —                       | Clear connect cooldown on all bulbs |
 | POST   | `/api/bulb/{n}/reconnect`  | —                       | Clear connect cooldown on a single bulb |
+| DELETE | `/api/bulb/{n}/bond`       | —                       | Delete the BLE bond (stored key) for a bulb on the nRF |
 
 #### Low-level BLE debug endpoints
 
@@ -226,6 +228,10 @@ curl -X POST http://<esp-ip>:8080/api/bulb/1/state \
 
 # Remove a bulb (erases from NVS, stops process)
 curl -X DELETE http://<esp-ip>:8080/api/bulb/3
+
+# Unpair a bulb (delete its BLE bond on the nRF) — fixes pairing mismatches.
+# After this, factory-reset the bulb, then re-discover or send a command.
+curl -X DELETE http://<esp-ip>:8080/api/bulb/2/bond
 
 # Pretty print scan result
 curl -s http://<esp-ip>:8080/api/scan | jq -r '.scan.results[] | select(.name != "") | "\(.addr) rssi=\(.rssi) \(.name)"'
@@ -435,6 +441,23 @@ GATT writes are rejected because the connection is not encrypted/bonded.
 2. Factory-reset the bulbs, see earlier note.
 3. Rebuild and flash firmware + app: `make flash`
 4. The bulbs enter pairing mode for ~30s after reset
+
+### Single bulb stuck with `status=9` bonding failure
+
+One bulb repeatedly fails to bond (`BLE bonding failed: status=9`, then
+disconnects with `reason=0x3E`) while the others work. This is a **bond
+mismatch**: the nRF still holds a stored key (LTK) for that bulb, but the
+bulb's side of the bond was lost or changed.
+
+**Fix:**
+1. Delete the stale bond on the nRF for just that bulb:
+   ```bash
+   curl -X DELETE http://<esp-ip>:8080/api/bulb/{n}/bond
+   ```
+   (or click **Unpair** on the bulb card in the Web UI)
+2. Factory-reset the bulb so it forgets its old bond too.
+3. Re-pair: `curl -X POST http://<esp-ip>:8080/api/discover` (or just send a
+   command — the bulb will pair fresh on the next connection).
 
 ### Timeout errors on first GATT write
 

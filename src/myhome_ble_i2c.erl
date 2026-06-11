@@ -16,7 +16,7 @@
 %% BLE operations
 -export([scan/1, connect/1, connect/2, disconnect/1, bond/1]).
 -export([gatt_discover/1, gatt_read/2, gatt_write/3, gatt_write_nr/3]).
--export([subscribe/2, get_bonds/0, delete_bonds/0]).
+-export([subscribe/2, get_bonds/0, delete_bond/1, delete_bond/2, delete_bonds/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -42,6 +42,8 @@
 -define(CMD_GATT_WRITE,   16#21).
 -define(CMD_GATT_WRITE_NR, 16#22).
 -define(CMD_SUBSCRIBE,    16#23).
+-define(CMD_DELETE_BOND,  16#31).
+-define(CMD_DELETE_ALL_BONDS, 16#32).
 -define(CMD_RESET,        16#FF).
 
 %% Event IDs
@@ -129,7 +131,19 @@ gatt_write_nr(ConnH, AttrH, Data) ->
     gen_server:call(?MODULE, {gatt_write_nr, ConnH, AttrH, Data}, 5000).
 subscribe(_ConnH, _CharH) -> {error, not_implemented}.
 get_bonds() -> {error, not_implemented}.
-delete_bonds() -> {error, not_implemented}.
+
+%% Delete the stored bond for a single peer (clears the LTK on the nRF).
+delete_bond(Addr) when byte_size(Addr) =:= 6 ->
+    delete_bond(Addr, 1);  %% default: random address type
+delete_bond(_) -> {error, invalid_addr}.
+
+delete_bond(Addr, AddrType) when byte_size(Addr) =:= 6 ->
+    gen_server:call(?MODULE, {delete_bond, Addr, AddrType}, 5000);
+delete_bond(_, _) -> {error, invalid_addr}.
+
+%% Delete all stored bonds.
+delete_bonds() ->
+    gen_server:call(?MODULE, delete_all_bonds, 5000).
 
 %% Phase 4: GATT discovery
 gatt_discover(ConnH) ->
@@ -242,6 +256,24 @@ handle_call({gatt_write, ConnH, AttrH, Data}, From, #state{i2c = I2C} = State) -
     end;
 handle_call({gatt_write_nr, ConnH, AttrH, Data}, _From, #state{i2c = I2C} = State) ->
     Cmd = <<?REG_CMD, ?CMD_GATT_WRITE_NR, ConnH:16/little, AttrH:16/little, Data/binary>>,
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
+        ok ->
+            {reply, ok, State};
+        {error, _} = Err ->
+            {reply, Err, State}
+    end;
+handle_call({delete_bond, Addr, AddrType}, _From, #state{i2c = I2C} = State) ->
+    myhome_log:log(info, "BLE deleting bond for ~s", [format_addr(Addr)]),
+    Cmd = <<?REG_CMD, ?CMD_DELETE_BOND, Addr:6/binary, AddrType>>,
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
+        ok ->
+            {reply, ok, State};
+        {error, _} = Err ->
+            {reply, Err, State}
+    end;
+handle_call(delete_all_bonds, _From, #state{i2c = I2C} = State) ->
+    myhome_log:log(info, "BLE deleting all bonds", []),
+    Cmd = <<?REG_CMD, ?CMD_DELETE_ALL_BONDS>>,
     case i2c:write_bytes(I2C, ?XIAO_ADDR, Cmd) of
         ok ->
             {reply, ok, State};

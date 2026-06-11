@@ -11,7 +11,7 @@
 -export([start_link/3]).
 -export([set_power/2, set_brightness/2, set_color_temp/2]).
 -export([set_color_xy/3, set_state/2, get_state/1, read_state/1]).
--export([clear_cooldown/1]).
+-export([clear_cooldown/1, unpair/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -117,6 +117,13 @@ get_state(Name) ->
 clear_cooldown(Name) ->
     gen_server:call(Name, clear_cooldown).
 
+%% @doc Delete the BLE bond for this bulb on the nRF (clears the stored LTK).
+%% Disconnects any active link and clears the cooldown so a fresh pairing
+%% can be established on the next command (after factory-resetting the bulb).
+-spec unpair(atom()) -> ok | {error, term()}.
+unpair(Name) ->
+    gen_server:call(Name, unpair, ?CALL_TIMEOUT).
+
 %% @doc Read the actual bulb state via BLE GATT (connects on-demand).
 -spec read_state(atom()) -> {ok, map()} | {error, term()}.
 read_state(Name) ->
@@ -176,6 +183,21 @@ handle_call(get_state, _From, State) ->
 
 handle_call(clear_cooldown, _From, State) ->
     {reply, ok, State#state{last_connect_fail = undefined}};
+
+handle_call(unpair, _From, #state{addr = Addr, addr_type = AddrType,
+                                  conn_handle = ConnHandle, name = Name} = State) ->
+    %% Drop any active connection before clearing the bond
+    case ConnHandle of
+        undefined -> ok;
+        _ -> catch myhome_ble_i2c:disconnect(ConnHandle)
+    end,
+    Result = myhome_ble_i2c:delete_bond(Addr, AddrType),
+    myhome_log:log(info, "[~p] unpair: ~p", [Name, Result]),
+    {reply, Result, State#state{conn_handle = undefined, connected = false,
+                                gatt_handles = undefined,
+                                pending_cmd = undefined, pending_from = undefined,
+                                pending_ref = undefined,
+                                last_connect_fail = undefined}};
 
 handle_call(read_state, From, State) ->
     do_cmd(read_all, From, State);

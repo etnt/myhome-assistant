@@ -363,6 +363,30 @@ static void cmd_work_handler(struct k_work *work)
         break;
     }
 
+    case CMD_DELETE_BOND: {
+        /* Payload: [addr 6B, addr_type 1B] */
+        if (cmd_buf_len < 8) {
+            LOG_ERR("DELETE_BOND: payload too short (%u)", cmd_buf_len);
+            last_cmd_result = CMD_RESULT_ERROR;
+            break;
+        }
+        int err = ble_central_unpair(&cmd_buf[1], cmd_buf[7]);
+        if (err != 0) {
+            LOG_ERR("Unpair failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
+    case CMD_DELETE_ALL_BONDS: {
+        int err = ble_central_unpair_all();
+        if (err != 0) {
+            LOG_ERR("Unpair all failed: %d", err);
+            last_cmd_result = CMD_RESULT_ERROR;
+        }
+        break;
+    }
+
     default:
         LOG_WRN("Unknown deferred command 0x%02x", cmd_id);
         last_cmd_result = CMD_RESULT_UNKNOWN;

@@ -51,7 +51,7 @@ init([]) ->
                     io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
                     Port = myhome_config:http_port(),
                     Opts = #{cors => #{allow_origin => <<"*">>,
-                                       allow_methods => <<"GET, POST, OPTIONS">>,
+                                       allow_methods => <<"GET, POST, DELETE, OPTIONS">>,
                                        allow_headers => <<"Content-Type">>}},
                     case tiny_httpd:start_link(any, Port, myhome_http_handler, Opts) of
                         {ok, _} ->
