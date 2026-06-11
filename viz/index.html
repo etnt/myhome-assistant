@@ -589,6 +589,7 @@ input[type="range"]::-moz-range-thumb:hover {
       <div id="bulbContainer" class="col"></div>
     </div>
     <div class="col">
+      <div id="mowerContainer" class="col"></div>
       <div id="sensorContainer" class="col"></div>
     </div>
   </div>
@@ -617,6 +618,17 @@ input[type="range"]::-moz-range-thumb:hover {
     <h2>⚡ Automation Policies</h2>
     <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
       <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>🤖 Mower Bridge</h2>
+    <div style="color:var(--text-dim);font-size:0.85rem;margin-bottom:0.5rem;">
+      URL of the host running <code>tools/navimow_server.py</code> (e.g. your home server).
+    </div>
+    <div style="display:flex;gap:0.5rem;">
+      <input id="mowerUrlInput" type="text" placeholder="http://192.168.68.x:8765"
+        style="flex:1;padding:0.5rem;background:var(--bg);color:var(--text);border:1px solid var(--accent);border-radius:var(--radius);">
+      <button class="btn btn-secondary" onclick="saveMowerUrl()">Save</button>
     </div>
   </div>
 </section>
@@ -679,6 +691,7 @@ async function checkStatus() {
     // Fetch initial sensor + policy data, then start event loop
     refreshSensors();
     refreshPolicies();
+    refreshMower();
     startEventLoop();
   } else {
     $('connDot').classList.remove('connected');
@@ -1148,6 +1161,91 @@ function renderSensors(sensors) {
   }
 }
 
+// --- Mower (Navimow) ---
+// The mower lives in the vendor cloud, not on the ESP32, so the UI talks to
+// a small host-side bridge (tools/navimow_server.py) instead of baseUrl().
+const MOWER_DEFAULT = 'http://localhost:8765';
+function mowerUrl() {
+  return (localStorage.getItem('myhome_mower_url') || MOWER_DEFAULT).replace(/\/+$/, '');
+}
+
+function saveMowerUrl() {
+  const url = $('mowerUrlInput').value.trim();
+  if (url) {
+    localStorage.setItem('myhome_mower_url', url);
+  } else {
+    localStorage.removeItem('myhome_mower_url');
+  }
+  toast('Mower bridge URL saved');
+  refreshMower();
+}
+
+const MOWER_STATES = {
+  mowing:    { icon: '🌱', label: 'Mowing',    color: 'var(--success)' },
+  charging:  { icon: '🔌', label: 'Charging',  color: 'var(--accent2)' },
+  docked:    { icon: '🏠', label: 'Docked',    color: 'var(--text-dim)' },
+  returning: { icon: '↩️', label: 'Returning', color: 'var(--accent2)' },
+  paused:    { icon: '⏸️', label: 'Paused',    color: 'var(--accent2)' },
+  idle:      { icon: '💤', label: 'Idle',      color: 'var(--text-dim)' },
+  error:     { icon: '⚠️', label: 'Error',     color: 'var(--accent)' },
+  unknown:   { icon: '❓', label: 'Unknown',   color: 'var(--text-dim)' },
+};
+
+async function refreshMower() {
+  try {
+    const res = await fetch(`${mowerUrl()}/api/mower`, { signal: AbortSignal.timeout(15000) });
+    const data = await res.json();
+    if (!data.ok) { renderMowerMessage(data.error || 'Mower unavailable'); return; }
+    renderMower(data.mowers || []);
+  } catch (e) {
+    renderMowerMessage('Bridge offline — run <code>python tools/navimow_server.py</code>');
+  }
+}
+
+function batteryColor(pct) {
+  if (pct == null) return 'var(--text-dim)';
+  if (pct <= 20) return 'var(--accent)';
+  if (pct <= 50) return 'var(--accent2)';
+  return 'var(--success)';
+}
+
+function renderMower(mowers) {
+  const container = $('mowerContainer');
+  if (!mowers.length) { renderMowerMessage('No mower on this account'); return; }
+  container.innerHTML = mowers.map(m => {
+    const s = MOWER_STATES[m.state] || MOWER_STATES.unknown;
+    const bat = m.battery;
+    const batLabel = bat == null ? '—' : `${bat}%`;
+    const batWidth = bat == null ? 0 : Math.max(0, Math.min(100, bat));
+    const err = (m.state === 'error' && m.error_message)
+      ? `<div style="color:var(--accent);font-size:0.85rem;margin-top:0.5rem;">⚠️ ${m.error_message}</div>`
+      : '';
+    return `
+      <div class="card sensor-card">
+        <h2>🤖 ${m.name || 'Mower'}${m.model ? ` <span style="color:var(--text-dim);font-weight:400;">(${m.model})</span>` : ''}</h2>
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;">
+          <span style="font-size:1.4rem;">${s.icon}</span>
+          <span style="font-weight:600;color:${s.color};">${s.label}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.85rem;color:var(--text-dim);margin-bottom:0.25rem;">
+          <span>Battery</span><span style="color:var(--text);">${batLabel}</span>
+        </div>
+        <div style="height:8px;background:var(--bg);border-radius:4px;overflow:hidden;">
+          <div style="height:100%;width:${batWidth}%;background:${batteryColor(bat)};transition:width 0.4s;"></div>
+        </div>
+        ${err}
+      </div>`;
+  }).join('');
+}
+
+function renderMowerMessage(html) {
+  $('mowerContainer').innerHTML = `
+    <div class="card sensor-card">
+      <h2>🤖 Mower</h2>
+      <div style="color:var(--text-dim);font-size:0.85rem;">${html}</div>
+    </div>`;
+}
+
 // --- Policies ---
 async function refreshPolicies() {
   const data = await api('GET', '/api/policies');
@@ -1221,6 +1319,12 @@ function showTab(name) {
 
 // Auto-connect on load
 setTimeout(checkStatus, 500);
+
+// Mower status comes from a separate host-side bridge, independent of the
+// ESP32 connection, so poll it on its own cadence.
+$('mowerUrlInput').value = localStorage.getItem('myhome_mower_url') || '';
+refreshMower();
+setInterval(refreshMower, 60000);
 
 // --- Long-poll event loop ---
 // Replaces constant polling. The ESP32 holds the connection open until
