@@ -115,6 +115,11 @@ int main(void)
         LOG_WRN("Reset pin init failed (non-fatal): %d", ret);
     }
 
+    /* Begin persistent auto-reconnect to all bonded bulbs (Phase 5). Bonds
+     * were loaded by ble_central_init(); this arms background connection so
+     * bulbs stay reachable without an explicit command. */
+    ble_central_autoconnect_start();
+
     /* Queue READY event — ESP32 will see IRQ go LOW */
     event_queue_push_simple(EVT_READY);
     LOG_INF("READY event queued, waiting for ESP32");

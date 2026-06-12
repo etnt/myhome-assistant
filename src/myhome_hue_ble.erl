@@ -49,19 +49,13 @@
     addr      :: binary(),        %% 6-byte BLE address
     addr_type :: integer(),
     conn_handle :: non_neg_integer() | undefined,
-    connected :: boolean(),
-    %% GATT handle cache: UUID binary → ATT value handle
+    connected :: boolean(),       %% true once the link is encrypted & ready
+    %% GATT handle cache: UUID binary → ATT value handle (discovered once)
     gatt_handles :: #{binary() => non_neg_integer()} | undefined,
     %% Cached light state
     power     :: boolean() | undefined,
     brightness :: integer() | undefined,
-    color_temp :: integer() | undefined,
-    %% Connect-on-demand: pending command waiting for encryption
-    pending_cmd :: term() | undefined,
-    pending_from :: term() | undefined,
-    pending_ref :: reference() | undefined,  %% watchdog ref for pending_cmd
-    %% Cooldown: avoid repeated failed connects
-    last_connect_fail :: integer() | undefined  %% system_time(millisecond)
+    color_temp :: integer() | undefined
 }).
 
 %%====================================================================
@@ -79,12 +73,6 @@ start_link(Addr, AddrType, Name) ->
 
 %% Heartbeat: periodic state read to detect external changes (e.g., physical switch)
 -define(HEARTBEAT_INTERVAL_MS, 300000). %% 5 minutes
-
-%% Watchdog: if a pending command isn't resolved by an enc_change/disconnect
-%% event within this window, reset the connection state so the bulb doesn't
-%% get stuck replying {error, busy} forever. Must be < ?CALL_TIMEOUT so a
-%% waiting caller gets a clean {error, timeout} reply.
--define(PENDING_TIMEOUT_MS, 30000).
 
 -spec set_power(atom(), boolean()) -> ok | {error, term()}.
 set_power(Name, On) ->
@@ -134,8 +122,11 @@ read_state(Name) ->
 %%====================================================================
 
 init({Addr, AddrType, Name}) ->
-    %% Subscribe to BLE events (enc_change, disconnected)
+    %% Subscribe to BLE events. The nRF keeps bonded bulbs permanently
+    %% connected (persistent auto-connect), so we react to the connection
+    %% lifecycle rather than connecting on demand.
     myhome_event_bus:subscribe(self(), fun
+        ({ble_connected, _, _}) -> true;
         ({ble_enc_change, _, _}) -> true;
         ({ble_disconnected, _, _}) -> true;
         (_) -> false
@@ -148,9 +139,7 @@ init({Addr, AddrType, Name}) ->
         connected = false,
         gatt_handles = undefined
     },
-    %% Connect-on-demand: no connection at startup.
-    %% WiFi stays healthy until a command actually needs BLE.
-    myhome_log:log(info, "[~p] ready (connect-on-demand)", [Name]),
+    myhome_log:log(info, "[~p] ready (persistent connection managed by nRF)", [Name]),
     %% Schedule first heartbeat (stagger based on atomvm:random to avoid all bulbs reading at once)
     Jitter = (atomvm:random() rem ?HEARTBEAT_INTERVAL_MS) + 60000,
     erlang:send_after(Jitter, self(), heartbeat),
@@ -182,7 +171,9 @@ handle_call(get_state, _From, State) ->
     {reply, Reply, State};
 
 handle_call(clear_cooldown, _From, State) ->
-    {reply, ok, State#state{last_connect_fail = undefined}};
+    %% No cooldown in the persistent model; the nRF auto-reconnects on its own.
+    %% Kept for HTTP API compatibility (/reconnect endpoints).
+    {reply, ok, State};
 
 handle_call(unpair, _From, #state{addr = Addr, addr_type = AddrType,
                                   conn_handle = ConnHandle, name = Name} = State) ->
@@ -194,10 +185,7 @@ handle_call(unpair, _From, #state{addr = Addr, addr_type = AddrType,
     Result = myhome_ble_i2c:delete_bond(Addr, AddrType),
     myhome_log:log(info, "[~p] unpair: ~p", [Name, Result]),
     {reply, Result, State#state{conn_handle = undefined, connected = false,
-                                gatt_handles = undefined,
-                                pending_cmd = undefined, pending_from = undefined,
-                                pending_ref = undefined,
-                                last_connect_fail = undefined}};
+                                gatt_handles = undefined}};
 
 handle_call(read_state, From, State) ->
     do_cmd(read_all, From, State);
@@ -208,109 +196,59 @@ handle_call(_Req, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%% Encryption established — execute pending command
-handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
-            #state{conn_handle = ConnHandle, pending_cmd = Cmd, pending_from = From} = State)
-  when Cmd =/= undefined ->
-    case Status of
-        0 ->
-            myhome_log:log(info, "[~p] encrypted, executing: ~s", [State#state.name, cmd_name(Cmd)]),
-            {Reply, NewState} = execute_cmd(Cmd, State#state{connected = true}),
-            myhome_ble_i2c:disconnect(ConnHandle),
-            case From of
-                undefined -> ok;  %% heartbeat — no caller to reply to
-                _ -> gen_server:reply(From, Reply)
-            end,
-            publish_state(NewState),
-            {noreply, NewState#state{pending_cmd = undefined, pending_from = undefined,
-                                     pending_ref = undefined,
-                                     conn_handle = undefined, connected = false}};
-        _ ->
-            myhome_log:log(error, "[~p] security failed (status=~p)", [State#state.name, Status]),
-            case From of
-                undefined -> ok;
-                _ -> gen_server:reply(From, {error, {security_failed, Status}})
-            end,
-            myhome_ble_i2c:disconnect(ConnHandle),
-            {noreply, State#state{conn_handle = undefined, connected = false,
-                                  pending_cmd = undefined, pending_from = undefined,
-                                  pending_ref = undefined}}
-    end;
+%% nRF established a connection to this bulb (persistent auto-connect or a
+%% manual pairing connect). Match by address; record the handle and wait for
+%% the link to be encrypted before marking it ready.
+handle_info({ble_event, {ble_connected, Handle, Addr}},
+            #state{addr = Addr} = State) ->
+    myhome_log:log(info, "[~p] connected [~p], awaiting encryption",
+                   [State#state.name, Handle]),
+    {noreply, State#state{conn_handle = Handle, connected = false}};
 
-%% Encryption event but no pending command (e.g., reconnect without command)
-handle_info({ble_event, {ble_enc_change, ConnHandle, Status}},
-            #state{conn_handle = ConnHandle} = State) ->
-    case Status of
-        0 ->
-            myhome_log:log(info, "[~p] encrypted (no pending cmd), disconnecting", [State#state.name]),
-            myhome_ble_i2c:disconnect(ConnHandle),
-            {noreply, State#state{conn_handle = undefined, connected = false}};
-        _ ->
-            myhome_ble_i2c:disconnect(ConnHandle),
-            {noreply, State#state{conn_handle = undefined, connected = false}}
-    end;
-
-handle_info({ble_event, {ble_disconnected, ConnHandle, Reason}},
-            #state{conn_handle = ConnHandle} = State) ->
-    myhome_log:log(info, "[~p] disconnected (reason=~p)", [State#state.name, Reason]),
-    %% Fail any pending command — whether from an external caller or a
-    %% heartbeat (pending_from = undefined). Always clear pending state so
-    %% the bulb doesn't get stuck replying {error, busy}.
-    case State#state.pending_from of
-        undefined -> ok;
-        From -> gen_server:reply(From, {error, disconnected})
+%% Link encrypted — bulb is ready. Discover GATT handles once (cached across
+%% reconnects), refresh cached state, and publish.
+handle_info({ble_event, {ble_enc_change, Handle, 0}},
+            #state{conn_handle = Handle} = State) ->
+    myhome_log:log(info, "[~p] encrypted, ready", [State#state.name]),
+    State1 = State#state{connected = true},
+    State2 = case ensure_gatt_handles(State1) of
+        {ok, S} ->
+            {_, S3} = execute_cmd(read_all, S),
+            S3;
+        {error, _} ->
+            State1
     end,
-    {noreply, State#state{conn_handle = undefined, connected = false,
-                          pending_cmd = undefined, pending_from = undefined,
-                          pending_ref = undefined}};
+    publish_state(State2),
+    {noreply, State2};
 
-%% Heartbeat: periodic state read to detect external changes
-handle_info(heartbeat, #state{pending_cmd = undefined} = State) ->
-    erlang:send_after(?HEARTBEAT_INTERVAL_MS, self(), heartbeat),
-    case in_connect_cooldown(State) of
-        true ->
-            %% Bulb unreachable — skip this cycle
-            {noreply, State};
-        false ->
-            %% Initiate a read_state as an internal command (no external caller)
-            case myhome_ble_i2c:connect(State#state.addr, State#state.addr_type) of
-                {ok, ConnHandle} ->
-                    %% Must explicitly request bond/encryption
-                    spawn(fun() -> myhome_ble_i2c:bond(ConnHandle) end),
-                    Ref = schedule_pending_timeout(),
-                    {noreply, State#state{conn_handle = ConnHandle, connected = false,
-                                          pending_cmd = read_all, pending_from = undefined,
-                                          pending_ref = Ref}};
-                {error, _} ->
-                    {noreply, State#state{last_connect_fail = erlang:system_time(millisecond)}}
-            end
-    end;
+%% Encryption failed — leave the bulb marked down; the nRF will retry.
+handle_info({ble_event, {ble_enc_change, Handle, Status}},
+            #state{conn_handle = Handle} = State) ->
+    myhome_log:log(warning, "[~p] encryption failed (status=~p)",
+                   [State#state.name, Status]),
+    {noreply, State#state{connected = false}};
+
+%% Bulb disconnected. The nRF auto-reconnects when it advertises again, so we
+%% just mark it down — no reconnect initiated from here. GATT handles are kept
+%% cached (the Hue GATT layout is stable across reconnects).
+handle_info({ble_event, {ble_disconnected, Handle, Reason}},
+            #state{conn_handle = Handle} = State) ->
+    myhome_log:log(info, "[~p] disconnected (reason=~p), nRF will auto-reconnect",
+                   [State#state.name, Reason]),
+    {noreply, State#state{conn_handle = undefined, connected = false}};
+
+%% Heartbeat: refresh cached state while connected to detect external changes
+%% (e.g., the physical wall switch). Skipped when disconnected.
 handle_info(heartbeat, State) ->
-    %% A command is already pending — skip this heartbeat
     erlang:send_after(?HEARTBEAT_INTERVAL_MS, self(), heartbeat),
-    {noreply, State};
-
-%% Watchdog fired for the current pending command — the expected enc_change /
-%% disconnect event never arrived. Reset connection state so we recover.
-handle_info({pending_timeout, Ref},
-            #state{pending_ref = Ref, pending_cmd = Cmd} = State)
-  when Cmd =/= undefined ->
-    myhome_log:log(warning, "[~p] pending command ~s timed out — resetting",
-                   [State#state.name, cmd_name(Cmd)]),
-    case State#state.pending_from of
-        undefined -> ok;
-        From -> gen_server:reply(From, {error, timeout})
-    end,
-    case State#state.conn_handle of
-        undefined -> ok;
-        H -> myhome_ble_i2c:disconnect(H)
-    end,
-    {noreply, State#state{pending_cmd = undefined, pending_from = undefined,
-                          pending_ref = undefined, conn_handle = undefined,
-                          connected = false}};
-%% Stale watchdog (command already resolved) — ignore.
-handle_info({pending_timeout, _Stale}, State) ->
-    {noreply, State};
+    case State#state.connected of
+        true ->
+            {_, NewState} = execute_cmd(read_all, State),
+            publish_state(NewState),
+            {noreply, NewState};
+        false ->
+            {noreply, State}
+    end;
 
 handle_info(_Msg, State) ->
     {noreply, State}.
@@ -325,52 +263,16 @@ terminate(_Reason, #state{conn_handle = Handle}) ->
 %% Internal functions
 %%====================================================================
 
-%% Arm the pending-command watchdog. Returns a unique ref that is matched
-%% against the {pending_timeout, Ref} message so stale timers are ignored.
-schedule_pending_timeout() ->
-    Ref = make_ref(),
-    erlang:send_after(?PENDING_TIMEOUT_MS, self(), {pending_timeout, Ref}),
-    Ref.
-
-%% Execute a command — connect on-demand if needed
+%% Execute a command on the persistent connection. The nRF keeps bonded bulbs
+%% connected, so a command either runs immediately or fails fast when the bulb
+%% is currently down (it will reconnect on its own in the background).
 do_cmd(Cmd, _From, #state{connected = true, conn_handle = Handle} = State)
   when Handle =/= undefined ->
-    %% Already connected and encrypted — execute immediately
     {Reply, NewState} = execute_cmd(Cmd, State),
-    myhome_ble_i2c:disconnect(Handle),
-    {reply, Reply, NewState#state{conn_handle = undefined, connected = false}};
-do_cmd(Cmd, From, #state{pending_cmd = undefined} = State) ->
-    %% Not connected — check cooldown then connect on-demand
-    case in_connect_cooldown(State) of
-        true ->
-            {reply, {error, connect_cooldown}, State};
-        false ->
-            do_cmd_connect(Cmd, From, State)
-    end;
-do_cmd(_Cmd, _From, #state{pending_cmd = _Existing} = State) ->
-    %% Already have a pending command (connection in progress)
-    {reply, {error, busy}, State}.
-
-do_cmd_connect(Cmd, From, State) ->
-    case myhome_ble_i2c:connect(State#state.addr, State#state.addr_type) of
-        {ok, ConnHandle} ->
-            myhome_log:log(info, "[~p] connected [~p], initiating bond/encryption...",
-                           [State#state.name, ConnHandle]),
-            %% Must explicitly request bond — XIAO doesn't auto-negotiate encryption.
-            %% For already-bonded devices this just re-encrypts the link.
-            %% bond() is async (waits via bond_waiters), but we also get enc_change
-            %% via the event bus which triggers execute_cmd in handle_info.
-            spawn(fun() -> myhome_ble_i2c:bond(ConnHandle) end),
-            Ref = schedule_pending_timeout(),
-            {noreply, State#state{conn_handle = ConnHandle, connected = false,
-                                  pending_cmd = Cmd, pending_from = From,
-                                  pending_ref = Ref,
-                                  last_connect_fail = undefined}};
-        {error, Reason} ->
-            myhome_log:log(warning, "[~p] connect failed: ~p", [State#state.name, Reason]),
-            {reply, {error, {connect_failed, Reason}},
-             State#state{last_connect_fail = erlang:system_time(millisecond)}}
-    end.
+    publish_state(NewState),
+    {reply, Reply, NewState};
+do_cmd(_Cmd, _From, State) ->
+    {reply, {error, not_connected}, State}.
 
 %% Execute a GATT write command on an encrypted connection
 execute_cmd({write, ChrUUID, Value}, #state{conn_handle = Handle} = State) ->
@@ -511,21 +413,6 @@ update_cached_state(State, Props) ->
         {ok, T} -> S2#state{color_temp = T};
         error   -> S2
     end.
-
-cmd_name({write, ?CHR_POWER, _}) -> "set_power";
-cmd_name({write, ?CHR_BRIGHTNESS, _}) -> "set_brightness";
-cmd_name({write, ?CHR_COLOR_TEMP, _}) -> "set_color_temp";
-cmd_name({write, ?CHR_COLOR_XY, _}) -> "set_color_xy";
-cmd_name({write_multi, _}) -> "set_state";
-cmd_name(read_all) -> "read_state";
-cmd_name(Other) -> io_lib:format("~p", [Other]).
-
-%% 60s cooldown after a failed connect to avoid memory exhaustion from retries
--define(CONNECT_COOLDOWN_MS, 60000).
-
-in_connect_cooldown(#state{last_connect_fail = undefined}) -> false;
-in_connect_cooldown(#state{last_connect_fail = LastFail}) ->
-    (erlang:system_time(millisecond) - LastFail) < ?CONNECT_COOLDOWN_MS.
 
 %% Publish bulb state to event_bus so long-poll clients get updates
 publish_state(#state{name = Name, power = Power, brightness = Bri, color_temp = CT}) ->

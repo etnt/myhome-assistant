@@ -467,18 +467,20 @@ every command (connect-on-demand). Stripping that before the firmware
 keeps bulbs connected would leave commands with no live connection.
 Work the steps in this order:
 
-1. **[ ] nRF52840: auto-reconnect bonded devices on boot** (foundational,
+1. **[x] nRF52840: auto-reconnect bonded devices on boot** (foundational,
    unblocks everything else). On boot, enumerate stored bonds
    (`bt_foreach_bond`), add them to the filter accept list, and
-   auto-connect (background scan / `bt_conn_le_create`). Re-establish
-   on the `disconnected` callback.
-2. **[ ] ESP32 persistent-connection model** — refactor
+   auto-connect (`bt_conn_le_create_auto`). Re-establish on the
+   `disconnected` callback. Scanner is shared, so auto-connect is paused
+   during discovery scans / manual connects and re-armed afterwards.
+2. **[x] ESP32 persistent-connection model** — refactored
    `myhome_hue_ble.erl` to assume a long-lived `conn_handle` (no
-   per-command connect/disconnect), reacting to `CONNECTED` /
-   `DISCONNECTED` / `READY` events instead.
-3. **[ ] Remove cooldown/retry logic** — once connections are
-   persistent, `last_connect_fail` + `CONNECT_COOLDOWN_MS` become dead
-   code.
+   per-command connect/disconnect), reacting to `ble_connected` /
+   `ble_enc_change` / `ble_disconnected` events. Commands run on the live
+   link or fail fast with `{error, not_connected}`.
+3. **[x] Remove cooldown/retry logic** — `last_connect_fail`,
+   `CONNECT_COOLDOWN_MS`, `in_connect_cooldown`, the connect-on-demand
+   path, and the pending-command watchdog are all removed.
 4. **[x] Decommission legacy** — removed `ble.erl` and `nifs/ble/`
    (recoverable from git history if rollback is ever needed);
    `myhome_ble_conn.erl` already removed.

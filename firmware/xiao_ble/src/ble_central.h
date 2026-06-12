@@ -99,4 +99,19 @@ struct bt_conn *ble_central_get_conn(uint16_t conn_handle);
  */
 uint16_t ble_central_conn_to_handle(struct bt_conn *conn);
 
+/*
+ * Persistent auto-reconnect (Phase 5)
+ */
+
+/**
+ * Populate the filter accept list from stored bonds and begin background
+ * auto-connection to every bonded bulb. Bonded devices are then kept
+ * persistently connected (and re-encrypted) without any command from the
+ * ESP32, reconnecting automatically whenever they advertise.
+ *
+ * Call once after ble_central_init(). Safe to call again to refresh the
+ * accept list after bonds change. Returns 0 on success.
+ */
+int ble_central_autoconnect_start(void);
+
 #endif /* BLE_CENTRAL_H */

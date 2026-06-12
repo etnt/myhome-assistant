@@ -443,6 +443,9 @@ handle_event(?EVT_CONNECTED, <<Handle:16/little, Addr:6/binary>>,
     State1 = State#state{
         connections = maps:put(Handle, Addr, Conns)
     },
+    %% Publish so bulb gen_servers learn the handle for nRF-initiated
+    %% (persistent auto-connect) links, which have no conn_waiter.
+    myhome_event_bus:publish({ble_connected, Handle, Addr}),
     case maps:get(Addr, Waiters, undefined) of
         undefined -> State1;
         From ->
