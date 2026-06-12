@@ -459,12 +459,32 @@ longer needed — nRF52840 manages connections internally).
 
 **Goal:** Keep bulbs connected permanently, remove old BLE code.
 
-- [ ] nRF52840: auto-reconnect bonded devices on boot
-- [ ] Remove connect-on-demand logic from `myhome_hue_ble.erl`
-- [ ] Remove `ble.erl`, `nifs/ble/` (kept for rollback); `myhome_ble_conn.erl` removed
-- [x] Remove NimBLE from ESP32-S3 sdkconfig patch
-- [ ] Remove cooldown/retry logic (no longer needed)
-- [ ] Verify: WiFi never drops, heartbeat always succeeds
+The remaining tasks have a hard dependency chain. The ESP32-side
+simplifications (remove connect-on-demand, remove cooldown) only make
+sense **after** the nRF52840 maintains persistent connections. Today
+`myhome_hue_ble.erl` connects → bonds → executes → **disconnects** on
+every command (connect-on-demand). Stripping that before the firmware
+keeps bulbs connected would leave commands with no live connection.
+Work the steps in this order:
+
+1. **[ ] nRF52840: auto-reconnect bonded devices on boot** (foundational,
+   unblocks everything else). On boot, enumerate stored bonds
+   (`bt_foreach_bond`), add them to the filter accept list, and
+   auto-connect (background scan / `bt_conn_le_create`). Re-establish
+   on the `disconnected` callback.
+2. **[ ] ESP32 persistent-connection model** — refactor
+   `myhome_hue_ble.erl` to assume a long-lived `conn_handle` (no
+   per-command connect/disconnect), reacting to `CONNECTED` /
+   `DISCONNECTED` / `READY` events instead.
+3. **[ ] Remove cooldown/retry logic** — once connections are
+   persistent, `last_connect_fail` + `CONNECT_COOLDOWN_MS` become dead
+   code.
+4. **[ ] Decommission legacy** — remove `ble.erl`, `nifs/ble/` (kept for
+   rollback on a git branch — confirm it exists first);
+   `myhome_ble_conn.erl` already removed.
+5. **[x] Remove NimBLE from ESP32-S3 sdkconfig patch** (done).
+6. **[ ] Verify: WiFi never drops, heartbeat always succeeds** (gated on
+   all of the above, on hardware).
 
 ### Phase 6: Polish (1 day)
 
