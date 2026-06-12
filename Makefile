@@ -1,7 +1,7 @@
 # MyHome Assistant - Build & Flash
 #
 # Targets:
-#   make atomvm          Build AtomVM firmware with BLE port driver
+#   make atomvm          Build AtomVM firmware (BLE offloaded to XIAO nRF52840)
 #   make flash-firmware  Flash AtomVM firmware to ESP32-S3
 #   make app             Compile Erlang sources and create .avm packbeam
 #   make flash-app       Build and flash the Erlang application
@@ -26,7 +26,7 @@ IP ?= 192.168.68.50
 
 .PHONY: atomvm flash-firmware app flash-app flash monitor clean all help
 
-## Build AtomVM firmware with BLE component
+## Build AtomVM firmware (BLE disabled on-chip; offloaded to XIAO nRF52840)
 atomvm: install-esptool  $(ESP32_DIR)/build/atomvm-esp32s3.img
 
 install-esptool: .venv
@@ -39,6 +39,7 @@ $(ATOMVM_DIR):
 	git clone --depth 1 git@github.com:etnt/AtomVM.git
 
 $(ESP32_DIR)/build/atomvm-esp32s3.img: $(ATOMVM_DIR) patches/sdkconfig.defaults.in.patch
+	@# Remove the legacy NimBLE port-driver symlink if a previous checkout created it
 	@if [ -L $(ESP32_DIR)/components/ble_port ]; then \
 		rm $(ESP32_DIR)/components/ble_port; \
 	fi
@@ -160,7 +161,7 @@ endif
 
 ## Show available targets
 help:
-	@echo "make atomvm         - Build AtomVM firmware with BLE"
+	@echo "make atomvm          - Build AtomVM firmware (BLE offloaded to XIAO)"
 	@echo "make flash-firmware  - Flash AtomVM firmware to ESP32-S3"
 	@echo "make app             - Build Erlang application"
 	@echo "make flash-app       - Build and flash Erlang app"

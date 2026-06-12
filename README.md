@@ -18,7 +18,7 @@ cd viz && python3 -m http.server 3000
 ```
 
 > **Note:** This project started with just an ESP32-S3 but then expanded to
-> an architectore which also make use of the XIAO-nRF52840 Bluetooth module.
+> an architecture which also make use of the XIAO-nRF52840 Bluetooth module.
 > The first approach can be found in the branch: **esp32-s3-only** and the
 > latter (current) approach exists in the **main** branch.
 
@@ -34,27 +34,48 @@ cd viz && python3 -m http.server 3000
 
 ## Architecture
 
+The system spans two chips: the **ESP32-S3** runs WiFi and the Erlang
+application, while a **XIAO nRF52840** acts as a dedicated BLE bridge. They
+talk over a shared I2C bus (register protocol + a GPIO interrupt line for
+async events), owned by `myhome_ble_i2c`.
+
 ```
 ESP32-S3 (AtomVM/Erlang)
-  ├── myhome_top_sup (rest_for_one)
-  │     ├── myhome_log (in-memory log ring buffer)
-  │     ├── ble (gen_server, owns port, serializes all BLE commands)
-  │     ├── myhome_event_bus (pub/sub for BLE events)
-  │     └── myhome_sup (one_for_one)
-  │           ├── myhome_scanner (subscribes to scan events)
-  │           ├── myhome_http (WiFi + tiny_httpd)
-  │           ├── myhome_http_handler (request routing + tiny_json)
-  │           ├── myhome_discovery (pairing + bulb startup)
-  │           ├── bulb_1 (connect-on-demand) ─·BLE·─► Hue Bulb 1
-  │           └── bulb_2 (connect-on-demand) ─·BLE·─► Hue Bulb 2
-  └── ble_port (C, NimBLE)
+  └── myhome_top_sup (rest_for_one)
+        ├── myhome_log         in-memory log ring buffer
+        ├── myhome_event_bus   pub/sub for BLE + sensor events
+        ├── myhome_ble_i2c     owns the shared I2C bus; BLE register
+        │                      protocol to the XIAO + GPIO IRQ draining
+        └── myhome_sup (one_for_one)
+              ├── myhome_scanner    BLE scans via the XIAO bridge
+              ├── myhome_http       WiFi + tiny_httpd REST API
+              ├── myhome_discovery  pairing + dynamic bulb startup
+              ├── myhome_sensors    BME680 + VEML6030 readings
+              ├── myhome_rules      lux / temp / time automation engine
+              ├── myhome_lcd        16x2 status display (IP + free heap)
+              ├── bulb_1 (myhome_hue_ble) ┐  connect-on-demand Hue control
+              └── bulb_2 (myhome_hue_ble) ┘  (added dynamically by discovery)
+
+Shared I2C bus (owned by myhome_ble_i2c):
+  0x08  XIAO nRF52840  — BLE bridge (scan/connect/GATT) + IRQ line
+  0x77  BME680         — temperature / humidity / pressure / VOC
+  0x48  VEML6030       — ambient + white lux
+  0x27  PCF8574        — 1602 LCD backpack (or 0x3F)
+
+XIAO nRF52840 (Zephyr firmware) ──BLE GATT──► Philips Hue bulbs
 ```
 
-Event flow: C port → `ble` process → `myhome_event_bus` → filtered subscribers.
+`myhome_http_handler` is not a supervised child — `tiny_httpd` spawns one
+handler process per request to route the REST API.
+
+Event flow: the XIAO raises the GPIO IRQ → `myhome_ble_i2c` drains queued
+events over I2C → `myhome_event_bus` → filtered subscribers (scanner, bulbs,
+LCD, …).
 
 BLE strategy: **connect-on-demand** — bulb gen_servers only establish a BLE
-connection when a command is sent, then disconnect after 5s idle. This keeps
-the radio free for WiFi when no light commands are active.
+connection (via the XIAO) when a command is sent, then disconnect after 5s
+idle. This keeps the radio free for WiFi when no light commands are active.
+
 
 ## Automation Rules
 
@@ -505,7 +526,8 @@ bulb's side of the bond was lost or changed.
 ### Timeout errors on first GATT write
 
 The first write to a bulb after connection takes longer (~5-10s) because
-NimBLE performs GATT service discovery to resolve characteristic handles.
+the XIAO bridge performs GATT service discovery to resolve characteristic
+handles.
 
 **Symptoms:**
 - `{timeout, {gen_server, call, ...}}` on first command
@@ -533,25 +555,10 @@ make flash-app
 WIFI_EVENT_STA_BEACON_TIMEOUT received
 ```
 
-The ESP32-S3 has a single 2.4 GHz radio shared between WiFi and BLE.
-ESP-IDF's software coexistence layer (`CONFIG_ESP_COEX_SW_COEXIST_ENABLE`)
-arbitrates access using time-division multiplexing — when both are active,
-each gets alternating ~50% time slices within a coexistence period.
-
-We mitigate interference in three ways:
-
-1. **Connect-on-demand** — BLE connections are only active during lamp
-   operations (typically <2s), then disconnected after 5s idle. WiFi has
-   100% radio access the rest of the time.
-2. **Core pinning** — the BT controller and NimBLE host are pinned to
-   core 1, while the WiFi task runs on core 0. This eliminates CPU
-   contention between the two stacks.
-3. **ESP-IDF coexistence** — the firmware enables the SW coexist module,
-   which uses dynamic priority so high-priority WiFi beacons can preempt
-   BLE time slices when needed.
-
-If you still see beacon timeouts, move the ESP32 closer to the WiFi
-access point or reduce the idle disconnect timeout.
+With BLE offloaded to the XIAO nRF52840, the ESP32-S3 radio is dedicated to
+WiFi, so on-chip WiFi/BLE radio contention is no longer a factor. Occasional
+beacon timeouts are typically just weak signal — move the ESP32 closer to the
+WiFi access point or reduce 2.4 GHz interference.
 
 
 ## Project Structure
@@ -565,45 +572,47 @@ access point or reduce the idle disconnect timeout.
 │   ├── myhome_app.erl        Application entry point (start/0)
 │   ├── myhome_top_sup.erl    Top-level supervisor (rest_for_one)
 │   ├── myhome_log.erl        In-memory log server (ring buffer via queue)
-│   ├── ble.erl               BLE port server (owns port, serializes commands)
-│   ├── myhome_event_bus.erl  Pub/sub event bus for BLE events
+│   ├── myhome_event_bus.erl  Pub/sub event bus for BLE + sensor events
+│   ├── myhome_ble_i2c.erl    Owns the shared I2C bus; BLE register protocol
+│   │                         to the XIAO bridge + GPIO IRQ draining
 │   ├── myhome_sup.erl        Secondary supervisor (one_for_one)
-│   ├── myhome_scanner.erl    On-demand BLE device scanner
-│   ├── myhome_http.erl       WiFi connection + HTTP listener
+│   ├── myhome_scanner.erl    On-demand BLE device scanner (via the bridge)
+│   ├── myhome_http.erl       WiFi + HTTP listener (exposes get_ip/0)
 │   ├── myhome_http_handler.erl  HTTP API request routing
 │   ├── myhome_discovery.erl  BLE pairing + dynamic bulb startup
-│   └── myhome_hue_ble.erl    Per-bulb gen_server, Hue BLE protocol
-├── nifs/ble/
-│   ├── CMakeLists.txt         ESP-IDF component build
-│   ├── include/ble_port.h     Port driver header
-│   └── ble_port.c            NimBLE port driver (scan/connect/GATT)
-└── plans/
-    └── philips_hue_control.md Detailed implementation plan
+│   ├── myhome_hue_ble.erl    Per-bulb gen_server, Hue BLE protocol
+│   ├── myhome_sensors.erl    BME680 + VEML6030 polling (atomvm_sensors)
+│   ├── myhome_rules.erl      Automation engine (lux / temp / time policies)
+│   ├── myhome_lcd.erl        16x2 LCD status display (IP + free heap)
+│   ├── myhome_time.erl       Timezone-aware local time helpers
+│   └── myhome_config.erl     Runtime config (WiFi creds, ports; see template)
+├── firmware/xiao_ble/        XIAO nRF52840 Zephyr BLE-bridge firmware
+│   ├── BUILD_SETUP.md         How to build zephyr.uf2
+│   ├── prj.conf               Zephyr project config
+│   └── src/                   Bridge sources (I2C target + BLE central)
+├── docs/                     Protocol + design notes (e.g. I2C protocol)
+└── plans/                    Implementation plans (Hue control, BLE offload, …)
 ```
+
 
 ### Dependencies
 
 | Package | Source | Purpose |
 |---------|--------|---------|
 | `tiny_httpd` | [github.com/etnt/tiny-httpd](https://github.com/etnt/tiny-httpd) | Minimal HTTP/1.1 server + JSON encoder/decoder |
-| `atomvm_sensors` | [github.com/etnt/atomvm_sensors](https://github.com/etnt/atomvm_sensors) | I2C sensor drivers (BME680, VEML6030) for AtomVM |
+| `atomvm_sensors` | [github.com/etnt/atomvm_sensors](https://github.com/etnt/atomvm_sensors) | I2C sensor drivers (BME680, VEML6030) and LCD1602 for AtomVM |
 
 Fetched automatically by rebar3 from `rebar.config`.
 
 ### AtomVM Kconfig Patch
 
-AtomVM ships without Bluetooth enabled. The file
-`patches/sdkconfig.defaults.in.patch` is applied to AtomVM's
-`sdkconfig.defaults.in` at build time (via `make atomvm`) to add:
+The file `patches/sdkconfig.defaults.in.patch` is applied to AtomVM's
+`sdkconfig.defaults.in` at build time (via `make atomvm`) to:
 
-- **NimBLE stack** — enables BLE central + observer roles for scanning and
-  connecting to Hue bulbs
-- **Security manager** — legacy and secure-connections pairing with NVS bond
-  persistence (Hue bulbs require encrypted links)
-- **RF coexistence** — enables ESP-IDF's software coexistence module for
-  time-division multiplexing of the shared 2.4 GHz radio between WiFi and BLE
-- **Core pinning** — BT controller and NimBLE host pinned to core 1, WiFi to
-  core 0, eliminating CPU contention between the two stacks
+- **Disable Bluetooth** (`CONFIG_BT_ENABLED=n`) — all BLE work is offloaded to
+  the external XIAO nRF52840, so the ESP32-S3 radio is dedicated to WiFi
+- **Enable PSRAM** — the 8 MB octal-SPI PSRAM on the ESP32-S3-WROOM module
+  (`CONFIG_SPIRAM` in octal mode at 80 MHz, available to `malloc`)
 
 After changing the patch you must do a full rebuild: `rm -rf AtomVM/src/platforms/esp32/build && make flash`.
 
@@ -612,8 +621,6 @@ After changing the patch you must do a full rebuild: `rm -rf AtomVM/src/platform
 [AtomVM](https://doc.atomvm.org/latest/)
 
 [BLE](https://learn.adafruit.com/introduction-to-bluetooth-low-energy/introduction)
-
-[hello_atomvm_ble_switchbot](https://github.com/piyopiyoex/hello_atomvm_ble_switchbot)
 
 ## License
 

@@ -479,8 +479,8 @@ Work the steps in this order:
 3. **[ ] Remove cooldown/retry logic** — once connections are
    persistent, `last_connect_fail` + `CONNECT_COOLDOWN_MS` become dead
    code.
-4. **[ ] Decommission legacy** — remove `ble.erl`, `nifs/ble/` (kept for
-   rollback on a git branch — confirm it exists first);
+4. **[x] Decommission legacy** — removed `ble.erl` and `nifs/ble/`
+   (recoverable from git history if rollback is ever needed);
    `myhome_ble_conn.erl` already removed.
 5. **[x] Remove NimBLE from ESP32-S3 sdkconfig patch** (done).
 6. **[ ] Verify: WiFi never drops, heartbeat always succeeds** (gated on
