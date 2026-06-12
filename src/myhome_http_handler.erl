@@ -3,6 +3,7 @@
 %%%
 %%% Endpoints:
 %%%   GET  /api/status          — list bulbs and connection state
+%%%   GET  /api/suptree         — Erlang supervision tree (nested JSON)
 %%%   GET  /api/logs            — get system logs (params: level, limit)
 %%%   GET  /api/scan            — get last BLE scan results
 %%%   POST /api/scan            — trigger new BLE scan (optional: {"duration":10})
@@ -51,6 +52,11 @@ handle_request(_Method, _Path, _Request) ->
 do_handle(get, [<<"status">>], _HttpRequest) ->
     Bulbs = get_bulb_status(),
     json_reply(#{status => ok, bulbs => Bulbs});
+
+do_handle(get, [<<"suptree">>], _HttpRequest) ->
+    %% Walk the Erlang supervision tree starting at the top supervisor and
+    %% return it as a nested JSON structure the UI can draw as a graph.
+    json_reply(#{status => ok, tree => build_sup_tree(myhome_top_sup)});
 
 do_handle(get, [<<"events">>], _HttpRequest) ->
     %% Long-poll: subscribe to event_bus, wait up to 30s for an event
@@ -673,6 +679,77 @@ take_digits(_, Acc) -> Acc.
 
 to_bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8);
 to_bin(Other) -> list_to_binary(io_lib:format("~p", [Other])).
+
+%%====================================================================
+%% Supervision tree introspection (for /api/suptree)
+%%====================================================================
+
+%% Build a nested supervision tree starting from a registered supervisor.
+build_sup_tree(SupName) when is_atom(SupName) ->
+    case whereis(SupName) of
+        Pid when is_pid(Pid) -> sup_node(SupName, Pid);
+        _ -> null
+    end.
+
+%% A supervisor node: recurse into its children.
+sup_node(Id, Pid) ->
+    Children = try supervisor:which_children(Pid) catch _:_ -> [] end,
+    ChildNodes = lists:filtermap(fun child_node/1, Children),
+    #{id => to_bin(Id),
+      pid => pid_bin(Pid),
+      type => supervisor,
+      modules => sup_modules(Id),
+      children => ChildNodes}.
+
+%% Map a which_children/1 entry to a tree node. Skip children that are
+%% currently restarting (pid =:= undefined / restarting).
+child_node({Id, Pid, supervisor, _Modules}) when is_pid(Pid) ->
+    {true, sup_node(Id, Pid)};
+child_node({Id, Pid, worker, Modules}) when is_pid(Pid) ->
+    {true, worker_node(Id, Pid, Modules)};
+child_node(_) ->
+    false.
+
+%% A worker node: classify the behaviour and capture its registered name.
+worker_node(Id, Pid, Modules) ->
+    #{id => to_bin(Id),
+      pid => pid_bin(Pid),
+      type => worker,
+      kind => gen_kind(Pid),
+      name => reg_name(Pid),
+      modules => mods_to_bin(Modules)}.
+
+%% Identify the OTP behaviour a worker is running by its current function.
+%% AtomVM's process_info/2 does not support `current_function` and raises
+%% badarg, so fall back to a plain worker classification there.
+gen_kind(Pid) ->
+    try erlang:process_info(Pid, current_function) of
+        {current_function, {gen_server, _, _}} -> <<"gen_server">>;
+        {current_function, {gen_statem, _, _}} -> <<"gen_statem">>;
+        {current_function, {gen_event, _, _}} -> <<"gen_event">>;
+        _ -> <<"worker">>
+    catch _:_ ->
+        <<"worker">>
+    end.
+
+%% Registered name of a process, or null if anonymous.
+reg_name(Pid) ->
+    case erlang:process_info(Pid, registered_name) of
+        {registered_name, Name} when is_atom(Name) -> atom_to_binary(Name, utf8);
+        _ -> null
+    end.
+
+%% The supervisor child id is usually its callback module name.
+sup_modules(Id) when is_atom(Id) -> [atom_to_binary(Id, utf8)];
+sup_modules(_) -> [].
+
+%% A child spec's modules can be a list or the atom `dynamic`
+%% (gen_event managers with a dynamic callback set).
+mods_to_bin(dynamic) -> [<<"dynamic">>];
+mods_to_bin(Mods) when is_list(Mods) -> [to_bin(M) || M <- Mods];
+mods_to_bin(_) -> [].
+
+pid_bin(Pid) -> iolist_to_binary(io_lib:format("~p", [Pid])).
 
 %% Parse a JSON string value: {"key": "value"}
 parse_json_string(Body, Key) ->

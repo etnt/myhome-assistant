@@ -130,6 +130,41 @@ h2 { font-size: 1.1rem; font-weight: 500; color: var(--text-dim); margin-bottom:
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* Supervision tree */
+.tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.tree-legend {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.tree-legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.tree-legend .lg {
+  width: 12px; height: 12px; border-radius: 3px;
+  display: inline-block; border: 2px solid;
+}
+.tree-legend .lg-sup { border-color: var(--accent); background: rgba(233,69,96,0.2); }
+.tree-legend .lg-gs  { border-color: var(--success); background: rgba(78,205,196,0.2); }
+.tree-legend .lg-gsm { border-color: var(--accent2); background: rgba(245,166,35,0.2); }
+.tree-legend .lg-w   { border-color: var(--text-dim); background: rgba(136,146,164,0.2); }
+.tree-wrap {
+  overflow: auto;
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 1rem;
+}
+.tree-wrap svg { display: block; }
+.tree-node-title { font-size: 12px; font-weight: 600; fill: var(--text); }
+.tree-node-sub { font-size: 10px; fill: var(--text-dim); }
+.tree-edge { fill: none; stroke: #2a3a5a; stroke-width: 1.5; }
+
 /* Grid layout — two independent columns on desktop */
 .grid {
   display: grid;
@@ -573,6 +608,7 @@ input[type="range"]::-moz-range-thumb:hover {
   <button class="tab-btn active" data-tab="dashboard" onclick="showTab('dashboard')">📊 Dashboard</button>
   <button class="tab-btn" data-tab="system" onclick="showTab('system')">🖥 System</button>
   <button class="tab-btn" data-tab="admin" onclick="showTab('admin')">⚙ Admin</button>
+  <button class="tab-btn" data-tab="tree" onclick="showTab('tree')">🌳 Tree</button>
 </nav>
 
 <!-- Dashboard: Lamps + Sensors -->
@@ -617,6 +653,25 @@ input[type="range"]::-moz-range-thumb:hover {
     <h2>⚡ Automation Policies</h2>
     <div id="policiesContainer" style="display:flex;flex-direction:column;gap:0.5rem;">
       <div style="color:var(--text-dim);font-size:0.85rem;">Loading...</div>
+    </div>
+  </div>
+</section>
+
+<!-- Tree: Erlang supervision tree -->
+<section class="tab-panel" id="tab-tree">
+  <div class="card">
+    <h2>🌳 Supervision Tree</h2>
+    <div class="tree-toolbar">
+      <button class="btn btn-secondary" onclick="refreshSupTree()">Refresh</button>
+      <div class="tree-legend">
+        <span><i class="lg lg-sup"></i> supervisor</span>
+        <span><i class="lg lg-gs"></i> gen_server</span>
+        <span><i class="lg lg-gsm"></i> gen_statem</span>
+        <span><i class="lg lg-w"></i> worker</span>
+      </div>
+    </div>
+    <div class="tree-wrap" id="treeContainer">
+      <div style="color:var(--text-dim);font-size:0.85rem;">Open this tab to load the tree.</div>
     </div>
   </div>
 </section>
@@ -1217,6 +1272,7 @@ function showTab(name) {
   if (panel) panel.classList.add('active');
   const btn = document.querySelector(`.tab-btn[data-tab="${name}"]`);
   if (btn) btn.classList.add('active');
+  if (name === 'tree') refreshSupTree();
 }
 
 // Auto-connect on load
@@ -1279,6 +1335,131 @@ function updateSensorsUI(sensors) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// --- Supervision tree ---
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const NODE_W = 168, NODE_H = 54, H_GAP = 26, V_GAP = 46;
+
+// Border/fill colours keyed by node kind.
+const NODE_STYLE = {
+  supervisor: { stroke: '#e94560', fill: 'rgba(233,69,96,0.12)' },
+  gen_server: { stroke: '#4ecdc4', fill: 'rgba(78,205,196,0.12)' },
+  gen_statem: { stroke: '#f5a623', fill: 'rgba(245,166,35,0.12)' },
+  gen_event:  { stroke: '#f5a623', fill: 'rgba(245,166,35,0.12)' },
+  worker:     { stroke: '#8892a4', fill: 'rgba(136,146,164,0.12)' },
+};
+
+function nodeKind(n) {
+  return n.type === 'supervisor' ? 'supervisor' : (n.kind || 'worker');
+}
+
+async function refreshSupTree() {
+  const container = $('treeContainer');
+  container.innerHTML = '<div style="color:var(--text-dim);font-size:0.85rem;">Loading…</div>';
+  const data = await api('GET', '/api/suptree');
+  if (!data || data.status !== 'ok' || !data.tree) {
+    container.innerHTML = '<div style="color:var(--text-dim);font-size:0.85rem;">No tree data (is the controller connected?).</div>';
+    return;
+  }
+  container.innerHTML = '';
+  container.appendChild(renderSupTree(data.tree));
+}
+
+// Assign x/y to every node: leaves get sequential columns, parents centre
+// over their children, depth maps to rows.
+function layoutTree(node, depth, ctx) {
+  node._depth = depth;
+  const children = node.children || [];
+  if (children.length === 0) {
+    node._x = ctx.nextX;
+    ctx.nextX += NODE_W + H_GAP;
+  } else {
+    children.forEach(c => layoutTree(c, depth + 1, ctx));
+    node._x = (children[0]._x + children[children.length - 1]._x) / 2;
+  }
+  node._y = depth * (NODE_H + V_GAP);
+  ctx.maxDepth = Math.max(ctx.maxDepth, depth);
+}
+
+function renderSupTree(root) {
+  const ctx = { nextX: 0, maxDepth: 0 };
+  layoutTree(root, 0, ctx);
+
+  const width = Math.max(ctx.nextX - H_GAP, NODE_W) + 4;
+  const height = (ctx.maxDepth + 1) * (NODE_H + V_GAP);
+
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+  // Edges first so node boxes draw on top.
+  const edges = document.createElementNS(SVG_NS, 'g');
+  const nodes = document.createElementNS(SVG_NS, 'g');
+  svg.appendChild(edges);
+  svg.appendChild(nodes);
+
+  (function walk(node) {
+    drawNode(nodes, node);
+    (node.children || []).forEach(child => {
+      drawEdge(edges, node, child);
+      walk(child);
+    });
+  })(root);
+
+  return svg;
+}
+
+function drawEdge(g, parent, child) {
+  const x1 = parent._x + NODE_W / 2, y1 = parent._y + NODE_H;
+  const x2 = child._x + NODE_W / 2, y2 = child._y;
+  const my = (y1 + y2) / 2;
+  const path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('class', 'tree-edge');
+  path.setAttribute('d', `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`);
+  g.appendChild(path);
+}
+
+function drawNode(g, node) {
+  const style = NODE_STYLE[nodeKind(node)] || NODE_STYLE.worker;
+  const grp = document.createElementNS(SVG_NS, 'g');
+  grp.setAttribute('transform', `translate(${node._x},${node._y})`);
+
+  const rect = document.createElementNS(SVG_NS, 'rect');
+  rect.setAttribute('width', NODE_W);
+  rect.setAttribute('height', NODE_H);
+  rect.setAttribute('rx', 8);
+  rect.setAttribute('fill', style.fill);
+  rect.setAttribute('stroke', style.stroke);
+  rect.setAttribute('stroke-width', node.type === 'supervisor' ? 2 : 1.5);
+  grp.appendChild(rect);
+
+  const title = node.name && node.name !== 'null' ? node.name : node.id;
+  addText(grp, title, NODE_W / 2, 20, 'tree-node-title');
+  const sub = node.type === 'supervisor'
+    ? `supervisor · ${node.pid}`
+    : `${node.kind} · ${node.pid}`;
+  addText(grp, sub, NODE_W / 2, 38, 'tree-node-sub');
+
+  // Tooltip with module(s).
+  if (node.modules && node.modules.length) {
+    const t = document.createElementNS(SVG_NS, 'title');
+    t.textContent = node.modules.join(', ');
+    grp.appendChild(t);
+  }
+  g.appendChild(grp);
+}
+
+function addText(g, str, x, y, cls) {
+  const t = document.createElementNS(SVG_NS, 'text');
+  t.setAttribute('x', x);
+  t.setAttribute('y', y);
+  t.setAttribute('text-anchor', 'middle');
+  t.setAttribute('class', cls);
+  // Truncate so long names don't overflow the box.
+  t.textContent = str.length > 22 ? str.slice(0, 21) + '…' : str;
+  g.appendChild(t);
+}
 </script>
 </body>
 </html>

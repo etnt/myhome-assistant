@@ -4,8 +4,8 @@
 Control Philips Hue Bluetooth light bulbs directly from an ESP32-S3 running
 AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 
-<a href="myhome-assistant.jpg"><img src="myhome-assistant.jpg" width="600"></a>
-<a href="myhome-assistant-graph.jpg"><img src="myhome-assistant-graph.jpg" width="300"></a>
+<a href="screenshots/myhome-assistant.jpg"><img src="screenshots/myhome-assistant.jpg" width="600"></a>
+<a href="screenshots/myhome-assistant-graph.jpg"><img src="screenshots/myhome-assistant-graph.jpg" width="300"></a>
 
 
 Goto: [https://etnt.github.io/myhome-assistant/](https://etnt.github.io/myhome-assistant/)
@@ -30,7 +30,7 @@ cd viz && python3 -m http.server 3000
 - Sensors: VEML6039, BME680
 - 16x2 LCD with I2C (PCF8574) backpack — status display (optional)
 
-<a href="myhome-assistant-hw.jpg"><img src="myhome-assistant-hw.jpg" height="300"></a>
+<a href="screenshots/myhome-assistant-hw.jpg"><img src="screenshots/myhome-assistant-hw.jpg" height="300"></a>
 
 ## Architecture
 
@@ -76,6 +76,35 @@ BLE strategy: **connect-on-demand** — bulb gen_servers only establish a BLE
 connection (via the XIAO) when a command is sent, then disconnect after 5s
 idle. This keeps the radio free for WiFi when no light commands are active.
 
+
+## Supervision Tree
+
+The web UI can draw the live Erlang supervision tree, so you can see exactly
+how the running processes are connected — supervisors, their children, and
+the dynamically started bulb gen_servers. Open the **🌳 Tree** tab and click
+**Refresh**.
+
+<a href="screenshots/myhome-assistant-suptree.jpg"><img src="screenshots/myhome-assistant-suptree.jpg" width="600"></a>
+
+The tree is built on the device by walking the supervisors from
+`myhome_top_sup` with `supervisor:which_children/1` and exposed via
+`GET /api/suptree` as nested JSON. The browser then lays it out and renders it
+as a dependency-free SVG graph (no external libraries). Each node shows the
+process id / registered name and pid; hover a node to see its callback
+module(s). Node colors distinguish the process kind:
+
+| Color  | Kind         | Meaning                                     |
+|--------|--------------|---------------------------------------------|
+| Red    | `supervisor` | A supervisor that starts/monitors children  |
+| Teal   | `gen_server` | A standard `gen_server` worker              |
+| Orange | `gen_statem` | A `gen_statem` state-machine worker         |
+| Grey   | `worker`     | Any other worker process                    |
+
+> **Note:** Behaviour detection (the teal/orange colors) relies on
+> `process_info/2`'s `current_function` key, which AtomVM does not support.
+> On the device every worker therefore shows up grey as `worker`; supervisors
+> are always distinguished. The richer coloring appears when the same endpoint
+> is served from desktop Erlang/OTP.
 
 ## Automation Rules
 
@@ -202,6 +231,7 @@ the system runs normally.
 | Method | Endpoint                   | Body                    | Description                |
 |--------|----------------------------|-------------------------|----------------------------|
 | GET    | `/api/status`              | —                       | List registered bulbs and connection state |
+| GET    | `/api/suptree`             | —                       | Erlang supervision tree as nested JSON (drawn in the UI) |
 | GET    | `/api/scan`                | —                       | Get last BLE scan results |
 | POST   | `/api/scan`                | `{"duration":10}`       | Trigger a BLE scan (blocks until done) |
 | POST   | `/api/discover`            | —                       | Scan, pair, and register new Hue bulbs |
