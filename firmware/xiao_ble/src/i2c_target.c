@@ -167,8 +167,17 @@ static void handle_command_isr(const uint8_t *data, uint8_t len)
 
     switch (cmd_id) {
     case CMD_PING: {
-        /* ISR-safe: just pushes to event queue */
-        uint8_t pong_payload[2] = {FIRMWARE_VERSION, ble_central_connection_count()};
+        /* ISR-safe: just pushes to event queue.
+         * Payload: [version, conn_count, uptime_sec (4B little-endian)]. */
+        uint32_t uptime_sec = (uint32_t)(k_uptime_get() / 1000);
+        uint8_t pong_payload[6] = {
+            FIRMWARE_VERSION,
+            ble_central_connection_count(),
+            (uint8_t)(uptime_sec & 0xFF),
+            (uint8_t)((uptime_sec >> 8) & 0xFF),
+            (uint8_t)((uptime_sec >> 16) & 0xFF),
+            (uint8_t)((uptime_sec >> 24) & 0xFF),
+        };
         event_queue_push(EVT_PONG, pong_payload, sizeof(pong_payload));
         last_cmd_result = CMD_RESULT_OK;
         ping_received = true;

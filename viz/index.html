@@ -513,6 +513,29 @@ input[type="range"]::-moz-range-thumb:hover {
 }
 .chart-close:hover { color: var(--text); background: var(--card); }
 
+/* Rename modal */
+.rename-modal { width: min(90vw, 380px); }
+.rename-modal label {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.rename-modal input {
+  font-size: 1rem;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  width: 100%;
+}
+.rename-modal .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
 /* Toast notifications */
 .toast-container {
   position: fixed;
@@ -632,17 +655,24 @@ input[type="range"]::-moz-range-thumb:hover {
 
 <!-- System: status / actions / logs -->
 <section class="tab-panel" id="tab-system">
-  <div class="card">
-    <h2>🖥 System</h2>
-    <div class="system-actions">
-      <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
-      <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
-      <button class="btn btn-secondary" onclick="doScan()">Scan</button>
-      <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
-      <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+  <div class="grid">
+    <div class="col">
+      <div class="card">
+        <h2>🖥 System</h2>
+        <div class="system-actions">
+          <button class="btn btn-secondary" onclick="checkStatus()">Status</button>
+          <button class="btn btn-secondary" onclick="doRefresh()">Refresh</button>
+          <button class="btn btn-secondary" onclick="doScan()">Scan</button>
+          <button class="btn btn-secondary" onclick="doDiscover()">Discover</button>
+          <button class="btn btn-secondary" onclick="fetchLogs()">Logs</button>
+        </div>
+        <div class="log-area" id="logArea">
+          <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
+        </div>
+      </div>
     </div>
-    <div class="log-area" id="logArea">
-      <div class="log-line" style="color:var(--text-dim)">Ready. Enter controller IP:Port and click Connect.</div>
+    <div class="col">
+      <div id="bleStatusContainer"></div>
     </div>
   </div>
 </section>
@@ -733,6 +763,7 @@ async function checkStatus() {
     refreshBulbs();
     // Fetch initial sensor + policy data, then start event loop
     refreshSensors();
+    refreshBleStatus();
     refreshPolicies();
     startEventLoop();
   } else {
@@ -968,26 +999,44 @@ function escapeHtml(s) {
 }
 
 function startRename(id) {
-  const span = document.getElementById(`bulb-name-${id}`);
-  if (!span || span.querySelector('input')) return;
   const current = bulbs[id] && bulbs[id].display_name ? bulbs[id].display_name : `Bulb ${id}`;
-  const input = document.createElement('input');
-  input.type = 'text';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'chart-overlay';
+  const close = () => overlay.remove();
+  overlay.onclick = e => { if (e.target === overlay) close(); };
+
+  overlay.innerHTML = `
+    <div class="chart-modal rename-modal">
+      <button class="chart-close" title="Close">&times;</button>
+      <h3>Rename lamp</h3>
+      <label for="renameInput">Display name</label>
+      <input id="renameInput" type="text" maxlength="64" />
+      <div class="modal-actions">
+        <button class="btn btn-secondary" data-act="cancel">Cancel</button>
+        <button class="btn btn-primary" data-act="save">Save</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  const input = overlay.querySelector('#renameInput');
   input.value = current;
-  input.className = 'bulb-name-input';
-  input.onclick = e => e.stopPropagation();
-  input.onkeydown = e => {
-    if (e.key === 'Enter') input.blur();
-    else if (e.key === 'Escape') { input.dataset.cancel = '1'; input.blur(); }
-  };
-  input.onblur = () => {
-    if (input.dataset.cancel) { renderBulb(id, bulbs[id] || {}); return; }
+
+  const submit = () => {
     const name = input.value.trim();
+    close();
     if (name && name !== current) renameBulb(id, name);
-    else renderBulb(id, bulbs[id] || {});
   };
-  span.textContent = '';
-  span.appendChild(input);
+
+  overlay.querySelector('[data-act="save"]').onclick = submit;
+  overlay.querySelector('[data-act="cancel"]').onclick = close;
+  overlay.querySelector('.chart-close').onclick = close;
+  input.onkeydown = e => {
+    if (e.key === 'Enter') submit();
+    else if (e.key === 'Escape') close();
+  };
+
   input.focus();
   input.select();
 }
@@ -1203,6 +1252,38 @@ function renderSensors(sensors) {
   }
 }
 
+// --- BLE bridge status ---
+async function refreshBleStatus() {
+  const data = await api('GET', '/api/ble/status');
+  if (data) renderBleStatus(data);
+}
+
+function renderBleStatus(d) {
+  const container = $('bleStatusContainer');
+  if (!d || d.status !== 'ok') { container.innerHTML = ''; return; }
+  const up = formatAgo(d.nrf_uptime_sec || 0);
+  const conns = d.connections || [];
+  const connRows = conns.length
+    ? conns.map(c => `
+        <div class="sensor-row">
+          <span>${c.addr}</span>
+          <span class="quality-badge ${c.encrypted ? 'good' : 'poor'}" style="font-size:0.7rem;">
+            ${c.encrypted ? '🔒 encrypted' : '⚠ open'}
+          </span>
+        </div>`).join('')
+    : `<div class="sensor-row"><span style="color:var(--text-dim)">No connections</span></div>`;
+  container.innerHTML = `
+    <div class="card sensor-card">
+      <h2>🔗 BLE Bridge (nRF52840)</h2>
+      <div class="sensor-grid">
+        <div class="sensor-row"><span>Firmware</span><span class="sensor-val">v${d.fw_version}</span></div>
+        <div class="sensor-row"><span>Uptime</span><span class="sensor-val">${up}</span></div>
+        <div class="sensor-row"><span>Connections</span><span class="sensor-val">${d.connection_count}</span></div>
+        ${connRows}
+      </div>
+    </div>`;
+}
+
 // --- Policies ---
 async function refreshPolicies() {
   const data = await api('GET', '/api/policies');
@@ -1310,6 +1391,7 @@ function handleEvent(event) {
   switch (event.type) {
     case 'sensor_update':
       updateSensorsUI(event.data);
+      refreshBleStatus();
       break;
     case 'policy_changed':
       refreshPolicies(); // re-fetch full policy list for consistency

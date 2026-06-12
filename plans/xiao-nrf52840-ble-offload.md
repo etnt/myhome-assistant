@@ -490,12 +490,16 @@ Work the steps in this order:
 
 ### Phase 6: Polish (1 day)
 
-- [ ] Handle nRF52840 reset/crash (READY event → re-establish connections)
-- [ ] HTTP endpoint: `GET /api/ble/status` (nRF52840 firmware version,
-  connection count, uptime)
-- [ ] Update discovery flow for new I2C-based scan+bond
-- [ ] Verify sensor reads unaffected during BLE operations (bus sharing)
-- [ ] Update README + architecture diagram
+- [x] Handle nRF52840 reset/crash (READY event → re-establish connections) —
+  a re-`EVT_READY` makes `myhome_ble_i2c` drop its stale view, notify the bulb
+  gen_servers, and re-adopt links as auto-reconnect brings each bulb back.
+- [x] HTTP endpoint: `GET /api/ble/status` (nRF52840 firmware version,
+  connection count, uptime). PONG now carries `uptime_sec` (4B LE).
+- [x] Update discovery flow for new I2C-based scan+bond — `myhome_discovery`
+  already runs through `myhome_scanner` + `myhome_ble_i2c:connect/bond`.
+- [ ] Verify sensor reads unaffected during BLE operations (bus sharing) —
+  gated on hardware; interleaving is by design (≤64B transactions).
+- [x] Update README + architecture diagram
 
 ## Rollback Strategy
 

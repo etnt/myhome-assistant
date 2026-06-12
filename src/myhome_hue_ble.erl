@@ -387,17 +387,33 @@ resolve_handle(ChrUUID, State) ->
             Err
     end.
 
-%% Ensure GATT handles are cached; discover if not
+%% Ensure GATT handles are cached; (re)discover if absent or incomplete.
+%% A cached map missing the essential power characteristic indicates a partial
+%% discovery (e.g. it ran before the Hue control service became visible), so we
+%% discard it and discover again rather than trusting a stale, incomplete cache.
 ensure_gatt_handles(#state{gatt_handles = Handles} = State) when is_map(Handles) ->
-    {ok, State};
-ensure_gatt_handles(#state{conn_handle = ConnH} = State) ->
+    case maps:is_key(?CHR_POWER, Handles) of
+        true  -> {ok, State};
+        false -> discover_gatt_handles(State)
+    end;
+ensure_gatt_handles(State) ->
+    discover_gatt_handles(State).
+
+discover_gatt_handles(#state{conn_handle = ConnH} = State) ->
     case myhome_ble_i2c:gatt_discover(ConnH) of
         {ok, Chars} ->
             Handles = lists:foldl(fun(#{uuid := Uuid, handle := H}, Acc) ->
                 maps:put(Uuid, H, Acc)
             end, #{}, Chars),
-            myhome_log:log(info, "[~p] discovered ~p GATT characteristics",
-                           [State#state.name, map_size(Handles)]),
+            case maps:is_key(?CHR_POWER, Handles) of
+                true ->
+                    myhome_log:log(info, "[~p] discovered ~p GATT characteristics",
+                                   [State#state.name, map_size(Handles)]);
+                false ->
+                    myhome_log:log(warning,
+                        "[~p] partial GATT discovery (~p chars, no control service) — will retry",
+                        [State#state.name, map_size(Handles)])
+            end,
             {ok, State#state{gatt_handles = Handles}};
         {error, _} = Err ->
             myhome_log:log(error, "[~p] GATT discovery failed: ~p",

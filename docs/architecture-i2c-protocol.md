@@ -64,13 +64,16 @@ Read register:   [START] [0x08+W] [reg_addr] [STOP]
 | 0x21 | GATT_WRITE        | `[conn_h, char_h 2B, data...]` | EVT_GATT_WRITE_RSP | Phase 2 |
 | 0x22 | GATT_WRITE_NR     | `[conn_h, char_h 2B, data...]` | —          | Phase 2 |
 | 0x23 | SUBSCRIBE         | `[conn_h, char_h 2B]` | EVT_GATT_NOTIFY × N | Phase 2 |
+| 0x31 | DELETE_BOND       | `[addr 6B, addr_type]` | —              | Phase 5 |
+| 0x32 | DELETE_ALL_BONDS  | —             | —                 | Phase 5 |
+| 0x33 | LIST_CONNECTIONS  | —             | EVT_CONNECTED × N, EVT_ENC_CHANGE × N | Phase 6 |
 | 0xFF | RESET             | —             | (reboots)         | Phase 1 ✓ |
 
 ## Events (XIAO → ESP32)
 
 | ID   | Name              | Payload                         | Status |
 |------|-------------------|---------------------------------|--------|
-| 0x81 | PONG              | `[version, active_connections]` | Phase 1 ✓ |
+| 0x81 | PONG              | `[version, active_connections, uptime_sec 4B LE]` | Phase 1 ✓ |
 | 0x82 | READY             | —                               | Phase 1 ✓ |
 | 0x83 | SCAN_RESULT       | `[addr 6B, rssi, name...]`      | Phase 2 |
 | 0x84 | SCAN_DONE         | `[count]`                       | Phase 2 |
@@ -99,6 +102,9 @@ Read register:   [START] [0x08+W] [reg_addr] [STOP]
 - XIAO software watchdog timeout: **30 seconds**
 - If no PING received within 30s → XIAO reboots itself
 - On reboot, XIAO queues `EVT_READY` → IRQ fires → ESP32 re-syncs
+- A *re*-`EVT_READY` (XIAO reset/crash while ESP32 keeps running) makes the
+  ESP32 drop its stale connection view and re-adopt links as the XIAO's
+  auto-reconnect re-establishes each bonded bulb
 
 ## Event Drain Sequence
 

@@ -53,8 +53,8 @@ ESP32-S3 (AtomVM/Erlang)
               ├── myhome_sensors    BME680 + VEML6030 readings
               ├── myhome_rules      lux / temp / time automation engine
               ├── myhome_lcd        16x2 status display (IP + free heap)
-              ├── bulb_1 (myhome_hue_ble) ┐  connect-on-demand Hue control
-              └── bulb_2 (myhome_hue_ble) ┘  (added dynamically by discovery)
+              ├── bulb_1 (myhome_hue_ble) ┐  persistent Hue control over
+              └── bulb_2 (myhome_hue_ble) ┘  always-on links (added by discovery)
 
 Shared I2C bus (owned by myhome_ble_i2c):
   0x08  XIAO nRF52840  — BLE bridge (scan/connect/GATT) + IRQ line
@@ -72,9 +72,20 @@ Event flow: the XIAO raises the GPIO IRQ → `myhome_ble_i2c` drains queued
 events over I2C → `myhome_event_bus` → filtered subscribers (scanner, bulbs,
 LCD, …).
 
-BLE strategy: **connect-on-demand** — bulb gen_servers only establish a BLE
-connection (via the XIAO) when a command is sent, then disconnect after 5s
-idle. This keeps the radio free for WiFi when no light commands are active.
+BLE strategy: **persistent connections** — the XIAO nRF52840 keeps every
+bonded Hue bulb connected and encrypted at all times. On boot (and whenever a
+bulb drops) it auto-reconnects by scanning for the bonded address and
+re-establishing the encrypted link, so a light command always has a live
+connection to run on. The ESP32 holds no BLE radio of its own; it simply
+issues commands over I2C and reacts to `ble_connected` / `ble_enc_change` /
+`ble_disconnected` events.
+
+Resilience: if the ESP32 reboots, the XIAO keeps its links up and the ESP32
+re-adopts them on startup via `CMD_LIST_CONNECTIONS`. If the XIAO itself
+resets or crashes, it re-emits an `EVT_READY`; `myhome_ble_i2c` detects the
+re-ready, drops its stale connection view, and re-adopts links as the XIAO's
+auto-reconnect brings each bulb back. `GET /api/ble/status` reports the nRF
+firmware version, uptime, and the currently connected/encrypted bulbs.
 
 
 ## Supervision Tree

@@ -3,6 +3,7 @@
 %%%
 %%% Endpoints:
 %%%   GET  /api/status          — list bulbs and connection state
+%%%   GET  /api/ble/status      — nRF52840 bridge: fw version, uptime, links
 %%%   GET  /api/suptree         — Erlang supervision tree (nested JSON)
 %%%   GET  /api/logs            — get system logs (params: level, limit)
 %%%   GET  /api/scan            — get last BLE scan results
@@ -52,6 +53,15 @@ handle_request(_Method, _Path, _Request) ->
 do_handle(get, [<<"status">>], _HttpRequest) ->
     Bulbs = get_bulb_status(),
     json_reply(#{status => ok, bulbs => Bulbs});
+
+do_handle(get, [<<"ble">>, <<"status">>], _HttpRequest) ->
+    %% nRF52840 bridge status: firmware version, uptime, and live connections.
+    case myhome_ble_i2c:status() of
+        St when is_map(St) ->
+            json_reply(St#{status => ok});
+        Err ->
+            json_reply(#{status => error, reason => to_bin(Err)})
+    end;
 
 do_handle(get, [<<"suptree">>], _HttpRequest) ->
     %% Walk the Erlang supervision tree starting at the top supervisor and

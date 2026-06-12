@@ -18,6 +18,7 @@
 -export([gatt_discover/1, gatt_read/2, gatt_write/3, gatt_write_nr/3]).
 -export([subscribe/2, get_bonds/0, delete_bond/1, delete_bond/2, delete_bonds/0]).
 -export([connection_state/1]).
+-export([status/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -78,6 +79,9 @@
 -record(state, {
     i2c            :: term(),
     ready = false  :: boolean(),
+    fw_version = 0 :: non_neg_integer(),       %% nRF firmware version (from PONG)
+    nrf_conn_count = 0 :: non_neg_integer(),   %% connection count the nRF reports
+    nrf_uptime_sec = 0 :: non_neg_integer(),   %% nRF uptime in seconds (from PONG)
     ping_timer     :: reference() | undefined,
     scan_from      :: {pid(), term()} | undefined,
     scan_results = [] :: list(),
@@ -155,6 +159,10 @@ delete_bonds() ->
 connection_state(Addr) when byte_size(Addr) =:= 6 ->
     safe_call({connection_state, Addr}, 5000);
 connection_state(_) -> {error, invalid_addr}.
+%% Bridge status: nRF firmware version, uptime, and live connections. Used by
+%% the GET /api/ble/status endpoint. Returns a map or {error, Reason}.
+status() ->
+    safe_call(status, 5000).
 %% Phase 4: GATT discovery
 gatt_discover(ConnH) ->
     safe_call({gatt_discover, ConnH}, 15000).
@@ -310,6 +318,20 @@ handle_call({connection_state, Addr}, _From,
         Handle -> {ok, Handle, maps:get(Handle, Enc, false)}
     end,
     {reply, Reply, State};
+handle_call(status, _From,
+            #state{ready = Ready, fw_version = Ver, nrf_uptime_sec = Uptime,
+                   nrf_conn_count = NrfCount, connections = Conns,
+                   encrypted = Enc} = State) ->
+    ConnList = [#{handle => H, addr => format_addr(Addr),
+                  encrypted => maps:get(H, Enc, false)}
+                || {H, Addr} <- maps:to_list(Conns)],
+    Reply = #{ready => Ready,
+              fw_version => Ver,
+              nrf_uptime_sec => Uptime,
+              nrf_reported_count => NrfCount,
+              connection_count => maps:size(Conns),
+              connections => ConnList},
+    {reply, Reply, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -442,9 +464,29 @@ read_event(#state{i2c = I2C} = State, EventType, PayloadLen) ->
             State
     end.
 
+handle_event(?EVT_READY, _Payload, #state{ready = true, connections = Conns} = State) ->
+    %% Re-READY while we were already running = the nRF52840 reset or crashed
+    %% and rebooted. It lost every BLE link, so drop our stale view, tell the
+    %% bulb gen_servers their links are gone, and ask for a fresh connection
+    %% list. As the nRF's auto-reconnect re-establishes each bonded bulb we
+    %% re-adopt the links via EVT_CONNECTED / EVT_ENC_CHANGE.
+    myhome_log:log(warning,
+                   "nRF52840 re-READY (reset/crash) — re-establishing ~p connection(s)",
+                   [maps:size(Conns)]),
+    lists:foreach(fun(Handle) ->
+        myhome_event_bus:publish({ble_disconnected, Handle, 16#FF})
+    end, maps:keys(Conns)),
+    request_connection_list(State),
+    State#state{connections = #{}, encrypted = #{}};
 handle_event(?EVT_READY, _Payload, State) ->
     State#state{ready = true};
 
+handle_event(?EVT_PONG, <<Version, NrfCount, Uptime:32/little, _/binary>>, State) ->
+    State#state{fw_version = Version, nrf_conn_count = NrfCount,
+                nrf_uptime_sec = Uptime};
+handle_event(?EVT_PONG, <<Version, NrfCount, _/binary>>, State) ->
+    %% Legacy 2-byte payload (firmware without uptime field)
+    State#state{fw_version = Version, nrf_conn_count = NrfCount};
 handle_event(?EVT_PONG, _Payload, State) ->
     State;
 
