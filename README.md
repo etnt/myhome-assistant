@@ -7,6 +7,7 @@ AtomVM/Erlang. No Hue Bridge required — communicates via BLE GATT.
 <a href="screenshots/myhome-assistant.jpg"><img src="screenshots/myhome-assistant.jpg" width="600"></a>
 <a href="screenshots/myhome-assistant-graph.jpg"><img src="screenshots/myhome-assistant-graph.jpg" width="300"></a>
 
+Watch this [demo](https://youtu.be/lQhCeNvgBzg?si=W9tPJvMKxLNNVMaS)
 
 Goto: [https://etnt.github.io/myhome-assistant/](https://etnt.github.io/myhome-assistant/)
 
