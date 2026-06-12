@@ -87,6 +87,14 @@ int ble_central_get_handle(const uint8_t *addr);
 uint8_t ble_central_connection_count(void);
 
 /**
+ * Re-announce all currently active connections by queuing EVT_CONNECTED for
+ * each (plus EVT_ENC_CHANGE for those already encrypted). Lets the ESP32
+ * rebuild its view of live links after an independent reboot, since the nRF
+ * holds connections across ESP32 restarts.
+ */
+void ble_central_report_connections(void);
+
+/**
  * Get the bt_conn pointer for a connection handle.
  * Returns NULL if handle is invalid or not connected.
  * Used by gatt_client to issue GATT operations.

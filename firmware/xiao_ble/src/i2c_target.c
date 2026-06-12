@@ -387,6 +387,12 @@ static void cmd_work_handler(struct k_work *work)
         break;
     }
 
+    case CMD_LIST_CONNECTIONS:
+        /* Re-announce live connections so the ESP32 can rebuild its view
+         * after an independent reboot. */
+        ble_central_report_connections();
+        break;
+
     default:
         LOG_WRN("Unknown deferred command 0x%02x", cmd_id);
         last_cmd_result = CMD_RESULT_UNKNOWN;

@@ -32,6 +32,15 @@ static void connect_retry_handler(struct k_work *work);
 static void rearm_autoconnect(void);
 static void stop_autoconnect(void);
 static void refresh_bonds_and_rearm(void);
+static struct k_work_delayable autoconnect_work;
+static void autoconnect_work_handler(struct k_work *work);
+
+/* Background auto-connect state (engine defined further below). The scanner is
+ * shared with discovery, so scan_recv_cb dispatches adverts to the auto-connect
+ * hook only while our background scan owns the radio. */
+static volatile bool autoconnect_scanning;    /* our background scan is running */
+static volatile bool autoconnect_connecting;  /* a background connect is in flight */
+static void autoconnect_on_advert(const bt_addr_le_t *addr);
 
 /* Scan parameters: active scan, 100ms interval, 50ms window, filter duplicates */
 static const struct bt_le_scan_param scan_params = {
@@ -48,6 +57,13 @@ static const struct bt_le_scan_param scan_params = {
 static void scan_recv_cb(const struct bt_le_scan_recv_info *info,
                          struct net_buf_simple *buf)
 {
+    /* While the background auto-connect scan owns the radio, adverts are not
+     * reported to the ESP32 — instead we try to connect bonded bulbs. */
+    if (autoconnect_scanning && !scanning) {
+        autoconnect_on_advert(info->addr);
+        return;
+    }
+
     /* Extract device name from AD data if present */
     char name[29] = {0};  /* Max BLE short name we can fit in 60B payload */
     uint8_t name_len = 0;
@@ -148,6 +164,7 @@ int ble_central_init(void)
     k_work_init_delayable(&scan_timeout_work, scan_timeout_handler);
     k_work_init_delayable(&connect_settle_work, connect_settle_handler);
     k_work_init_delayable(&connect_retry_work, connect_retry_handler);
+    k_work_init_delayable(&autoconnect_work, autoconnect_work_handler);
 
     /* Register pairing/auth callbacks */
     bt_conn_auth_cb_register(&auth_cb);
@@ -277,17 +294,35 @@ static bool connect_pending;          /* a connect/settle cycle is active */
 /*
  * Persistent auto-reconnect (Phase 5).
  *
- * Bonded bulbs are kept permanently connected. On boot (and whenever a bulb
- * drops) we arm bt_conn_le_create_auto(), which uses the controller filter
- * accept list to connect to any bonded device the instant it advertises — no
- * command from the ESP32 required. The procedure completes on each
- * connection, so we re-arm to catch the next bonded bulb. The scanner is
- * shared, so auto-connect is paused during discovery scans and manual
- * (pairing) connects, then re-armed afterwards.
+ * Bonded bulbs are kept permanently connected with no command from the ESP32.
+ * Rather than the controller filter-accept-list auto-initiator
+ * (bt_conn_le_create_auto) — which on this controller refuses a second
+ * concurrent central connection (HCI 0x0b "connection already exists") — we
+ * run our own background scan: whenever a bonded bulb that is not yet
+ * connected advertises, we stop the scan and open a direct connection to that
+ * specific address with bt_conn_le_create(). This is the canonical Zephyr
+ * multi-connection central pattern and reliably brings up every bonded bulb.
+ *
+ * Each connection re-arms the engine, which rescans for the next still-missing
+ * bulb until all bonded bulbs are up. The scanner is shared, so auto-connect is
+ * paused during discovery scans and manual (pairing) connects, then re-armed.
  */
 static bool autoconnect_enabled;   /* >=1 bond and start() has run */
-static bool autoconnect_armed;     /* bt_conn_le_create_auto currently running */
 static uint8_t bonded_count;       /* number of stored bonds */
+
+/* Deferring (re)start to the work queue keeps us out of BT callback context
+ * after a connect/disconnect, and lets transient failures self-heal. */
+#define AUTOCONNECT_ARM_DELAY_MS 500   /* let the prior connect/security settle */
+#define AUTOCONNECT_RETRY_MS     2000  /* retry after a transient failure */
+
+/* Passive scan is enough — we only need the advertiser address to match a
+ * bond. Filter duplicates so we act on each bulb once per scan window. */
+static const struct bt_le_scan_param autoconnect_scan_params = {
+    .type = BT_LE_SCAN_TYPE_PASSIVE,
+    .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+    .interval = BT_GAP_SCAN_FAST_INTERVAL,  /* 60ms */
+    .window = BT_GAP_SCAN_FAST_WINDOW,      /* 30ms */
+};
 
 static void count_bond_cb(const struct bt_bond_info *info, void *user_data)
 {
@@ -296,77 +331,145 @@ static void count_bond_cb(const struct bt_bond_info *info, void *user_data)
     (*n)++;
 }
 
-static void add_bond_to_fal_cb(const struct bt_bond_info *info, void *user_data)
+/* True if addr is currently connected, using the host-authoritative view so it
+ * self-heals any drift between our connections[] table and the controller. */
+static bool autoconnect_addr_connected(const bt_addr_le_t *addr)
 {
-    ARG_UNUSED(user_data);
-    char addr_str[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(&info->addr, addr_str, sizeof(addr_str));
-
-    int err = bt_le_filter_accept_list_add(&info->addr);
-    if (err) {
-        LOG_WRN("Accept list add %s failed: %d", addr_str, err);
-    } else {
-        LOG_INF("Accept list add %s", addr_str);
+    struct bt_conn *c = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
+    if (c) {
+        bt_conn_unref(c);
+        return true;
     }
+    return false;
+}
+
+static void count_unconnected_cb(const struct bt_bond_info *info, void *user_data)
+{
+    uint8_t *want = user_data;
+    if (!autoconnect_addr_connected(&info->addr)) {
+        (*want)++;
+    }
+}
+
+static uint8_t autoconnect_unconnected_count(void)
+{
+    uint8_t want = 0;
+    bt_foreach_bond(BT_ID_DEFAULT, count_unconnected_cb, &want);
+    return want;
 }
 
 static void stop_autoconnect(void)
 {
-    if (autoconnect_armed) {
-        bt_conn_create_auto_stop();
-        autoconnect_armed = false;
+    k_work_cancel_delayable(&autoconnect_work);
+    if (autoconnect_scanning) {
+        bt_le_scan_stop();
+        autoconnect_scanning = false;
     }
 }
 
-/* (Re-)start background auto-connect if appropriate. No-op when the scanner
- * or initiator is busy, when already armed, when no connection slot is free,
- * or when every bonded bulb is already connected. */
+/* Scan-receive hook: called from scan_recv_cb while the background scan owns
+ * the radio. If the advertiser is a bonded, not-yet-connected bulb, stop the
+ * scan and open a direct connection to that specific address. connected_cb
+ * then re-arms to catch the next bulb. Chaining scan -> stop -> create from the
+ * scan callback is the documented Zephyr pattern. */
+static void autoconnect_on_advert(const bt_addr_le_t *addr)
+{
+    if (autoconnect_connecting) {
+        return; /* one connect already in flight; ignore further adverts */
+    }
+    if (conn_count >= MAX_CONNECTIONS) {
+        return;
+    }
+    if (!bt_le_bond_exists(BT_ID_DEFAULT, addr)) {
+        return; /* not one of our bonded bulbs */
+    }
+    if (autoconnect_addr_connected(addr)) {
+        return; /* already connected (Hue bulbs advertise while connected) */
+    }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+
+    bt_le_scan_stop();
+    autoconnect_scanning = false;
+    autoconnect_connecting = true;
+
+    struct bt_conn *conn = NULL;
+    int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+                                BT_LE_CONN_PARAM_DEFAULT, &conn);
+    if (err) {
+        LOG_WRN("Auto-connect to %s failed to start: %d (rescan)", addr_str, err);
+        autoconnect_connecting = false;
+        rearm_autoconnect();
+        return;
+    }
+
+    LOG_INF("Auto-connecting to %s", addr_str);
+    if (conn) {
+        bt_conn_unref(conn);
+    }
+}
+
+/* Work-queue handler: (re)start the background scan when bonded bulbs still
+ * need bringing up. Runs in thread context, not a BT callback. */
+static void autoconnect_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (!autoconnect_enabled) {
+        return;
+    }
+    if (scanning || connect_pending || autoconnect_connecting) {
+        /* Radio busy with a discovery scan, manual connect, or an in-flight
+         * auto-connect — retry shortly. */
+        k_work_reschedule(&autoconnect_work, K_MSEC(AUTOCONNECT_RETRY_MS));
+        return;
+    }
+
+    uint8_t want = autoconnect_unconnected_count();
+    if (want == 0 || conn_count >= MAX_CONNECTIONS) {
+        /* Every bonded bulb is connected (or no slots left) — idle the scan. */
+        if (autoconnect_scanning) {
+            bt_le_scan_stop();
+            autoconnect_scanning = false;
+        }
+        return;
+    }
+
+    if (autoconnect_scanning) {
+        return; /* already looking for the next bulb */
+    }
+
+    int err = bt_le_scan_start(&autoconnect_scan_params, NULL);
+    if (err) {
+        LOG_WRN("Auto-connect scan start failed: %d (retry in %dms)",
+                err, AUTOCONNECT_RETRY_MS);
+        k_work_reschedule(&autoconnect_work, K_MSEC(AUTOCONNECT_RETRY_MS));
+        return;
+    }
+    autoconnect_scanning = true;
+    LOG_INF("Auto-connect scanning (%u connected, %u wanted)", conn_count, want);
+}
+
+/* (Re-)start background auto-connect if appropriate. Defers to the work queue
+ * so it never runs in a BT callback context. */
 static void rearm_autoconnect(void)
 {
-    if (!autoconnect_enabled || autoconnect_armed) {
+    if (!autoconnect_enabled) {
         return;
     }
-    if (scanning || connect_pending) {
-        /* Scanner/initiator busy — re-armed once they finish. */
-        return;
-    }
-    if (conn_count >= MAX_CONNECTIONS || conn_count >= bonded_count) {
-        return;
-    }
-
-    int err = bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN,
-                                     BT_LE_CONN_PARAM_DEFAULT);
-    if (err == -EALREADY) {
-        autoconnect_armed = true;
-    } else if (err) {
-        LOG_WRN("Auto-connect arm failed: %d", err);
-    } else {
-        autoconnect_armed = true;
-        LOG_INF("Auto-connect armed (%u/%u bonded connected)",
-                conn_count, bonded_count);
-    }
+    k_work_reschedule(&autoconnect_work, K_MSEC(AUTOCONNECT_ARM_DELAY_MS));
 }
 
-/* Rebuild the accept list from the current bond set and re-arm. Used at boot
- * and whenever bonds change (new pairing / unpair). */
+/* Recompute the bond count and re-arm. Used at boot and whenever bonds change
+ * (new pairing / unpair). */
 static void refresh_bonds_and_rearm(void)
 {
     stop_autoconnect();
 
     bonded_count = 0;
     bt_foreach_bond(BT_ID_DEFAULT, count_bond_cb, &bonded_count);
-
-    int err = bt_le_filter_accept_list_clear();
-    if (err) {
-        LOG_WRN("Accept list clear failed: %d", err);
-    }
-
-    if (bonded_count > 0) {
-        bt_foreach_bond(BT_ID_DEFAULT, add_bond_to_fal_cb, NULL);
-        autoconnect_enabled = true;
-    } else {
-        autoconnect_enabled = false;
-    }
+    autoconnect_enabled = (bonded_count > 0);
 
     rearm_autoconnect();
 }
@@ -480,6 +583,13 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
     if (err) {
         LOG_ERR("Connection failed to %s: %u", addr_str, err);
+        if (autoconnect_connecting) {
+            /* Background auto-connect attempt failed (bulb went away mid-connect
+             * or timed out). Don't surface a command error — just rescan. */
+            autoconnect_connecting = false;
+            rearm_autoconnect();
+            return;
+        }
         /* HCI-level connect failure (e.g. create-connection timeout): the peer
          * isn't reachable at this address, so retrying is pointless. Report
          * the error and end the connect cycle. */
@@ -515,11 +625,10 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    /* Background auto-connect (or other unsolicited) link: the create_auto
-     * procedure completes on connection. Report it, self-initiate encryption
-     * (bonded bulbs require an encrypted link), then re-arm to catch the next
-     * bonded bulb. */
-    autoconnect_armed = false;
+    /* Background auto-connect (or other unsolicited) link. Report it,
+     * self-initiate encryption (bonded bulbs require an encrypted link), then
+     * re-arm to rescan for the next still-missing bonded bulb. */
+    autoconnect_connecting = false;
     report_connected(entry);
 
     int sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
@@ -638,8 +747,8 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
     uint8_t payload[3] = {handle & 0xFF, (handle >> 8) & 0xFF, 0};
     event_queue_push(EVT_BOND_COMPLETE, payload, 3);
 
-    /* A new bond now exists — add it to the accept list so the persistent
-     * auto-connect path re-establishes it after future disconnects. */
+    /* A new bond now exists — re-arm the persistent auto-connect engine so it
+     * keeps this bulb connected (and re-establishes it after disconnects). */
     if (bonded) {
         refresh_bonds_and_rearm();
     }
@@ -787,4 +896,23 @@ uint16_t ble_central_conn_to_handle(struct bt_conn *conn)
 {
     struct conn_entry *entry = find_conn_entry(conn);
     return entry ? entry->handle : 0xFFFF;
+}
+
+void ble_central_report_connections(void)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        struct conn_entry *entry = &connections[i];
+        if (!entry->conn) {
+            continue;
+        }
+        LOG_INF("Re-announcing connection [%u]", entry->handle);
+        report_connected(entry);
+        if (entry->bonded) {
+            /* Already encrypted — re-emit EVT_ENC_CHANGE so the ESP32 knows
+             * the link is usable without waiting for a reconnect. */
+            uint8_t payload[3] = {entry->handle & 0xFF,
+                                  (entry->handle >> 8) & 0xFF, 0};
+            event_queue_push(EVT_ENC_CHANGE, payload, 3);
+        }
+    }
 }

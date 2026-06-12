@@ -29,6 +29,7 @@
 #define CMD_GET_BONDS        0x30
 #define CMD_DELETE_BOND      0x31
 #define CMD_DELETE_ALL_BONDS 0x32
+#define CMD_LIST_CONNECTIONS 0x33
 #define CMD_RESET            0xFF
 
 /* Event IDs */

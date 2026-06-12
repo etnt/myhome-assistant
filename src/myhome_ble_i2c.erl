@@ -17,6 +17,7 @@
 -export([scan/1, connect/1, connect/2, disconnect/1, bond/1]).
 -export([gatt_discover/1, gatt_read/2, gatt_write/3, gatt_write_nr/3]).
 -export([subscribe/2, get_bonds/0, delete_bond/1, delete_bond/2, delete_bonds/0]).
+-export([connection_state/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -44,6 +45,7 @@
 -define(CMD_SUBSCRIBE,    16#23).
 -define(CMD_DELETE_BOND,  16#31).
 -define(CMD_DELETE_ALL_BONDS, 16#32).
+-define(CMD_LIST_CONNECTIONS, 16#33).
 -define(CMD_RESET,        16#FF).
 
 %% Event IDs
@@ -82,6 +84,7 @@
     conn_waiters = #{} :: #{binary() => {pid(), term()}},  %% addr => From
     bond_waiters = #{} :: #{non_neg_integer() => {pid(), term()}},  %% handle => From
     connections = #{} :: #{non_neg_integer() => binary()},  %% handle => addr
+    encrypted = #{} :: #{non_neg_integer() => boolean()},   %% handle => link encrypted?
     discover_waiters = #{} :: #{non_neg_integer() => {pid(), term()}},  %% conn_handle => From
     discover_results = #{} :: #{non_neg_integer() => list()},  %% conn_handle => [{uuid, handle, props}]
     gatt_read_waiters = #{} :: #{non_neg_integer() => {pid(), term()}},  %% conn_handle => From
@@ -145,6 +148,13 @@ delete_bond(_, _) -> {error, invalid_addr}.
 delete_bonds() ->
     safe_call(delete_all_bonds, 5000).
 
+%% Look up the current connection for a peer address. Lets a bulb gen_server
+%% reconcile a link the nRF established (persistent auto-connect) before the
+%% gen_server subscribed to the event bus. Returns {ok, Handle, Encrypted} or
+%% none.
+connection_state(Addr) when byte_size(Addr) =:= 6 ->
+    safe_call({connection_state, Addr}, 5000);
+connection_state(_) -> {error, invalid_addr}.
 %% Phase 4: GATT discovery
 gatt_discover(ConnH) ->
     safe_call({gatt_discover, ConnH}, 15000).
@@ -293,6 +303,13 @@ handle_call(delete_all_bonds, _From, #state{i2c = I2C} = State) ->
         {error, _} = Err ->
             {reply, Err, State}
     end;
+handle_call({connection_state, Addr}, _From,
+            #state{connections = Conns, encrypted = Enc} = State) ->
+    Reply = case find_handle_by_addr(Addr, Conns) of
+        undefined -> none;
+        Handle -> {ok, Handle, maps:get(Handle, Enc, false)}
+    end,
+    {reply, Reply, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -318,6 +335,10 @@ handle_info(check_ready, State) ->
     State1 = drain_events(State),
     case State1#state.ready of
         true ->
+            %% Operational. Ask the nRF to re-announce live connections so we
+            %% rebuild our view after an ESP32-only reboot (the nRF holds links
+            %% across our restarts). Harmless if there are none.
+            request_connection_list(State1),
             Timer = erlang:send_after(?PING_INTERVAL_MS, self(), do_ping),
             {noreply, State1#state{ping_timer = Timer}};
         false ->
@@ -346,6 +367,17 @@ send_ping(#state{i2c = I2C}) ->
         ok ->
             ok;
         {error, _} = Err ->
+            Err
+    end.
+
+%% Ask the nRF to re-announce its live BLE connections (EVT_CONNECTED +
+%% EVT_ENC_CHANGE for each). Used after startup so we adopt links the nRF
+%% holds across our reboots.
+request_connection_list(#state{i2c = I2C}) ->
+    case i2c:write_bytes(I2C, ?XIAO_ADDR, <<?REG_CMD, ?CMD_LIST_CONNECTIONS>>) of
+        ok -> ok;
+        {error, _} = Err ->
+            myhome_log:log(warning, "BLE list-connections request failed: ~p", [Err]),
             Err
     end.
 
@@ -438,10 +470,13 @@ handle_event(?EVT_SCAN_DONE, _Payload,
     State#state{scan_from = undefined, scan_results = []};
 
 handle_event(?EVT_CONNECTED, <<Handle:16/little, Addr:6/binary>>,
-             #state{conn_waiters = Waiters, connections = Conns} = State) ->
+             #state{conn_waiters = Waiters, connections = Conns,
+                    encrypted = Enc} = State) ->
     myhome_log:log(info, "BLE connected [~p] to ~s", [Handle, format_addr(Addr)]),
     State1 = State#state{
-        connections = maps:put(Handle, Addr, Conns)
+        connections = maps:put(Handle, Addr, Conns),
+        %% New link starts unencrypted until ENC_CHANGE confirms otherwise.
+        encrypted = maps:put(Handle, false, Enc)
     },
     %% Publish so bulb gen_servers learn the handle for nRF-initiated
     %% (persistent auto-connect) links, which have no conn_waiter.
@@ -454,12 +489,13 @@ handle_event(?EVT_CONNECTED, <<Handle:16/little, Addr:6/binary>>,
     end;
 
 handle_event(?EVT_DISCONNECTED, <<Handle:16/little, Reason>>,
-             #state{connections = Conns} = State) ->
+             #state{connections = Conns, encrypted = Enc} = State) ->
     Addr = maps:get(Handle, Conns, <<>>),
     myhome_log:log(info, "BLE disconnected [~p] (~s): reason=0x~.16B",
                    [Handle, format_addr(Addr), Reason]),
     myhome_event_bus:publish({ble_disconnected, Handle, Reason}),
-    State#state{connections = maps:remove(Handle, Conns)};
+    State#state{connections = maps:remove(Handle, Conns),
+                encrypted = maps:remove(Handle, Enc)};
 
 handle_event(?EVT_BOND_COMPLETE, <<Handle:16/little, Status>>,
              #state{bond_waiters = Waiters} = State) ->
@@ -479,22 +515,23 @@ handle_event(?EVT_BOND_COMPLETE, <<Handle:16/little, Status>>,
     end;
 
 handle_event(?EVT_ENC_CHANGE, <<Handle:16/little, Status>>,
-             #state{bond_waiters = Waiters} = State) ->
+             #state{bond_waiters = Waiters, encrypted = Enc} = State) ->
     case Status of
         0 -> myhome_log:log(info, "BLE encryption established [~p]", [Handle]);
         _ -> myhome_log:log(warning, "BLE encryption failed [~p]: status=~p", [Handle, Status])
     end,
     myhome_event_bus:publish({ble_enc_change, Handle, Status}),
+    State1 = State#state{encrypted = maps:put(Handle, Status =:= 0, Enc)},
     %% Also resolve bond waiters (re-bonding to already-bonded device only emits enc_change)
     case maps:get(Handle, Waiters, undefined) of
-        undefined -> State;
+        undefined -> State1;
         From ->
             Reply = case Status of
                 0 -> ok;
                 _ -> {error, {enc_failed, Status}}
             end,
             gen_server:reply(From, Reply),
-            State#state{bond_waiters = maps:remove(Handle, Waiters)}
+            State1#state{bond_waiters = maps:remove(Handle, Waiters)}
     end;
 
 handle_event(?EVT_GATT_SERVICES, <<ConnH:16/little, 0:16, _/binary>>,

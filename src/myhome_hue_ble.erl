@@ -140,6 +140,10 @@ init({Addr, AddrType, Name}) ->
         gatt_handles = undefined
     },
     myhome_log:log(info, "[~p] ready (persistent connection managed by nRF)", [Name]),
+    %% The nRF may have already auto-connected this bulb before we subscribed
+    %% (it connects at boot, ahead of these gen_servers). Reconcile once we're
+    %% subscribed so we don't miss a connection whose events we never saw.
+    self() ! reconcile_connection,
     %% Schedule first heartbeat (stagger based on atomvm:random to avoid all bulbs reading at once)
     Jitter = (atomvm:random() rem ?HEARTBEAT_INTERVAL_MS) + 60000,
     erlang:send_after(Jitter, self(), heartbeat),
@@ -247,6 +251,36 @@ handle_info(heartbeat, State) ->
             publish_state(NewState),
             {noreply, NewState};
         false ->
+            {noreply, State}
+    end;
+
+%% Reconcile a connection the nRF established before we subscribed (e.g. its
+%% boot-time auto-connect). Adopt the live handle so the bulb is usable
+%% without waiting for a disconnect/reconnect cycle.
+handle_info(reconcile_connection, State) ->
+    case myhome_ble_i2c:connection_state(State#state.addr) of
+        {ok, Handle, true} ->
+            myhome_log:log(info, "[~p] adopting live connection [~p] (encrypted)",
+                           [State#state.name, Handle]),
+            State1 = State#state{conn_handle = Handle, connected = true},
+            State2 = case ensure_gatt_handles(State1) of
+                {ok, S} ->
+                    {_, S3} = execute_cmd(read_all, S),
+                    S3;
+                {error, _} ->
+                    State1
+            end,
+            publish_state(State2),
+            {noreply, State2};
+        {ok, Handle, false} ->
+            %% Connected but not yet encrypted — record the handle and wait for
+            %% the nRF's enc_change (it self-initiates encryption).
+            myhome_log:log(info, "[~p] adopting live connection [~p] (awaiting encryption)",
+                           [State#state.name, Handle]),
+            {noreply, State#state{conn_handle = Handle, connected = false}};
+        _ ->
+            %% Not connected yet; the nRF auto-connects in the background and we
+            %% (now subscribed) will get the ble_connected event.
             {noreply, State}
     end;
 
