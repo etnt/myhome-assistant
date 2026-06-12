@@ -28,6 +28,7 @@ cd viz && python3 -m http.server 3000
 - Seed XIAO nRF52840 Bluetooth module
 - Philips Hue Bluetooth bulbs (2019+ models with built-in BLE)
 - Sensors: VEML6039, BME680
+- 16x2 LCD with I2C (PCF8574) backpack — status display (optional)
 
 <a href="myhome-assistant-hw.jpg"><img src="myhome-assistant-hw.jpg" height="300"></a>
 
@@ -132,6 +133,48 @@ make monitor
 
 The bulbs are controlled via the HTTP API; via `minicom`
 you'll see the obtained IP address, of the ESP32, being printed.
+
+### Status Display (LCD)
+
+An optional 16x2 character LCD (HD44780 with a PCF8574 I2C backpack) shows
+live status without needing the serial console:
+
+```
+┌────────────────┐
+│192.168.68.50   │  line 0: device IP address ("No IP" until WiFi is up)
+│Mem:8266/8100K  │  line 1: free heap KB — current / minimum-ever
+└────────────────┘
+```
+
+Line 1 shows two numbers in KB: the **current** free heap (fluctuates with
+activity) and the **minimum** free heap seen since boot (worst-case headroom
+and a slow-leak indicator). Both lines refresh once a minute.
+
+**Wiring** — the LCD shares the same I2C bus as the sensors and the XIAO
+bridge (driven by `myhome_lcd` via the `lcd1602` driver in `atomvm_sensors`):
+
+| LCD backpack | ESP32-S3        |
+|--------------|-----------------|
+| `VCC`        | **5V** (see note)|
+| `GND`        | `GND`           |
+| `SDA`        | shared I2C `SDA`|
+| `SCL`        | shared I2C `SCL`|
+
+> **Note — power it from 5V.** The PCF8574 expander works at 3.3V (so the
+> address ACKs and the backlight lights up), but the HD44780 LCD glass needs
+> ~5V to develop enough contrast — at 3.3V you get a lit backlight but no
+> visible characters even with the contrast trimpot maxed. Because the
+> backpack's I2C pull-ups go to `VCC`, powering it at 5V pulls `SDA`/`SCL` to
+> 5V, which exceeds the ESP32-S3's 3.6V GPIO limit. For an in-spec setup
+> either remove the backpack's two pull-up resistors (rely on the 3.3V bus
+> pull-ups) or use a bidirectional I2C level shifter.
+
+The driver auto-detects the backpack at `0x27` (PCF8574) or `0x3F`
+(PCF8574A). On boot it runs a backlight blink test and writes a row of solid
+blocks for a few seconds — turn the contrast trimpot until the blocks are
+crisp. Detection and init progress are printed to the serial console
+(`[lcd] ...`). The display is optional: if no backpack is found the rest of
+the system runs normally.
 
 ### REST API
 

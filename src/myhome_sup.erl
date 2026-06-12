@@ -55,10 +55,18 @@ init([]) ->
         type => worker
     },
 
+    LcdSpec = #{
+        id => myhome_lcd,
+        start => {myhome_lcd, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec]}}.
+    {ok, {SupFlags, [ScannerSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec, LcdSpec]}}.
