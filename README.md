@@ -178,8 +178,10 @@ controlled. You must trigger discovery manually:
    ```bash
    curl -X POST http://<esp-ip>:8080/api/discover
    ```
-3. The ESP32 scans for nearby BLE devices, then pairs with those that have "Hue" in their name
-4. Addresses are stored in NVS for automatic reconnection on future boots
+3. The XIAO nRF52840 bridge scans for nearby BLE devices (driven over I2C by
+   the ESP32), then pairs and bonds with those that have "Hue" in their name
+4. Addresses are stored in NVS; on future boots the XIAO auto-reconnects and
+   keeps each bonded bulb connected and encrypted (persistent links)
 
 > **Note:** In case the bulbs has been paired before you may have to factory
 > reset them; the safest way to do this is to user the `Phillips Hue` app
@@ -243,6 +245,7 @@ the system runs normally.
 | Method | Endpoint                   | Body                    | Description                |
 |--------|----------------------------|-------------------------|----------------------------|
 | GET    | `/api/status`              | —                       | List registered bulbs and connection state |
+| GET    | `/api/ble/status`          | —                       | BLE bridge status: nRF firmware version, uptime, and connected/encrypted bulbs |
 | GET    | `/api/suptree`             | —                       | Erlang supervision tree as nested JSON (drawn in the UI) |
 | GET    | `/api/scan`                | —                       | Get last BLE scan results |
 | POST   | `/api/scan`                | `{"duration":10}`       | Trigger a BLE scan (blocks until done) |
@@ -252,7 +255,7 @@ the system runs normally.
 | GET    | `/api/sensors`             | —                       | Current readings from all sensors |
 | GET    | `/api/sensors/{type}`      | —                       | Readings for a single sensor type |
 | GET    | `/api/bulb/{n}/state`      | —                       | Cached bulb state (no BLE, instant) |
-| POST   | `/api/bulb/{n}/refresh`    | —                       | Live BLE GATT read (connects on-demand) |
+| POST   | `/api/bulb/{n}/refresh`    | —                       | Live BLE GATT read over the persistent link |
 | POST   | `/api/bulb/{n}/power`      | `{"on":true}`           | Turn bulb on/off |
 | POST   | `/api/bulb/{n}/brightness` | `{"value":200}`         | Set brightness (1–254) |
 | POST   | `/api/bulb/{n}/color_temp` | `{"value":370}`         | Set color temp (153–500 mirek) |
@@ -266,8 +269,8 @@ the system runs normally.
 | POST   | `/api/policies/{id}/enable` | —                      | Enable an automation policy |
 | POST   | `/api/policies/{id}/disable` | —                     | Disable an automation policy |
 | GET    | `/api/events`              | —                       | Long-poll for real-time events (30s timeout) |
-| POST   | `/api/reconnect`           | —                       | Clear connect cooldown on all bulbs |
-| POST   | `/api/bulb/{n}/reconnect`  | —                       | Clear connect cooldown on a single bulb |
+| POST   | `/api/reconnect`           | —                       | Legacy no-op (persistent model); kept for API compatibility |
+| POST   | `/api/bulb/{n}/reconnect`  | —                       | Legacy no-op (persistent model); kept for API compatibility |
 | DELETE | `/api/bulb/{n}/bond`       | —                       | Delete the BLE bond (stored key) for a bulb on the nRF |
 
 #### Low-level BLE debug endpoints
@@ -303,7 +306,7 @@ curl -X POST http://<esp-ip>:8080/api/discover
 # View system logs (newest first)
 curl http://<esp-ip>:8080/api/logs
 
-# Read actual bulb state (connects via BLE, reads GATT characteristics)
+# Read actual bulb state (live BLE GATT read over the persistent link)
 curl -X POST http://<esp-ip>:8080/api/bulb/1/refresh
 # => {"status":"ok","power":true,"brightness":200,"color_temp":366}
 
@@ -377,6 +380,11 @@ Enter the ESP32's IP:Port (e.g. `192.168.1.115:8080`) and click **Connect**.
 
 - **Bulb controls** — power toggle, brightness slider, and color temperature
   slider for each discovered bulb
+- **Lamp rename** — click a lamp's name to rename it via a modal dialog
+  (stored in NVS)
+- **BLE bridge status** — under the **System** tab, a card showing the
+  nRF52840 firmware version, uptime, and each connected bulb with its
+  encryption state
 - **BLE scanner** — trigger scans and view nearby devices
 - **System logs** — live view of the on-device log ring buffer
 - **Sensor cards** — real-time readings from BME680 (temperature, humidity,
@@ -408,11 +416,19 @@ connection, so the long-poll blocks only its own handler process.
 
 Each bulb gen_server runs a **heartbeat timer** (every 5 minutes + random
 jitter) that reads the bulb's BLE state to detect external changes (e.g.
-wall switch toggled). If the bulb is unreachable, a 60-second **connect
-cooldown** prevents retry storms that could exhaust ESP32 RAM.
+wall switch toggled).
 
-Use `POST /api/reconnect` (all bulbs) or `POST /api/bulb/{n}/reconnect`
-(single bulb) to clear the cooldown and retry immediately.
+Reconnection is handled entirely by the XIAO nRF52840: it keeps every bonded
+bulb connected and encrypted, and re-establishes a dropped link on its own by
+scanning for the bonded address. The ESP32 just reacts to the resulting
+`ble_connected` / `ble_enc_change` / `ble_disconnected` events. If a bulb's
+GATT discovery ever returns an incomplete characteristic set (e.g. it ran
+before the Hue control service was visible), the ESP32 detects the missing
+control characteristic on the next command and re-discovers automatically.
+
+`POST /api/reconnect` and `POST /api/bulb/{n}/reconnect` remain for API
+compatibility but are no-ops in the persistent model — there is no connect
+cooldown to clear.
 
 ## Color Control
 
