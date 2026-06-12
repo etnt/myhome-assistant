@@ -107,7 +107,7 @@ get_i2c() ->
 
 %% Phase 2: BLE scanning
 scan(Duration) ->
-    gen_server:call(?MODULE, {scan, Duration}, 30000).
+    safe_call({scan, Duration}, 30000).
 
 %% Phase 3: Connection management
 connect(Addr) when byte_size(Addr) =:= 6 ->
@@ -115,20 +115,20 @@ connect(Addr) when byte_size(Addr) =:= 6 ->
 connect(_) -> {error, invalid_addr}.
 
 connect(Addr, AddrType) ->
-    gen_server:call(?MODULE, {connect, Addr, AddrType}, 15000).
+    safe_call({connect, Addr, AddrType}, 15000).
 
 disconnect(Handle) ->
-    gen_server:call(?MODULE, {disconnect, Handle}, 5000).
+    safe_call({disconnect, Handle}, 5000).
 
 bond(Handle) ->
-    gen_server:call(?MODULE, {bond, Handle}, 15000).
+    safe_call({bond, Handle}, 15000).
 
 gatt_read(ConnH, AttrH) ->
-    gen_server:call(?MODULE, {gatt_read, ConnH, AttrH}, 10000).
+    safe_call({gatt_read, ConnH, AttrH}, 10000).
 gatt_write(ConnH, AttrH, Data) ->
-    gen_server:call(?MODULE, {gatt_write, ConnH, AttrH, Data}, 10000).
+    safe_call({gatt_write, ConnH, AttrH, Data}, 10000).
 gatt_write_nr(ConnH, AttrH, Data) ->
-    gen_server:call(?MODULE, {gatt_write_nr, ConnH, AttrH, Data}, 5000).
+    safe_call({gatt_write_nr, ConnH, AttrH, Data}, 5000).
 subscribe(_ConnH, _CharH) -> {error, not_implemented}.
 get_bonds() -> {error, not_implemented}.
 
@@ -138,16 +138,29 @@ delete_bond(Addr) when byte_size(Addr) =:= 6 ->
 delete_bond(_) -> {error, invalid_addr}.
 
 delete_bond(Addr, AddrType) when byte_size(Addr) =:= 6 ->
-    gen_server:call(?MODULE, {delete_bond, Addr, AddrType}, 5000);
+    safe_call({delete_bond, Addr, AddrType}, 5000);
 delete_bond(_, _) -> {error, invalid_addr}.
 
 %% Delete all stored bonds.
 delete_bonds() ->
-    gen_server:call(?MODULE, delete_all_bonds, 5000).
+    safe_call(delete_all_bonds, 5000).
 
 %% Phase 4: GATT discovery
 gatt_discover(ConnH) ->
-    gen_server:call(?MODULE, {gatt_discover, ConnH}, 15000).
+    safe_call({gatt_discover, ConnH}, 15000).
+
+%% Wrap gen_server:call so a timeout (or dead/overloaded server) returns
+%% {error, Reason} instead of raising an exit. BLE operations run inside
+%% the per-bulb gen_servers; a connect/GATT timeout must NOT crash the bulb
+%% process — the caller handles {error, _} gracefully (cooldown + reply).
+safe_call(Msg, Timeout) ->
+    try
+        gen_server:call(?MODULE, Msg, Timeout)
+    catch
+        exit:{timeout, _} -> {error, timeout};
+        exit:{noproc, _}  -> {error, noproc};
+        exit:Reason       -> {error, Reason}
+    end.
 
 %%====================================================================
 %% gen_server callbacks
