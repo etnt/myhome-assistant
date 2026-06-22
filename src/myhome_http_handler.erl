@@ -228,6 +228,15 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"color_xy">>], HttpRequest) ->
 
 %% --- Philips WiZ lamps (JSON-over-UDP, addressed by logical name) ---
 
+do_handle(get, [<<"wiz">>], _HttpRequest) ->
+    %% List the configured lamps (logical names) with their resolved IPs so
+    %% the UI can render a control card per lamp.
+    Lamps = myhome_wiz:list(),
+    json_reply(#{status => ok,
+                 lamps => [#{name => to_bin(maps:get(name, L)),
+                             mac => wiz_mac_bin(maps:get(mac, L)),
+                             ip => wiz_ip_bin(maps:get(ip, L))} || L <- Lamps]});
+
 do_handle(get, [<<"wiz">>, <<"discover">>], _HttpRequest) ->
     case myhome_wiz:discover() of
         {ok, Lamps} ->
@@ -236,6 +245,17 @@ do_handle(get, [<<"wiz">>, <<"discover">>], _HttpRequest) ->
                                      mac => maps:get(mac, L)} || L <- Lamps]});
         {error, Reason} ->
             json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
+do_handle(get, [<<"wiz">>, LampBin, <<"state">>], _HttpRequest) ->
+    case wiz_lamp_name(LampBin) of
+        {ok, Name} ->
+            case myhome_wiz:get_state(Name) of
+                {ok, St} -> json_reply(wiz_state_json(St));
+                {error, Reason} -> json_reply(#{status => error, reason => to_bin(Reason)})
+            end;
+        error ->
+            {404, #{}, <<"Unknown lamp">>}
     end;
 
 do_handle(post, [<<"wiz">>, LampBin, <<"power">>], HttpRequest) ->
@@ -657,14 +677,15 @@ with_wiz_lamp(LampBin, HttpRequest, Fun) ->
 %% Validate against myhome_config:wiz_lamps/0. binary_to_existing_atom keeps
 %% the atom table bounded — valid lamp atoms already exist in the config module.
 wiz_lamp_name(LampBin) ->
-    try binary_to_existing_atom(LampBin, utf8) of
-        Name ->
-            case maps:is_key(Name, myhome_config:wiz_lamps()) of
-                true -> {ok, Name};
-                false -> error
-            end
-    catch _:_ ->
-        error
+    %% Match the request name against the configured atoms by converting each
+    %% known key to a binary. Do NOT use binary_to_existing_atom/2 here: on
+    %% AtomVM the target atom may not yet be registered in the atom table
+    %% (literal-pool atoms appear lazily), so it throws badarg right after a
+    %% reboot and every lamp looks "unknown" until something touches the config.
+    Names = maps:keys(myhome_config:wiz_lamps()),
+    case lists:filter(fun(N) -> atom_to_binary(N, utf8) =:= LampBin end, Names) of
+        [Name | _] -> {ok, Name};
+        [] -> error
     end.
 
 wiz_reply(ok) -> json_reply(#{status => ok});
@@ -674,6 +695,29 @@ wiz_reply({error, Reason}) -> json_reply(#{status => error, reason => to_bin(Rea
 wiz_ip_bin({A, B, C, D}) ->
     iolist_to_binary(io_lib:format("~p.~p.~p.~p", [A, B, C, D]));
 wiz_ip_bin(_) -> <<"unknown">>.
+
+%% Format a configured MAC (binary) for JSON output; static-IP lamps have none.
+wiz_mac_bin(Mac) when is_binary(Mac) -> Mac;
+wiz_mac_bin(_) -> <<"">>.
+
+%% Build a JSON-friendly reply from a live getPilot state map. Only the keys
+%% the lamp reported are included; RGB is emitted only when all channels are
+%% present (the lamp is in color mode).
+wiz_state_json(St) ->
+    M0 = #{status => ok},
+    M1 = wiz_put(power, maps:get(power, St, undefined), M0),
+    M2 = wiz_put(brightness, maps:get(brightness, St, undefined), M1),
+    M3 = wiz_put(color_temp, maps:get(color_temp, St, undefined), M2),
+    case {maps:get(r, St, undefined), maps:get(g, St, undefined),
+          maps:get(b, St, undefined)} of
+        {R, G, B} when is_integer(R), is_integer(G), is_integer(B) ->
+            M3#{r => R, g => G, b => B};
+        _ ->
+            M3
+    end.
+
+wiz_put(_K, undefined, M) -> M;
+wiz_put(K, V, M) -> M#{K => V}.
 
 get_bulb_status() ->
     lists:filtermap(fun(N) ->

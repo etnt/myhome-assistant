@@ -64,6 +64,11 @@
 -define(EVT_ENC_CHANGE,    16#8C).
 -define(EVT_CMD_ERROR,     16#FE).
 
+%% Per-event drain tracing. Off by default — the nRF auto-reconnect at boot
+%% floods the console with GATT-services (0x88) events. Flip the macro body to
+%% `io:format(Fmt, Args)' when debugging the I2C bridge.
+-define(TRACE(Fmt, Args), ok).
+
 %% GPIO pins
 -define(IRQ_PIN, 4).
 -define(RST_PIN, 5).
@@ -343,13 +348,13 @@ handle_cast(_Msg, State) ->
 
 handle_info({gpio_interrupt, ?IRQ_PIN}, State) ->
     %% XIAO has events pending — drain them
-    io:format("[ble_i2c] IRQ! draining events~n"),
+    ?TRACE("[ble_i2c] IRQ! draining events~n", []),
     State1 = drain_events(State),
     {noreply, State1};
 
 handle_info(drain_continue, State) ->
     %% Continue draining if we hit the per-cycle limit
-    io:format("[ble_i2c] drain_continue~n"),
+    ?TRACE("[ble_i2c] drain_continue~n", []),
     State1 = drain_events(State),
     {noreply, State1};
 
@@ -425,11 +430,11 @@ drain_events(#state{i2c = I2C} = State, Remaining) ->
             case i2c:read_bytes(I2C, ?XIAO_ADDR, 2) of
                 {ok, <<0, 0>>} ->
                     %% No more events
-                    io:format("[ble_i2c] drain: queue empty~n"),
+                    ?TRACE("[ble_i2c] drain: queue empty~n", []),
                     State;
                 {ok, <<EventType, PayloadLen>>} ->
                     %% Read the actual event
-                    io:format("[ble_i2c] drain: evt=0x~.16B len=~p rem=~p~n",
+                    ?TRACE("[ble_i2c] drain: evt=0x~.16B len=~p rem=~p~n",
                               [EventType, PayloadLen, Remaining]),
                     State1 = read_event(State, EventType, PayloadLen),
                     drain_events(State1, Remaining - 1);
@@ -449,7 +454,7 @@ read_event(#state{i2c = I2C} = State, EventType, PayloadLen) ->
         ok ->
             case i2c:read_bytes(I2C, ?XIAO_ADDR, ReadLen) of
                 {ok, <<_Type, _Len, Payload/binary>>} ->
-                    io:format("[ble_i2c] event 0x~.16B payload=~p~n",
+                    ?TRACE("[ble_i2c] event 0x~.16B payload=~p~n",
                               [EventType, Payload]),
                     handle_event(EventType, Payload, State);
                 {ok, Other} ->

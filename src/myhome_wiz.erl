@@ -32,13 +32,15 @@
 %% Public API
 -export([start_link/0]).
 -export([set_power/2, set_brightness/2, set_color_temp/2, set_rgb/4]).
--export([discover/0]).
+-export([discover/0, list/0, get_state/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(WIZ_PORT, 38899).
--define(CALL_TIMEOUT, 8000).
+%% Generous enough that a control/state call which parks behind an on-demand
+%% local /24 scan (sends + reply window) resolves before the caller times out.
+-define(CALL_TIMEOUT, 12000).
 -define(DISCOVER_CALL_TIMEOUT, 25000).
 
 %% getPilot request — every WiZ lamp answers with its state, including "mac".
@@ -49,12 +51,14 @@
 -define(DISC_INITIAL_MS, 8000).     %% first scan, after WiFi settles
 -define(DISC_INTERVAL_MS, 300000).  %% periodic refresh (5 min)
 -define(DISC_MAX_HOSTS, 1500).      %% cap sweep size (>/22 falls back to /24)
+-define(STATE_RECV_MS, 600).        %% getPilot reply wait for a live state read
 
 -record(state, {
     socket :: term() | undefined,            %% control socket, opened lazily
     cache = #{} :: #{atom() => tuple()},     %% Name => IP, from discovery
     scanning = false :: boolean(),           %% a discovery sweep is in flight
-    waiters = [] :: [term()]                 %% callers awaiting the current sweep
+    waiters = [] :: [term()],                %% discover/0 callers awaiting the sweep
+    pending = [] :: [{term(), atom(), term()}] %% control/state calls awaiting resolution
 }).
 
 %%====================================================================
@@ -94,6 +98,21 @@ set_rgb(Name, R, G, B)
 discover() ->
     gen_server:call(?MODULE, discover, ?DISCOVER_CALL_TIMEOUT).
 
+%% @doc List the configured lamps with their resolved IPs, for the UI.
+%% Static-IP lamps report their configured IP; MAC-addressed lamps report
+%% the cached IP from discovery, or `undefined' if not yet seen.
+-spec list() -> [#{name => atom(), mac => binary() | undefined,
+                   ip => tuple() | undefined}].
+list() ->
+    gen_server:call(?MODULE, list, ?CALL_TIMEOUT).
+
+%% @doc Read a lamp's current state live (getPilot). Returns a map with the
+%% keys present in the reply: `power' (boolean), `brightness' (10..100),
+%% `color_temp' (Kelvin), and `r'/`g'/`b' (0..255) when in color mode.
+-spec get_state(atom()) -> {ok, map()} | {error, term()}.
+get_state(Name) ->
+    gen_server:call(?MODULE, {get_state, Name}, ?CALL_TIMEOUT).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -106,26 +125,49 @@ init([]) ->
     myhome_log:log(info, "[myhome_wiz] ready"),
     {ok, #state{socket = undefined, cache = #{}}}.
 
-handle_call({pilot, Name, Params}, _From, State0) ->
-    case resolve_ip(Name, State0) of
-        {ok, IP, State1} ->
-            case ensure_socket(State1) of
-                {ok, State2} ->
-                    Reply = send_pilot(State2#state.socket, IP, Params),
-                    {reply, Reply, State2};
-                {error, Reason, State2} ->
-                    myhome_log:log(error, "[myhome_wiz] udp open failed: ~p", [Reason]),
-                    {reply, {error, Reason}, State2}
-            end;
-        {error, Reason, State1} ->
-            {reply, {error, Reason}, State1}
+handle_call({pilot, Name, Params}, From, State0) ->
+    %% Resolve from cache and act immediately; on a cache miss, kick a fast
+    %% local scan and park the caller until the lamp's IP is known (rather
+    %% than failing — MAC-addressed lamps are cold right after boot).
+    case classify(Name, State0) of
+        {ready, IP} ->
+            {Reply, State1} = do_pilot(IP, Params, State0),
+            {reply, Reply, State1};
+        needs_scan ->
+            {noreply, park(From, Name, {pilot, Params}, start_scan(local24, State0))};
+        {error, Reason} ->
+            {reply, {error, Reason}, State0}
+    end;
+handle_call({get_state, Name}, From, State0) ->
+    case classify(Name, State0) of
+        {ready, IP} ->
+            {Reply, State1} = do_get_state(IP, State0),
+            {reply, Reply, State1};
+        needs_scan ->
+            {noreply, park(From, Name, get_state, start_scan(local24, State0))};
+        {error, Reason} ->
+            {reply, {error, Reason}, State0}
     end;
 handle_call(discover, From, State0) ->
     %% Run the (potentially ~1000-host) sweep in a spawned worker so the
     %% gen_server stays responsive to lamp-control calls. The caller is
     %% parked in `waiters' and answered when the sweep result arrives.
-    State1 = start_scan(State0),
+    State1 = start_scan(full, State0),
     {noreply, State1#state{waiters = [From | State1#state.waiters]}};
+handle_call(list, _From, State) ->
+    Lamps = maps:fold(fun(Name, Val, Acc) ->
+        Entry = case Val of
+            {_, _, _, _} = IP ->
+                #{name => Name, mac => undefined, ip => IP};
+            Mac when is_binary(Mac) ->
+                #{name => Name, mac => Mac,
+                  ip => maps:get(Name, State#state.cache, undefined)};
+            _ ->
+                #{name => Name, mac => undefined, ip => undefined}
+        end,
+        [Entry | Acc]
+    end, [], myhome_config:wiz_lamps()),
+    {reply, Lamps, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -133,19 +175,21 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(refresh_discovery, State0) ->
-    %% Periodic background refresh — fire-and-forget (no waiters to answer).
-    State1 = start_scan(State0),
+    %% Periodic background refresh — full subnet sweep, fire-and-forget.
+    State1 = start_scan(full, State0),
     erlang:send_after(?DISC_INTERVAL_MS, self(), refresh_discovery),
     {noreply, State1};
 handle_info({discovery_result, {ok, Found}}, State0) ->
-    Cache = build_cache(Found),
+    Cache = build_cache(Found, State0#state.cache),
     myhome_log:log(info, "[myhome_wiz] discovered ~p lamp(s)", [length(Found)]),
     Reply = {ok, [#{ip => IP, mac => Mac} || {IP, Mac} <- Found]},
     [gen_server:reply(W, Reply) || W <- State0#state.waiters],
-    {noreply, State0#state{cache = Cache, scanning = false, waiters = []}};
+    State1 = State0#state{cache = Cache, scanning = false, waiters = []},
+    {noreply, drain_pending(State1)};
 handle_info({discovery_result, {error, Reason}}, State0) ->
     [gen_server:reply(W, {error, Reason}) || W <- State0#state.waiters],
-    {noreply, State0#state{scanning = false, waiters = []}};
+    [gen_server:reply(From, {error, Reason}) || {From, _, _} <- State0#state.pending],
+    {noreply, State0#state{scanning = false, waiters = [], pending = []}};
 handle_info({udp, _Sock, _Addr, _Port, _Packet}, State) ->
     %% Stray late reply from a closed discovery socket — ignore.
     {noreply, State};
@@ -159,35 +203,80 @@ terminate(_Reason, #state{socket = Socket}) ->
     ok.
 
 %%====================================================================
-%% Internal — IP resolution
+%% Internal — IP resolution & request servicing
 %%====================================================================
 
-%% Resolve a logical lamp name to a current IP. Static-IP lamps resolve
-%% directly; MAC-addressed lamps come from the discovery cache, triggering
-%% an on-demand scan if not yet known.
-resolve_ip(Name, State) ->
+%% Decide how to service a request for Name without side effects beyond the
+%% cache lookup. Static-IP lamps are always ready; MAC-addressed lamps are
+%% ready once discovered, else `needs_scan'.
+classify(Name, State) ->
     case maps:find(Name, myhome_config:wiz_lamps()) of
         error ->
-            {error, unknown_lamp, State};
+            {error, unknown_lamp};
         {ok, {_, _, _, _} = IP} ->
-            {ok, IP, State};
+            {ready, IP};
         {ok, Mac} when is_binary(Mac) ->
             case maps:find(Name, State#state.cache) of
-                {ok, IP} ->
-                    {ok, IP, State};
-                error ->
-                    %% Not discovered yet — kick a background scan (so the
-                    %% cache fills in for next time) and fail this call rather
-                    %% than blocking the gen_server on a full sweep.
-                    {error, lamp_not_found, start_scan(State)}
+                {ok, IP} -> {ready, IP};
+                error    -> needs_scan
             end;
         {ok, _Other} ->
-            {error, bad_lamp_config, State}
+            {error, bad_lamp_config}
     end.
 
-%% Build a Name => IP cache by matching configured MACs against the
-%% MACs reported by discovery. Static-IP lamps are not cached.
-build_cache(Found) ->
+%% Pure cache lookup (no scan) used when draining parked callers.
+lookup_ip(Name, State) ->
+    case maps:find(Name, myhome_config:wiz_lamps()) of
+        {ok, {_, _, _, _} = IP} -> {ok, IP};
+        {ok, Mac} when is_binary(Mac) -> maps:find(Name, State#state.cache);
+        _ -> error
+    end.
+
+%% Park a control/state caller until the next discovery result resolves it.
+park(From, Name, Action, State) ->
+    State#state{pending = [{From, Name, Action} | State#state.pending]}.
+
+%% Once discovery has merged into the cache, answer every parked caller by
+%% re-resolving and performing its action (or failing if still unknown).
+drain_pending(#state{pending = []} = State) ->
+    State;
+drain_pending(#state{pending = Pending} = State0) ->
+    State1 = lists:foldl(fun({From, Name, Action}, S) ->
+        case lookup_ip(Name, S) of
+            {ok, IP} ->
+                {Reply, S1} = perform(Action, IP, S),
+                gen_server:reply(From, Reply),
+                S1;
+            error ->
+                gen_server:reply(From, {error, lamp_not_found}),
+                S
+        end
+    end, State0, Pending),
+    State1#state{pending = []}.
+
+perform({pilot, Params}, IP, State) -> do_pilot(IP, Params, State);
+perform(get_state, IP, State)       -> do_get_state(IP, State).
+
+%% Send a setPilot to a resolved IP, opening the control socket if needed.
+do_pilot(IP, Params, State0) ->
+    case ensure_socket(State0) of
+        {ok, State1} ->
+            {send_pilot(State1#state.socket, IP, Params), State1};
+        {error, Reason, State1} ->
+            myhome_log:log(error, "[myhome_wiz] udp open failed: ~p", [Reason]),
+            {{error, Reason}, State1}
+    end.
+
+%% Live getPilot read from a resolved IP.
+do_get_state(IP, State) ->
+    {read_pilot(IP), State}.
+
+%% Merge newly-discovered Name => IP mappings into the existing cache.
+%% Discovery is lossy (a single UDP probe per host, collected in a short
+%% window), so a known lamp can miss a round; merging keeps it resolvable
+%% until a later scan actually reports a new IP. Static-IP lamps are not
+%% cached (they resolve directly).
+build_cache(Found, OldCache) ->
     ByMac = lists:foldl(fun({IP, Mac}, Acc) -> Acc#{Mac => IP} end, #{}, Found),
     maps:fold(fun
         (Name, Mac, Acc) when is_binary(Mac) ->
@@ -197,7 +286,7 @@ build_cache(Found) ->
             end;
         (_Name, _Val, Acc) ->
             Acc
-    end, #{}, myhome_config:wiz_lamps()).
+    end, OldCache, myhome_config:wiz_lamps()).
 
 %%====================================================================
 %% Internal — discovery
@@ -208,28 +297,26 @@ build_cache(Found) ->
 %% as {discovery_result, Result}, keeping the gen_server unblocked. A
 %% try/catch guarantees a result is always sent so `scanning' can never
 %% get stuck on a worker crash.
-start_scan(#state{scanning = true} = State) ->
+start_scan(_Scope, #state{scanning = true} = State) ->
     State;
-start_scan(#state{scanning = false} = State) ->
+start_scan(Scope, #state{scanning = false} = State) ->
     Self = self(),
     spawn(fun() ->
-        Result = try do_discover() catch Class:Reason -> {error, {Class, Reason}} end,
+        Result = try do_discover(Scope) catch Class:Reason -> {error, {Class, Reason}} end,
         Self ! {discovery_result, Result}
     end),
     State#state{scanning = true}.
 
-%% Unicast-scan the local subnet with getPilot and collect lamp replies.
-%% Returns a deduplicated list of {IP, NormalizedMac}.
-do_discover() ->
+%% Unicast-scan for WiZ lamps with getPilot and collect replies. Scope is
+%% `full' (whole subnet from the netmask, for periodic/explicit discovery) or
+%% `local24' (just our own /24, for fast on-demand resolution — the lamp
+%% almost always shares the controller's /24). Returns {IP, NormalizedMac}.
+do_discover(Scope) ->
     case myhome_http:get_ip() of
         {_, _, _, _} = MyIp ->
             case gen_udp:open(0, [binary, {active, true}]) of
                 {ok, Sock} ->
-                    %% Probe every host on our subnet (derived from the
-                    %% netmask, so wider-than-/24 LANs are covered) plus the
-                    %% directed-broadcast address (some firmware answers
-                    %% broadcast; a rejected send just errors and is ignored).
-                    Targets = scan_targets(MyIp, myhome_http:get_netmask()),
+                    Targets = discover_targets(Scope, MyIp),
                     SendErrs = lists:foldl(fun(IP, Acc) ->
                         case gen_udp:send(Sock, IP, ?WIZ_PORT, ?GETPILOT) of
                             ok -> Acc;
@@ -248,6 +335,14 @@ do_discover() ->
         _Other ->
             {error, no_ip}
     end.
+
+%% Build the probe target list for a scan scope. `full' covers the whole
+%% subnet (from the netmask, with the directed-broadcast address appended);
+%% `local24' covers only the controller's own /24.
+discover_targets(full, MyIp) ->
+    scan_targets(MyIp, myhome_http:get_netmask());
+discover_targets(local24, {A, B, C, D}) ->
+    [{A, B, C, N} || N <- lists:seq(1, 254), N =/= D].
 
 %% Build the list of unicast probe targets for the host's subnet from the
 %% IP and netmask. Excludes our own address, appends the directed-broadcast
@@ -358,3 +453,93 @@ encode_field(state, true)  -> <<"\"state\":true">>;
 encode_field(state, false) -> <<"\"state\":false">>;
 encode_field(Key, Val) when is_integer(Val) ->
     [$", atom_to_binary(Key, utf8), <<"\":">>, integer_to_binary(Val)].
+
+%%====================================================================
+%% Internal — live state read (getPilot)
+%%====================================================================
+
+%% Send getPilot and wait for the lamp's reply. Uses a short-lived *active*
+%% socket with a deadline-bounded `receive' — AtomVM does not honor passive
+%% gen_udp:recv/3 timeouts, so a missing reply would otherwise hang forever.
+%% setPilot acks (no "state" field) are skipped until the real reply arrives.
+read_pilot(IP) ->
+    case gen_udp:open(0, [binary, {active, true}]) of
+        {ok, Sock} ->
+            Reply = case gen_udp:send(Sock, IP, ?WIZ_PORT, ?GETPILOT) of
+                ok ->
+                    Deadline = erlang:monotonic_time(millisecond) + ?STATE_RECV_MS,
+                    recv_pilot(Sock, Deadline);
+                {error, Reason} ->
+                    myhome_log:log(error, "[myhome_wiz] getPilot send to ~p failed: ~p", [IP, Reason]),
+                    {error, Reason}
+            end,
+            gen_udp:close(Sock),
+            Reply;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+recv_pilot(Sock, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true ->
+            {error, timeout};
+        false ->
+            receive
+                {udp, Sock, _Addr, _Port, Packet} ->
+                    case binary:match(Packet, <<"\"state\":">>) of
+                        nomatch -> recv_pilot(Sock, Deadline);  %% skip setPilot ack
+                        _       -> {ok, parse_pilot(Packet)}
+                    end
+            after Remaining ->
+                {error, timeout}
+            end
+    end.
+
+%% Pull the fields we care about out of a getPilot reply. Missing fields are
+%% simply omitted, so callers can pattern-match on what's present.
+parse_pilot(Packet) ->
+    Base = #{power => parse_power(Packet)},
+    Base1 = put_present(brightness, find_int(Packet, <<"\"dimming\":">>), Base),
+    Base2 = put_present(color_temp, find_int(Packet, <<"\"temp\":">>), Base1),
+    Base3 = put_present(r, find_int(Packet, <<"\"r\":">>), Base2),
+    Base4 = put_present(g, find_int(Packet, <<"\"g\":">>), Base3),
+    put_present(b, find_int(Packet, <<"\"b\":">>), Base4).
+
+put_present(_K, undefined, M) -> M;
+put_present(K, V, M) -> M#{K => V}.
+
+parse_power(Packet) ->
+    case binary:match(Packet, <<"\"state\":">>) of
+        {Start, Len} ->
+            Rest = binary:part(Packet, Start + Len, byte_size(Packet) - Start - Len),
+            case Rest of
+                <<"true", _/binary>>  -> true;
+                <<"false", _/binary>> -> false;
+                _                     -> undefined
+            end;
+        nomatch ->
+            undefined
+    end.
+
+%% Find Key (e.g. <<"\"dimming\":">>) in the packet and read the integer
+%% that follows. Returns `undefined' if absent or not numeric.
+find_int(Packet, Key) ->
+    case binary:match(Packet, Key) of
+        {Start, Len} ->
+            Rest = binary:part(Packet, Start + Len, byte_size(Packet) - Start - Len),
+            read_int(Rest, []);
+        nomatch ->
+            undefined
+    end.
+
+read_int(<<$-, Rest/binary>>, []) ->
+    read_int(Rest, [$-]);
+read_int(<<C, Rest/binary>>, Acc) when C >= $0, C =< $9 ->
+    read_int(Rest, [C | Acc]);
+read_int(_, []) ->
+    undefined;
+read_int(_, [$-]) ->
+    undefined;
+read_int(_, Acc) ->
+    binary_to_integer(list_to_binary(lists:reverse(Acc))).

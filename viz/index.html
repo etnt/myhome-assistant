@@ -403,6 +403,16 @@ input[type="range"]::-moz-range-thumb:hover {
   border-radius: 3px;
 }
 
+/* Kelvin-scaled track (WiZ): low K = warm on the left, high K = cool on the
+   right — the reverse of the mired track above. */
+.color-temp-slider.kelvin::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, #ff9933, #ffcc66, #fff5e6, #a8d8ff);
+}
+
+.color-temp-slider.kelvin::-moz-range-track {
+  background: linear-gradient(to right, #ff9933, #ffcc66, #fff5e6, #a8d8ff);
+}
+
 /* Scan results */
 .scan-results {
   margin-top: 0.75rem;
@@ -646,6 +656,14 @@ input[type="range"]::-moz-range-thumb:hover {
         </div>
       </div>
       <div id="bulbContainer" class="col"></div>
+      <div class="card all-lamps-card">
+        <span class="all-lamps-label">🔆 WiZ Lamps (Wi-Fi)</span>
+        <div class="all-lamps-actions">
+          <button class="btn btn-secondary" onclick="refreshWizLamps()">Refresh</button>
+          <button class="btn btn-secondary" onclick="discoverWiz()">Discover</button>
+        </div>
+      </div>
+      <div id="wizContainer" class="col"></div>
     </div>
     <div class="col">
       <div id="sensorContainer" class="col"></div>
@@ -761,6 +779,8 @@ async function checkStatus() {
     }
     // Refresh bulb states
     refreshBulbs();
+    // Refresh WiZ (Wi-Fi) lamps
+    refreshWizLamps();
     // Fetch initial sensor + policy data, then start event loop
     refreshSensors();
     refreshBleStatus();
@@ -988,6 +1008,206 @@ async function setColorTemp(id, value) {
     bulbs[id] = { ...bulbs[id], color_temp: value };
   } else {
     toast(`Color temp failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+// --- WiZ lamps (Wi-Fi, addressed by logical name) ---
+// WiZ lamps are fire-and-forget (no per-lamp state-read endpoint), so the UI
+// keeps optimistic local state. Value ranges differ from Hue: brightness is a
+// 10-100 percentage and color temp is in Kelvin (2200-6500).
+const wizLamps = {};
+let wizBusy = false;
+
+function prettyName(name) {
+  return String(name).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function cssId(name) {
+  return String(name).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  return m
+    ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) }
+    : { r: 255, g: 255, b: 255 };
+}
+
+function rgbToHex(r, g, b) {
+  const h = n => Math.max(0, Math.min(255, n | 0)).toString(16).padStart(2, '0');
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+function setWizDisabled(busy) {
+  wizBusy = busy;
+  document.querySelectorAll('.wiz-card').forEach(card => {
+    card.style.opacity = busy ? '0.5' : '';
+    card.style.pointerEvents = busy ? 'none' : '';
+  });
+}
+
+async function refreshWizLamps() {
+  const data = await api('GET', '/api/wiz');
+  const container = $('wizContainer');
+  if (!data || !data.lamps) return;
+  if (!data.lamps.length) {
+    container.innerHTML =
+      `<div class="card" style="color:var(--text-dim);font-size:0.85rem;">` +
+      `No WiZ lamps configured. Add them to <code>wiz_lamps/0</code> in the ` +
+      `config (use Discover to read their MACs), then Refresh.</div>`;
+    return;
+  }
+  data.lamps.forEach(l => {
+    wizLamps[l.name] = { ...wizLamps[l.name], ...l };
+    renderWizLamp(l.name, wizLamps[l.name]);
+    fetchWizState(l.name);
+  });
+}
+
+// Read a lamp's actual state (live getPilot) and reflect it in its card.
+async function fetchWizState(name) {
+  const data = await api('GET', `/api/wiz/${encodeURIComponent(name)}/state`);
+  if (!data || data.status !== 'ok') return;
+  const patch = {};
+  if (typeof data.power === 'boolean') patch.power = data.power;
+  if (data.brightness != null) patch.brightness = data.brightness;
+  if (data.color_temp != null) patch.color_temp = data.color_temp;
+  if (data.r != null && data.g != null && data.b != null && (data.r + data.g + data.b) > 0) {
+    patch.rgb = rgbToHex(data.r, data.g, data.b);
+  }
+  wizLamps[name] = { ...wizLamps[name], ...patch };
+  renderWizLamp(name, wizLamps[name]);
+}
+
+function renderWizLamp(name, state) {
+  const cid = cssId(name);
+  let card = document.getElementById(`wiz-${cid}`);
+  if (!card) {
+    card = document.createElement('div');
+    card.id = `wiz-${cid}`;
+    card.className = 'card bulb-card wiz-card';
+    $('wizContainer').appendChild(card);
+  }
+
+  const jn = JSON.stringify(name);
+  const known = state.power === true || state.power === false;
+  const isOn = state.power === true;
+  const statusText = known ? (isOn ? 'ON' : 'OFF') : '—';
+  const bri = state.brightness != null ? state.brightness : 100;
+  const ct = state.color_temp != null ? state.color_temp : 4000;
+  const color = state.rgb || '#ffcc66';
+  const ipText = state.ip && state.ip !== 'unknown'
+    ? state.ip
+    : (state.mac ? 'not discovered' : '');
+  const meta = [ipText, state.mac].filter(Boolean).map(escapeHtml).join(' · ');
+
+  card.innerHTML = `
+    <div class="bulb-header">
+      <span class="bulb-name" title="${escapeHtml(String(name))}">${escapeHtml(prettyName(name))}</span>
+      <span class="bulb-status ${isOn ? 'on' : ''}">${statusText}</span>
+    </div>
+    ${meta ? `<div style="font-size:0.72rem;color:var(--text-dim);margin-bottom:0.6rem;">${meta}</div>` : ''}
+    <div style="display:flex;align-items:center;gap:1rem;">
+      <label class="toggle">
+        <input type="checkbox" ${isOn ? 'checked' : ''} onchange='wizPower(${jn}, this.checked)'>
+        <span class="slider"></span>
+      </label>
+      <span style="font-size:0.8rem;color:var(--text-dim)">Power</span>
+    </div>
+    <div class="control-group">
+      <div class="control-label">
+        <span>Brightness</span>
+        <span id="wiz-bri-${cid}">${bri}%</span>
+      </div>
+      <input type="range" min="10" max="100" value="${bri}"
+        oninput="$('wiz-bri-${cid}').textContent=this.value+'%'"
+        onchange='wizBrightness(${jn}, +this.value)'>
+    </div>
+    <div class="control-group">
+      <div class="control-label">
+        <span>Color Temp</span>
+        <span id="wiz-ct-${cid}">${ct} K</span>
+      </div>
+      <input type="range" class="color-temp-slider kelvin" min="2200" max="6500" step="100" value="${ct}"
+        oninput="$('wiz-ct-${cid}').textContent=this.value+' K'"
+        onchange='wizColorTemp(${jn}, +this.value)'>
+    </div>
+    <div class="control-group">
+      <div class="control-label"><span>Color (RGB)</span></div>
+      <input type="color" value="${color}" onchange='wizColor(${jn}, this.value)'
+        style="width:100%;height:36px;padding:0;border:1px solid rgba(255,255,255,0.12);border-radius:6px;background:none;cursor:pointer;">
+    </div>
+  `;
+}
+
+async function wizPower(name, on) {
+  if (wizBusy) return;
+  setWizDisabled(true);
+  const data = await api('POST', `/api/wiz/${encodeURIComponent(name)}/power`, { on });
+  setWizDisabled(false);
+  if (data && data.status === 'ok') {
+    toast(`${prettyName(name)} ${on ? 'on' : 'off'}`);
+    wizLamps[name] = { ...wizLamps[name], power: on };
+  } else {
+    toast(`WiZ power failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+  renderWizLamp(name, wizLamps[name] || {});
+}
+
+async function wizBrightness(name, value) {
+  if (wizBusy) return;
+  setWizDisabled(true);
+  value = parseInt(value, 10);
+  const data = await api('POST', `/api/wiz/${encodeURIComponent(name)}/brightness`, { value });
+  setWizDisabled(false);
+  if (data && data.status === 'ok') {
+    wizLamps[name] = { ...wizLamps[name], brightness: value, power: true };
+    renderWizLamp(name, wizLamps[name]);
+  } else {
+    toast(`WiZ brightness failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+async function wizColorTemp(name, value) {
+  if (wizBusy) return;
+  setWizDisabled(true);
+  value = parseInt(value, 10);
+  const data = await api('POST', `/api/wiz/${encodeURIComponent(name)}/color_temp`, { value });
+  setWizDisabled(false);
+  if (data && data.status === 'ok') {
+    wizLamps[name] = { ...wizLamps[name], color_temp: value, rgb: null, power: true };
+    renderWizLamp(name, wizLamps[name]);
+  } else {
+    toast(`WiZ color temp failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+async function wizColor(name, hex) {
+  if (wizBusy) return;
+  setWizDisabled(true);
+  const { r, g, b } = hexToRgb(hex);
+  const data = await api('POST', `/api/wiz/${encodeURIComponent(name)}/rgb`, { r, g, b });
+  setWizDisabled(false);
+  if (data && data.status === 'ok') {
+    wizLamps[name] = { ...wizLamps[name], rgb: hex, power: true };
+    renderWizLamp(name, wizLamps[name]);
+  } else {
+    toast(`WiZ color failed: ${data ? data.reason || '' : 'no response'}`, 'error');
+  }
+}
+
+async function discoverWiz() {
+  toast('Discovering WiZ lamps…');
+  const data = await api('GET', '/api/wiz/discover', null, 30000);
+  if (data && data.status === 'ok') {
+    const lamps = data.lamps || [];
+    clearLog();
+    appendLog('info', `WiZ discovery found ${lamps.length} lamp(s):`);
+    lamps.forEach(l => appendLog('info', `  ${l.ip}  mac=${l.mac}`));
+    toast(`WiZ discovery: ${lamps.length} lamp(s) found`);
+    refreshWizLamps();
+  } else {
+    toast(`WiZ discovery failed: ${data ? data.reason || '' : 'no response'}`, 'error');
   }
 }
 
