@@ -476,7 +476,7 @@ handle_event(?EVT_READY, _Payload, #state{ready = true, connections = Conns} = S
     %% list. As the nRF's auto-reconnect re-establishes each bonded bulb we
     %% re-adopt the links via EVT_CONNECTED / EVT_ENC_CHANGE.
     myhome_log:log(warning,
-                   "nRF52840 re-READY (reset/crash) — re-establishing ~p connection(s)",
+                   "nRF52840 re-READY (reset/crash) - re-establishing ~p connection(s)",
                    [maps:size(Conns)]),
     lists:foreach(fun(Handle) ->
         myhome_event_bus:publish({ble_disconnected, Handle, 16#FF})

@@ -132,6 +132,7 @@ handle_call({pilot, Name, Params}, From, State0) ->
     case classify(Name, State0) of
         {ready, IP} ->
             {Reply, State1} = do_pilot(IP, Params, State0),
+            maybe_publish(Name, {pilot, Params}, Reply),
             {reply, Reply, State1};
         needs_scan ->
             {noreply, park(From, Name, {pilot, Params}, start_scan(local24, State0))};
@@ -245,6 +246,7 @@ drain_pending(#state{pending = Pending} = State0) ->
         case lookup_ip(Name, S) of
             {ok, IP} ->
                 {Reply, S1} = perform(Action, IP, S),
+                maybe_publish(Name, Action, Reply),
                 gen_server:reply(From, Reply),
                 S1;
             error ->
@@ -256,6 +258,29 @@ drain_pending(#state{pending = Pending} = State0) ->
 
 perform({pilot, Params}, IP, State) -> do_pilot(IP, Params, State);
 perform(get_state, IP, State)       -> do_get_state(IP, State).
+
+%% Broadcast a lamp's new state on the event bus after a successful control
+%% action, so any long-polling UI reflects changes made via curl/API without
+%% having to poll each lamp. Only control (setPilot) actions publish; a live
+%% get_state read does not change anything. Non-blocking (async cast).
+maybe_publish(Name, {pilot, Params}, ok) ->
+    myhome_event_bus:publish({wiz_state, Name, params_to_state(Params)});
+maybe_publish(_Name, _Action, _Reply) ->
+    ok.
+
+%% Translate the WiZ wire params we just sent into UI-facing state keys.
+%% Setting brightness/temp/color implicitly powers the lamp on, mirroring the
+%% lamp's own behaviour and the UI's optimistic update.
+params_to_state(Params) ->
+    maps:fold(fun
+        (state, V, A)   -> A#{power => V};
+        (dimming, V, A) -> A#{power => true, brightness => V};
+        (temp, V, A)    -> A#{power => true, color_temp => V};
+        (r, V, A)       -> A#{power => true, r => V};
+        (g, V, A)       -> A#{g => V};
+        (b, V, A)       -> A#{b => V};
+        (_, _, A)       -> A
+    end, #{}, Params).
 
 %% Send a setPilot to a resolved IP, opening the control socket if needed.
 do_pilot(IP, Params, State0) ->

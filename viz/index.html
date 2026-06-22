@@ -872,7 +872,9 @@ function renderBulb(id, state) {
     $('bulbContainer').appendChild(card);
   }
 
+  const known = state.power === true || state.power === false;
   const isOn = state.power === true;
+  const statusText = known ? (isOn ? 'ON' : 'OFF') : '—';
   const bri = state.brightness != null ? state.brightness : 128;
   const ct = state.color_temp != null ? state.color_temp : 370;
   const label = state.display_name || `Bulb ${id}`;
@@ -881,7 +883,7 @@ function renderBulb(id, state) {
     <div class="bulb-header">
       <span class="bulb-name" id="bulb-name-${id}" title="Click to rename"
         onclick="startRename(${id})">${escapeHtml(label)}</span>
-      <span class="bulb-status ${isOn ? 'on' : ''}">${isOn ? 'ON' : 'OFF'}</span>
+      <span class="bulb-status ${isOn ? 'on' : ''}">${statusText}</span>
     </div>
     <div style="display:flex;align-items:center;gap:1rem;">
       <label class="toggle">
@@ -943,9 +945,11 @@ async function togglePower(id, on) {
 }
 
 async function allPower(on) {
-  if (bulbBusy) return;
+  if (bulbBusy || wizBusy) return;
   setBulbsDisabled(true);
+  setWizDisabled(true);
   let ok = 0, failed = 0;
+  // BLE (Hue) bulbs
   for (let i = 1; i <= NUM_BULBS; i++) {
     const data = await api('POST', `/api/bulb/${i}/power`, { on });
     if (data && data.status === 'ok') {
@@ -958,7 +962,19 @@ async function allPower(on) {
       failed++;
     }
   }
+  // WiZ (Wi-Fi) lamps
+  for (const name of Object.keys(wizLamps)) {
+    const data = await api('POST', `/api/wiz/${encodeURIComponent(name)}/power`, { on });
+    if (data && data.status === 'ok') {
+      ok++;
+      wizLamps[name] = { ...wizLamps[name], power: on };
+      renderWizLamp(name, wizLamps[name]);
+    } else {
+      failed++;
+    }
+  }
   setBulbsDisabled(false);
+  setWizDisabled(false);
   if (failed > 0) {
     toast(`All ${on ? 'on' : 'off'}: ${ok} ok, ${failed} failed`, 'error');
   } else {
@@ -1625,6 +1641,19 @@ function handleEvent(event) {
         renderBulb(id, bulbs[id]);
       }
       break;
+    case 'wiz_state': {
+      // A WiZ lamp changed (e.g. via curl/API) — reflect it without polling.
+      const w = event.data;
+      if (!w.name) break;
+      const patch = {};
+      if (typeof w.power === 'boolean') patch.power = w.power;
+      if (w.brightness != null) patch.brightness = w.brightness;
+      if (w.color_temp != null) patch.color_temp = w.color_temp;
+      if (w.r != null && w.g != null && w.b != null) patch.rgb = rgbToHex(w.r, w.g, w.b);
+      wizLamps[w.name] = { ...wizLamps[w.name], ...patch };
+      renderWizLamp(w.name, wizLamps[w.name]);
+      break;
+    }
   }
 }
 

@@ -74,6 +74,12 @@ start_link(Addr, AddrType, Name) ->
 %% Heartbeat: periodic state read to detect external changes (e.g., physical switch)
 -define(HEARTBEAT_INTERVAL_MS, 300000). %% 5 minutes
 
+%% When a post-connect read comes back unreadable (e.g. GATT discovery was still
+%% partial), retry a few times at a short interval so the cache populates within
+%% seconds rather than waiting for the next heartbeat.
+-define(READ_RETRY_MAX, 4).
+-define(READ_RETRY_DELAY_MS, 8000). %% 8 seconds
+
 -spec set_power(atom(), boolean()) -> ok | {error, term()}.
 set_power(Name, On) ->
     gen_server:call(Name, {set_power, On}, ?CALL_TIMEOUT).
@@ -223,7 +229,7 @@ handle_info({ble_event, {ble_enc_change, Handle, 0}},
             State1
     end,
     publish_state(State2),
-    {noreply, State2};
+    {noreply, maybe_retry_read(State2)};
 
 %% Encryption failed — leave the bulb marked down; the nRF will retry.
 handle_info({ble_event, {ble_enc_change, Handle, Status}},
@@ -271,7 +277,7 @@ handle_info(reconcile_connection, State) ->
                     State1
             end,
             publish_state(State2),
-            {noreply, State2};
+            {noreply, maybe_retry_read(State2)};
         {ok, Handle, false} ->
             %% Connected but not yet encrypted — record the handle and wait for
             %% the nRF's enc_change (it self-initiates encryption).
@@ -284,8 +290,33 @@ handle_info(reconcile_connection, State) ->
             {noreply, State}
     end;
 
+%% Bounded retry of a post-connect read that came back unreadable. Each attempt
+%% re-runs GATT discovery (via execute_cmd/ensure_gatt_handles), so a partial
+%% initial discovery self-heals within seconds. Stops once a value is read or
+%% the attempts are exhausted.
+handle_info({retry_read, N}, #state{connected = true, power = undefined} = State)
+  when N > 0 ->
+    {_, NewState} = execute_cmd(read_all, State),
+    case NewState#state.power of
+        undefined ->
+            erlang:send_after(?READ_RETRY_DELAY_MS, self(), {retry_read, N - 1});
+        _ ->
+            publish_state(NewState)
+    end,
+    {noreply, NewState};
+handle_info({retry_read, _N}, State) ->
+    {noreply, State};
+
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+%% Schedule a bounded read-retry when the bulb is connected but its state could
+%% not be read (power undefined). No-op otherwise.
+maybe_retry_read(#state{connected = true, power = undefined} = State) ->
+    erlang:send_after(?READ_RETRY_DELAY_MS, self(), {retry_read, ?READ_RETRY_MAX}),
+    State;
+maybe_retry_read(State) ->
+    State.
 
 terminate(_Reason, #state{conn_handle = undefined}) ->
     ok;
@@ -411,7 +442,7 @@ discover_gatt_handles(#state{conn_handle = ConnH} = State) ->
                                    [State#state.name, map_size(Handles)]);
                 false ->
                     myhome_log:log(warning,
-                        "[~p] partial GATT discovery (~p chars, no control service) — will retry",
+                        "[~p] partial GATT discovery (~p chars, no control service) - will retry",
                         [State#state.name, map_size(Handles)])
             end,
             {ok, State#state{gatt_handles = Handles}};

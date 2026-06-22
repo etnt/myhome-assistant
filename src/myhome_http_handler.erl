@@ -79,6 +79,7 @@ do_handle(get, [<<"events">>], _HttpRequest) ->
         ({sensor_update, _}) -> true;
         ({policy_changed, _, _}) -> true;
         ({bulb_state, _, _}) -> true;
+        ({wiz_state, _, _}) -> true;
         (_) -> false
     end),
     Event = receive
@@ -87,7 +88,9 @@ do_handle(get, [<<"events">>], _HttpRequest) ->
         {ble_event, {policy_changed, Id, Enabled}} ->
             #{type => policy_changed, data => #{id => Id, enabled => Enabled}};
         {ble_event, {bulb_state, Name, BulbState}} ->
-            #{type => bulb_state, data => BulbState#{name => Name}}
+            #{type => bulb_state, data => BulbState#{name => Name}};
+        {ble_event, {wiz_state, Name, WizState}} ->
+            #{type => wiz_state, data => WizState#{name => to_bin(Name)}}
     after 30000 ->
         none
     end,
