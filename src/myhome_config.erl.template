@@ -1,6 +1,8 @@
 -module(myhome_config).
 
 -export([wifi_ssid/0, wifi_psk/0, http_port/0, sensors/0]).
+-export([timezone/0, policies/0]).
+-export([wiz_lamps/0]).
 
 %% Copy this file to myhome_config.erl and fill in your values.
 
@@ -18,3 +20,67 @@ sensors() ->
         ],
         poll_interval_ms => 5000
     }.
+
+%% Philips WiZ lamps, addressed by logical name. Each value is either:
+%%   * a MAC binary <<"a8bb50aabbcc">> (recommended) — myhome_wiz finds
+%%     the lamp's current IP automatically by scanning the LAN, so DHCP
+%%     can hand out any address, or
+%%   * a static IP tuple {A,B,C,D} — used directly (reserve a DHCP lease).
+%% To find each lamp's MAC, flash the firmware once and run
+%%   myhome_wiz:discover().
+%% from the console (or GET /api/wiz/discover), then paste the MACs here.
+wiz_lamps() ->
+    #{
+        living_room => <<"a8bb50aabbcc">>,
+        bedroom     => <<"a8bb50ddeeff">>
+    }.
+
+%% POSIX TZ string used for local-time calculations. The default below is
+%% CET/CEST (central Europe). See the tz database for other zones.
+timezone() -> "CET-1CEST,M3.5.0,M10.5.0/3".
+
+%% Automation policies. These are declarative configuration; the action
+%% closures only delegate to myhome_lights:set_all/1, which holds the
+%% (version-controlled) light-control logic. Edit, add, or disable rules
+%% to taste. Brightness uses the Hue convention (1..254).
+policies() ->
+    [
+        %% Evening Comfort: when it gets dark in the evening, turn lights on;
+        %% when it brightens again, turn them off. The wide deadband
+        %% (lux < 50 on, lux > 200 off) prevents flapping on cloudy days.
+        #{id => evening_comfort, enabled => true, rules => [
+            #{id => lights_on_dark,
+              trigger => sensor,
+              condition => fun(#{lux := Lux, hour := H}) ->
+                  H >= 14 andalso H < 23 andalso Lux < 50
+              end,
+              action => fun() ->
+                  myhome_lights:set_all(#{power => true, brightness => 204})
+              end,
+              cooldown => 300000},
+
+            #{id => lights_off_bright,
+              trigger => sensor,
+              condition => fun(#{lux := Lux, hour := H}) ->
+                  H >= 14 andalso H < 23 andalso Lux > 200
+              end,
+              action => fun() ->
+                  myhome_lights:set_all(#{power => false})
+              end,
+              cooldown => 300000}
+        ]},
+
+        %% Night Shutoff: ensure lights are off overnight, but only when it's
+        %% actually dark (avoids switching off during bright summer nights).
+        #{id => night_shutoff, enabled => true, rules => [
+            #{id => lights_off_night,
+              trigger => timer,
+              condition => fun(#{hour := H, lux := Lux}) ->
+                  H >= 0 andalso H < 6 andalso Lux < 100
+              end,
+              action => fun() ->
+                  myhome_lights:set_all(#{power => false})
+              end,
+              cooldown => 600000}
+        ]}
+    ].

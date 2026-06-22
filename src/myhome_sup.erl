@@ -63,10 +63,18 @@ init([]) ->
         type => worker
     },
 
+    WizSpec = #{
+        id => myhome_wiz,
+        start => {myhome_wiz, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker
+    },
+
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 60
     },
 
-    {ok, {SupFlags, [ScannerSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec, LcdSpec]}}.
+    {ok, {SupFlags, [ScannerSpec, HttpSpec, DiscoverySpec, SensorsSpec, RulesSpec, LcdSpec, WizSpec]}}.

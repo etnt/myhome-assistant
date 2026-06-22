@@ -23,6 +23,11 @@
 %%%   POST /api/bulb/1/state    — body: {"power":true,"brightness":200}
 %%%   GET  /api/bulb/1/state    — cached state (no BLE)
 %%%   POST /api/bulb/1/refresh  — live BLE GATT read (connects on-demand)
+%%%   POST /api/wiz/<name>/power      — body: {"on": true}
+%%%   POST /api/wiz/<name>/brightness — body: {"value": 10-100}
+%%%   POST /api/wiz/<name>/color_temp — body: {"value": 2200-6500} (Kelvin)
+%%%   POST /api/wiz/<name>/rgb        — body: {"r":255,"g":120,"b":0}
+%%%   GET  /api/wiz/discover          — scan LAN, list lamps (ip + mac)
 %%%
 %%% Example:
 %%%   curl http://<ip>:8080/api/bulb/1/power -d '{"on":true}'
@@ -42,7 +47,7 @@ handle_request(Method, [<<"api">> | Path], Request) ->
         exit:noproc ->
             static_error(<<"process not running">>);
         exit:{timeout, _} ->
-            static_error(<<"timeout - BLE busy">>);
+            static_error(<<"request timed out">>);
         Class:Reason ->
             io:format("[http] crash: ~p:~p~n", [Class, Reason]),
             static_error(<<"internal error">>)
@@ -220,6 +225,55 @@ do_handle(post, [<<"bulb">>, BulbNum, <<"color_xy">>], HttpRequest) ->
         _ ->
             {400, #{}, <<"Bad Request: x and y must be 0-65535">>}
     end;
+
+%% --- Philips WiZ lamps (JSON-over-UDP, addressed by logical name) ---
+
+do_handle(get, [<<"wiz">>, <<"discover">>], _HttpRequest) ->
+    case myhome_wiz:discover() of
+        {ok, Lamps} ->
+            json_reply(#{status => ok,
+                         lamps => [#{ip => wiz_ip_bin(maps:get(ip, L)),
+                                     mac => maps:get(mac, L)} || L <- Lamps]});
+        {error, Reason} ->
+            json_reply(#{status => error, reason => to_bin(Reason)})
+    end;
+
+do_handle(post, [<<"wiz">>, LampBin, <<"power">>], HttpRequest) ->
+    with_wiz_lamp(LampBin, HttpRequest, fun(Name, Body) ->
+        case parse_json_bool(Body, <<"on">>) of
+            {ok, On} -> wiz_reply(myhome_wiz:set_power(Name, On));
+            error -> {400, #{}, <<"Bad Request: need 'on' boolean">>}
+        end
+    end);
+
+do_handle(post, [<<"wiz">>, LampBin, <<"brightness">>], HttpRequest) ->
+    with_wiz_lamp(LampBin, HttpRequest, fun(Name, Body) ->
+        case parse_json_int(Body, <<"value">>) of
+            {ok, Val} when Val >= 10, Val =< 100 ->
+                wiz_reply(myhome_wiz:set_brightness(Name, Val));
+            _ -> {400, #{}, <<"Bad Request: value must be 10-100">>}
+        end
+    end);
+
+do_handle(post, [<<"wiz">>, LampBin, <<"color_temp">>], HttpRequest) ->
+    with_wiz_lamp(LampBin, HttpRequest, fun(Name, Body) ->
+        case parse_json_int(Body, <<"value">>) of
+            {ok, Val} when Val >= 2200, Val =< 6500 ->
+                wiz_reply(myhome_wiz:set_color_temp(Name, Val));
+            _ -> {400, #{}, <<"Bad Request: value must be 2200-6500 (Kelvin)">>}
+        end
+    end);
+
+do_handle(post, [<<"wiz">>, LampBin, <<"rgb">>], HttpRequest) ->
+    with_wiz_lamp(LampBin, HttpRequest, fun(Name, Body) ->
+        case {parse_json_int(Body, <<"r">>), parse_json_int(Body, <<"g">>),
+              parse_json_int(Body, <<"b">>)} of
+            {{ok, R}, {ok, G}, {ok, B}}
+              when R >= 0, R =< 255, G >= 0, G =< 255, B >= 0, B =< 255 ->
+                wiz_reply(myhome_wiz:set_rgb(Name, R, G, B));
+            _ -> {400, #{}, <<"Bad Request: r, g, b must be 0-255">>}
+        end
+    end);
 
 do_handle(get, [<<"bulb">>, BulbNum, <<"state">>], _HttpRequest) ->
     %% Return cached in-memory state (no BLE connection)
@@ -588,6 +642,38 @@ bulb_name(<<"2">>) -> bulb_2;
 bulb_name(<<"3">>) -> bulb_3;
 bulb_name(<<"4">>) -> bulb_4;
 bulb_name(_) -> bulb_1.
+
+%% Resolve a WiZ lamp path segment to a configured lamp atom, then run Fun.
+%% Returns a 404 for unknown lamps so an arbitrary name never actuates one.
+with_wiz_lamp(LampBin, HttpRequest, Fun) ->
+    case wiz_lamp_name(LampBin) of
+        {ok, Name} ->
+            #{body := Body} = HttpRequest,
+            Fun(Name, Body);
+        error ->
+            {404, #{}, <<"Unknown lamp">>}
+    end.
+
+%% Validate against myhome_config:wiz_lamps/0. binary_to_existing_atom keeps
+%% the atom table bounded — valid lamp atoms already exist in the config module.
+wiz_lamp_name(LampBin) ->
+    try binary_to_existing_atom(LampBin, utf8) of
+        Name ->
+            case maps:is_key(Name, myhome_config:wiz_lamps()) of
+                true -> {ok, Name};
+                false -> error
+            end
+    catch _:_ ->
+        error
+    end.
+
+wiz_reply(ok) -> json_reply(#{status => ok});
+wiz_reply({error, Reason}) -> json_reply(#{status => error, reason => to_bin(Reason)}).
+
+%% Format an IP tuple as a binary string for JSON output.
+wiz_ip_bin({A, B, C, D}) ->
+    iolist_to_binary(io_lib:format("~p.~p.~p.~p", [A, B, C, D]));
+wiz_ip_bin(_) -> <<"unknown">>.
 
 get_bulb_status() ->
     lists:filtermap(fun(N) ->

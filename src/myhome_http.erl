@@ -7,7 +7,7 @@
 -module(myhome_http).
 -behaviour(gen_server).
 
--export([start_link/0, get_ip/0]).
+-export([start_link/0, get_ip/0, get_netmask/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% Max seconds without WiFi recovery before rebooting
@@ -15,7 +15,8 @@
 
 -record(state, {
     reboot_timer = undefined :: undefined | reference(),
-    ip = undefined :: undefined | tuple()
+    ip = undefined :: undefined | tuple(),
+    netmask = undefined :: undefined | tuple()
 }).
 
 %%====================================================================
@@ -31,6 +32,15 @@ start_link() ->
 -spec get_ip() -> tuple() | undefined.
 get_ip() ->
     try gen_server:call(?MODULE, get_ip, 2000)
+    catch _:_ -> undefined
+    end.
+
+%% @doc Current IPv4 subnet mask as a `{A,B,C,D}' tuple, or `undefined'
+%% if WiFi hasn't obtained a lease yet. Used to scope network scans to
+%% the actual subnet (which may be wider than a /24).
+-spec get_netmask() -> tuple() | undefined.
+get_netmask() ->
+    try gen_server:call(?MODULE, get_netmask, 2000)
     catch _:_ -> undefined
     end.
 
@@ -58,7 +68,7 @@ init([]) ->
     case network:start(Config) of
         {ok, _Pid} ->
             case wait_for_ip(30000) of
-                {ok, {Address, _Netmask, _Gateway}} ->
+                {ok, {Address, Netmask, _Gateway}} ->
                     io:format("WiFi connected! IP: ~s~n", [format_ip(Address)]),
                     %% Notify subscribers (e.g. the LCD display) of our IP.
                     myhome_event_bus:publish({network_up, Address}),
@@ -72,7 +82,7 @@ init([]) ->
                             myhome_log:log(info, "HTTP API listening on port ~p", [Port]),
                             myhome_log:log(info, "Try: curl http://~s:~p/api/status",
                                       [format_ip(Address), Port]),
-                            {ok, #state{ip = Address}};
+                            {ok, #state{ip = Address, netmask = Netmask}};
                         {error, Reason} ->
                             io:format("HTTP server FAILED: ~p~n", [Reason]),
                             myhome_log:log(error, "HTTP server failed: ~p", [Reason]),
@@ -89,6 +99,9 @@ init([]) ->
 
 handle_call(get_ip, _From, #state{ip = Ip} = State) ->
     {reply, Ip, State};
+
+handle_call(get_netmask, _From, #state{netmask = Mask} = State) ->
+    {reply, Mask, State};
 
 handle_call(_Req, _From, State) ->
     {reply, ok, State}.

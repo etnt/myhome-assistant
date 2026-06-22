@@ -127,6 +127,82 @@ and designed for Nordic latitudes where sunset varies dramatically by season.
 See [AUTOMATION_RULES.md](AUTOMATION_RULES.md) for how to write and configure
 rule policies.
 
+## Philips WiZ Lamps (Wi-Fi)
+
+Besides the BLE Hue bulbs, the system can also control **Philips WiZ** lamps.
+Unlike Hue, WiZ lamps are **Wi-Fi** devices: they speak a small JSON-over-UDP
+protocol on port `38899`, so the ESP32 talks to them directly over the network
+— no BLE bridge, no pairing, no NVS bonds. The implementation lives in
+`myhome_wiz` (a `gen_server`).
+
+### Joining a lamp to the network
+
+A WiZ lamp must be on the **same Wi-Fi network as the ESP32** to be reachable.
+Use the **WiZ / WizConnect** mobile app to join the lamp to your IoT SSID (the
+same one the ESP32 uses).
+
+> **Note — Wi-Fi client isolation.** Many routers isolate the IoT SSID from the
+> main one. The ESP32 can only reach lamps that share its own segment, so put
+> the lamp on the ESP32's SSID. (A laptop on a different SSID won't be able to
+> probe the lamps for the same reason.)
+
+### Discovery
+
+Lamps get their address from DHCP, which can change. Rather than hard-coding
+IPs, `myhome_wiz` finds a lamp by its stable **MAC**: it scans the ESP32's
+whole subnet (derived from the netmask, so larger-than-/24 LANs are covered)
+by sending a `getPilot` probe to every host and reading back each lamp's MAC.
+
+```bash
+# Scan the LAN and list responding lamps (ip + mac)
+curl -s http://<esp-ip>:8080/api/wiz/discover
+# => {"status":"ok","lamps":[{"mac":"9877d5a0a7dc","ip":"192.168.68.53"}]}
+```
+
+The scan runs in a background worker, so it never blocks lamp control. Results
+are cached and refreshed periodically; a lamp's IP is re-resolved automatically
+if DHCP moves it.
+
+### Configuration
+
+Map each lamp to a logical name in `myhome_config:wiz_lamps/0`. A value can be
+either a discovered **MAC binary** (recommended — survives IP changes) or a
+static **IP tuple**:
+
+```erlang
+wiz_lamps() ->
+    #{
+        living_room => <<"9877d5a0a7dc">>,   %% by MAC (auto-resolved via discovery)
+        bedroom     => {192, 168, 68, 60}    %% or a fixed/reserved IP
+    }.
+```
+
+### Control
+
+Lamps are addressed by their logical name:
+
+```bash
+# Power on / off
+curl -X POST http://<esp-ip>:8080/api/wiz/living_room/power -d '{"on":true}'
+
+# Brightness (10–100 %)
+curl -X POST http://<esp-ip>:8080/api/wiz/living_room/brightness -d '{"value":80}'
+
+# Color temperature (2200–6500 K, higher = cooler)
+curl -X POST http://<esp-ip>:8080/api/wiz/living_room/color_temp -d '{"value":2700}'
+
+# RGB color (each channel 0–255)
+curl -X POST http://<esp-ip>:8080/api/wiz/living_room/rgb -d '{"r":255,"g":120,"b":0}'
+```
+
+| Method | Endpoint                       | Body                       | Description                          |
+|--------|--------------------------------|----------------------------|--------------------------------------|
+| GET    | `/api/wiz/discover`            | —                          | Scan the LAN, list lamps (ip + mac)  |
+| POST   | `/api/wiz/{name}/power`        | `{"on":true}`              | Turn lamp on/off                     |
+| POST   | `/api/wiz/{name}/brightness`   | `{"value":80}`             | Set brightness (10–100 %)            |
+| POST   | `/api/wiz/{name}/color_temp`   | `{"value":2700}`           | Set color temperature (2200–6500 K)  |
+| POST   | `/api/wiz/{name}/rgb`          | `{"r":255,"g":120,"b":0}`  | Set RGB color (each channel 0–255)   |
+
 ## Prerequisites
 
 - [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) (v5.x)
