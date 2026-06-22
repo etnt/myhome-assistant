@@ -133,6 +133,19 @@ handle_info(connected, #state{reboot_timer = TRef} = State) ->
     cancel_timer(TRef),
     {noreply, State#state{reboot_timer = undefined}};
 
+%% DHCP (re)assigned an address. The init path consumes the FIRST {ok, IpInfo}
+%% via wait_for_ip/1; any later one (e.g. after a reconnect) arrives here. The
+%% reconnect may yield a different IP, so refresh the cached IP/netmask -
+%% otherwise subnet-derived logic (WiZ discovery) keeps scanning the stale
+%% boot-time subnet and never finds lamps on the new network.
+handle_info({ok, {Address, Netmask, _Gateway}}, State) ->
+    case State#state.ip of
+        Address -> ok;
+        _ -> myhome_log:log(info, "IP refreshed to ~s", [format_ip(Address)])
+    end,
+    myhome_event_bus:publish({network_up, Address}),
+    {noreply, State#state{ip = Address, netmask = Netmask}};
+
 handle_info(wifi_reboot, _State) ->
     myhome_log:log(error, "WiFi not recovered after ~ps - rebooting!",
                    [?WIFI_REBOOT_TIMEOUT_MS div 1000]),
