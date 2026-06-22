@@ -1,19 +1,33 @@
 # Two-Chip Architecture Plan
 
-Eliminate WiFi/BLE radio contention by offloading Zigbee communication to a
-dedicated ESP32-H2 radio worker, connected to the existing ESP32-S3 brain
-via UART.
+Move Hue (and other) lighting from BLE to a dedicated ESP32-H2 Zigbee
+coordinator, connected to the existing ESP32-S3 brain via UART. This targets
+BLE-inherent reliability limits — **not** WiFi/BLE radio contention, which the
+nRF52840 bridge already eliminated.
 
 ## Motivation
 
-The current single-chip (ESP32-S3) design shares a single 2.4 GHz radio
-between WiFi and BLE. This causes:
-- Beacon timeouts during BLE operations
-- Connection failures after overnight idle (slow BLE advertisers + WiFi coex)
-- Serialized bulb commands (only one BLE op at a time)
+The project already runs a **two-chip** design: the ESP32-S3 owns WiFi and the
+Erlang application, while a **XIAO nRF52840** handles all BLE as a dedicated
+bridge (over I2C, owned by `myhome_ble_i2c`). So WiFi/BLE *radio contention is
+already solved* — that is **not** the problem this plan addresses.
 
-Moving to Zigbee on a dedicated chip solves all three: the H2's 802.15.4
-radio never contends with WiFi, and Zigbee mesh supports concurrent devices.
+What remains are issues **inherent to BLE as a protocol** for always-on lighting:
+- Connection failures after overnight idle — persistent encrypted links must be
+  babysat and re-established by scanning for the bonded address
+- Serialized control — effectively one bulb op at a time
+- ~10-device practical ceiling and in-room (~10 m) point-to-point range; no mesh
+
+Hue bulbs are **Zigbee-native** (BLE is their secondary, limited radio). Moving
+Hue control to a dedicated **ESP32-H2** Zigbee coordinator addresses the
+BLE-inherent problems directly: an always-on 802.15.4 mesh (mains-powered bulbs
+relay), concurrent device handling, whole-home range, and a large sensor
+ecosystem (Aqara, IKEA). The H2's radio also never contends with WiFi — a bonus,
+though the nRF already gave us radio separation.
+
+> **Scope note:** This replaces the *bridge role* for Zigbee-capable devices.
+> The nRF52840 BLE bridge stays for BLE-only gadgets and lets us migrate Hue to
+> Zigbee incrementally with a BLE fallback (see Coexistence with BLE).
 
 ## System Architecture
 
@@ -63,24 +77,27 @@ radio never contends with WiFi, and Zigbee mesh supports concurrent devices.
 
 ## Software Architecture (ESP32-S3 Side)
 
-Follows the same pattern as the existing `ble.erl` port server — a gen_server
-owns the UART port, serializes commands, and publishes events to the event bus.
+Follows the same pattern as the existing `myhome_ble_i2c` bridge — a gen_server
+owns the link to the radio chip, serializes commands, and publishes events to
+the event bus.
 
 ### Supervision Tree (Extended)
 
 ```
 myhome_top_sup (rest_for_one)
   ├── myhome_log
-  ├── ble (existing — kept for BLE-only devices)
-  ├── zigbee (NEW — owns UART port to H2)
   ├── myhome_event_bus
+  ├── myhome_ble_i2c    (existing — XIAO nRF52840 BLE bridge over I2C)
+  ├── zigbee            (NEW — owns UART port to the H2)
   └── myhome_sup (one_for_one)
         ├── myhome_scanner
-        ├── myhome_ble_conn
-        ├── myhome_zigbee_devices (NEW — per-device state)
         ├── myhome_http
         ├── myhome_discovery
-        └── myhome_sensors
+        ├── myhome_sensors
+        ├── myhome_rules
+        ├── myhome_lcd
+        ├── myhome_zigbee_devices (NEW — per-device state)
+        └── bulb_N (myhome_hue_ble)   (existing BLE bulbs)
 ```
 
 ### New Module: `zigbee.erl`
@@ -201,6 +218,16 @@ idf.py -p /dev/cu.usbmodemXXX flash
 
 ## Integration with Existing Codebase
 
+### Phase 0: De-risk Touchlink commissioning (spike)
+
+Before writing any UART or Erlang code, prove the riskiest assumption: that we
+can join a Hue bulb to **our own** coordinator without the Hue Bridge. Flash a
+stock `esp-zigbee-sdk` coordinator example to the H2, factory-reset a Hue bulb,
+and attempt Touchlink (close-proximity) commissioning followed by a basic
+on/off. If this is flaky or fails across bulb firmware versions, reconsider
+scope (stay on BLE, or keep a Hue Bridge as a Matter bridge) **before**
+committing to the full build below.
+
 ### Phase 1: UART Bridge (Week 1)
 
 - Add `zigbee.erl` gen_server to `myhome_top_sup`
@@ -273,7 +300,8 @@ route_bulb_cmd(BulbNum, Cmd) ->
 2. **OTA for H2** — Can we flash the H2 via UART from the S3, or always
    require USB connection? (ESP-IDF UART bootloader supports this)
 3. **Hue bulbs on Zigbee** — Philips Hue bulbs support Zigbee 3.0.
-   Once paired to our coordinator, we skip BLE entirely. Need to test
-   pairing without the Hue Bridge (Touchlink commissioning).
+   Once paired to our coordinator, we skip BLE entirely. Pairing without the
+   Hue Bridge (Touchlink commissioning) is the biggest unknown — validate it
+   first in **Phase 0** before building the rest.
 4. **Fallback** — If H2 is unresponsive (no PONG), should the S3 fall back
    to BLE for Hue bulbs, or just report the error?
